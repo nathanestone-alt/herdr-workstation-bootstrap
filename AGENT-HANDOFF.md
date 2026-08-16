@@ -55,7 +55,7 @@ Start-VM -Name herdr-ubuntu
 vmconnect.exe localhost herdr-ubuntu
 ~~~
 
-The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. Default safety reserves require at least 20 logical processors and 48 GB installed RAM. On other hardware, pass reviewed `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` overrides through `bootstrap.ps1 -Stage VmCreate`. The VM uses the Default Switch and starts 30 seconds after Hyper-V, before Windows user login.
+The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. Default safety reserves require at least 20 logical processors and a 64 GB-or-larger host; the preflight compares the requested 48 GiB total against memory visible to Windows, which is slightly below the installed amount. On other hardware, pass reviewed `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` overrides through `bootstrap.ps1 -Stage VmCreate`. The VM uses the Default Switch and starts 30 seconds after Hyper-V, before Windows user login.
 
 If VM creation used any reviewed resource or host-reserve override, record the exact `-Vm*` arguments in the commissioning record and repeat every one of them on the later `bootstrap.ps1 -Stage VmComplete` command. A bare completion command re-applies the script defaults.
 

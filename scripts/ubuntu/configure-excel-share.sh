@@ -26,7 +26,7 @@ if [[ "$mount_point" != /* ]]; then
   exit 2
 fi
 case "$mount_point" in
-  /|/boot|/home|/etc|/usr|/var)
+  /|/boot|/home|/etc|/usr|/var|/srv)
     echo "Mount point '$mount_point' is a protected system path." >&2
     exit 2
     ;;
@@ -35,6 +35,10 @@ if [[ ! "$mount_point" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
    [[ "$mount_point" == *//* || "$mount_point" == */./* || "$mount_point" == */../* ||
       "$mount_point" == */. || "$mount_point" == */.. || "$mount_point" == */ ]]; then
   echo 'Mount point contains unsupported characters or path components.' >&2
+  exit 2
+fi
+if [[ ! "$mount_point" =~ ^/srv/herdr-[A-Za-z0-9._-]+$ ]]; then
+  echo 'Mount point must be a direct /srv/herdr-* child.' >&2
   exit 2
 fi
 if [[ ! "$windows_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
@@ -60,7 +64,22 @@ id "$owner_name" >/dev/null 2>&1 || { echo "Ubuntu owner '$owner_name' does not 
 owner_uid="$(id -u "$owner_name")"
 owner_gid="$(id -g "$owner_name")"
 
-sudo install -d -m 0750 "$mount_point"
+mount_point_exists=false
+if mountpoint -q "$mount_point"; then
+  mount_point_exists=true
+elif sudo test -e "$mount_point"; then
+  if ! sudo test -d "$mount_point"; then
+    echo "Mount point '$mount_point' exists but is not a directory." >&2
+    exit 22
+  fi
+  mount_point_metadata="$(sudo stat -c '%a:%U:%G' -- "$mount_point")"
+  if [[ "$mount_point_metadata" != '750:root:root' ]]; then
+    echo "Existing mount point '$mount_point' must already be mode 0750 and owned by root:root; found $mount_point_metadata. Refusing to change it." >&2
+    exit 22
+  fi
+  mount_point_exists=true
+fi
+
 fstab_current="$(mktemp)"
 desired_block="$(mktemp)"
 replacement="$(mktemp)"
@@ -141,6 +160,9 @@ sudo -u "$owner_name" sh -c 'printf "%s\n" "Herdr credential test" > "$1"; rm -f
 sudo umount "$probe_mount"
 probe_mounted=false
 
+if [[ "$mount_point_exists" != true ]]; then
+  sudo install -d -m 0750 -o root -g root "$mount_point"
+fi
 sudo install -m 0600 -o root -g root "$credential_tmp" "$credentials_file"
 fstab_changed=false
 if ! cmp -s "$fstab_current" "$replacement"; then

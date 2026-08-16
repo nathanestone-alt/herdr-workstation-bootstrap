@@ -221,10 +221,16 @@ install_tools() {
   hash -r
   [[ "$(node --version)" == "v$NODE_VERSION" ]] || { echo 'Node version does not match lock.' >&2; exit 24; }
 
-  "$node_dir/bin/npm" install --global --save-exact \
+  "$node_dir/bin/npm" install --global --save-exact --prefix "$node_dir" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
     "bun@$BUN_VERSION"
+  for package_dir in '@openai/codex' '@anthropic-ai/claude-code' bun; do
+    [[ -d "$node_dir/lib/node_modules/$package_dir" ]] || {
+      echo "npm did not install '$package_dir' under the pinned Node prefix '$node_dir'." >&2
+      exit 24
+    }
+  done
   for executable in codex claude bun bunx; do
     ln -sfn "$node_dir/bin/$executable" "$bin_dir/$executable"
   done
