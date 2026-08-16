@@ -1,0 +1,7 @@
+interface:
+  display_name: "Herdr Coordination"
+  short_description: "Coordinate durable pane names and live-agent handoffs"
+  default_prompt: "Use $herdr-coordination to request or maintain a canonical pane name through Coordination, keep the work subtitle current, and route any relevant live-agent handoffs with proof-bound delivery."
+
+policy:
+  allow_implicit_invocation: true

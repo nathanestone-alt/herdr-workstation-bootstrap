@@ -1,0 +1,26 @@
+{
+  "skill_name": "stmodel-tier1-gate",
+  "evals": [
+    {
+      "id": 0,
+      "name": "recalc-no-libreoffice",
+      "prompt": "I'm working in the STModel repo (C:\\dev\\STModel). I just changed some formulas in model/workbook/STModel.xlsm and I want to recalculate it and confirm there are no formula errors (#REF!, #NAME?, #DIV/0! etc). What's the right way to do this here, and write me the script to do it. Don't actually run it -- just give me the script and the exact command.",
+      "expected_output": "A pywin32 COM recalc approach (DispatchEx isolated Excel, CalculateFull) against a COPY of the workbook, using py -3.13, that explicitly does NOT use LibreOffice (because the RedIQ add-in / VBA UDFs aren't loaded there and would produce false #NAME?/#REF! errors).",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "author-runtime-gate",
+      "prompt": "In the STModel repo (C:\\dev\\STModel) I just rebuilt the levered cash-flow cache (_MLECache) for scenario 1. Write me a Tier-1 runtime gate script that opens the workbook, recalculates, and asserts that the loan balance (mle_bal_end) is zero at the exit month (mle_ctl_flagmo). It should pass/fail cleanly and be safe to run on CI. Don't run it -- just write the script and tell me how to invoke it.",
+      "expected_output": "A runtime gate script that: uses py -3.13; attaches via isolated DispatchEx (not GetActiveObject) against a COPY; calls CalculateFull; reads values by NAMED RANGE (mle_bal_end, mle_ctl_flagmo) not A1; handles COM-unavailable by printing COM_UNAVAILABLE and exiting 0; exits nonzero only on a hard FAIL. Ideally reuses audit/_tools/com_gate_lib.py / the scaffold.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "verdict-and-classb",
+      "prompt": "I'm doing an independent audit re-run of a workbook change in the STModel repo (C:\\dev\\STModel) before merging. Some of my runtime checks assert state that only exists AFTER the migration is applied. How should I handle those checks when I run the gate, and what should the verdict I write look like? Show me the verdict format and where it goes. You can write a short example verdict file.",
+      "expected_output": "Explains Class-B precondition checks must SKIP (not FAIL) when run pre-migration (a precondition, not a defect), and that SKIPs don't flip the exit code. Shows the verdict as a Gate | Status | Evidence markdown table plus a bold verdict line (MERGE-OK / BLOCK), written to audit/findings/<dispatch>_gate_review.md.",
+      "files": []
+    }
+  ]
+}
