@@ -1,73 +1,55 @@
 # Manual Start: From Sealed Box to First Agent
 
-These are the steps that require a person. Complete them in order. Do not attempt to automate Windows OOBE, account recovery, license acceptance, or security-key storage.
+These steps require a person. Complete them in order. Do not automate Windows OOBE, account recovery, license acceptance, recovery-key storage, or credential entry.
 
-## Before touching the new MS-A2
+## Before touching the MS-A2
 
 On the current Surface:
 
-1. Confirm this repository is private on GitHub and the latest commit is pushed.
-2. Confirm you can sign into:
-   - the Microsoft account used for Windows/Office;
-   - GitHub account `nathanestone-alt`;
-   - ChatGPT/Codex;
-   - Anthropic/Claude;
-   - Tailscale;
-   - Backblaze/Veeam later, when backup is installed.
-3. Save recovery codes for accounts using two-factor authentication.
-4. Do not retire or erase the Surface. It remains the known-good reference until the MS-A2 passes every validation gate.
-5. Have the Windows 11 Pro USB/product key available, but first check whether the MS-A2 already has an activated Windows Pro license.
-6. Confirm the Surface can still access the Hostinger VPS and that Hostinger hPanel recovery is available.
-
-The custom-skill export is intentionally not automatic. After the repository exists, an agent on the Surface can run:
-
-~~~powershell
-pwsh -File .\scripts\windows\Export-MigrationPayload.ps1 -Destination .\payload
-~~~
-
-Review the resulting files for secrets before forcing them past `.gitignore` into this private repository. Never export Codex/Claude authentication files, plugin caches, private SSH keys, or browser profiles.
+1. Confirm this private repository is current on GitHub.
+2. Confirm access to Microsoft/Office, GitHub (`nathanestone-alt`), Codex, Claude, Tailscale and Hostinger hPanel.
+3. Save current recovery codes outside either computer.
+4. Keep the Surface intact as the known-good reference until every commissioning gate passes.
+5. Keep the Windows 11 Pro USB sealed until the installed Windows edition and activation are checked.
+6. Export only reviewed custom skills with `scripts/windows/Export-MigrationPayload.ps1`. Never export authentication files, private SSH keys, browser profiles or plugin caches.
 
 ## 1. Physical setup
 
-1. Connect the MS-A2 and monitor to battery-backed UPS outlets.
+1. Put the MS-A2 and setup monitor on battery-backed UPS outlets.
 2. Connect Ethernet to the primary 2.5 GbE port.
-3. Connect the monitor and the Logitech MK270 USB receiver directly for initial setup.
-4. Keep the Comet KVM and Fingerbot available, but do not make them the only console path until Windows and networking are stable.
-5. Power on and enter firmware setup if needed. Confirm approximately 64 GB RAM and a 2 TB SSD are detected.
+3. Connect the monitor and Logitech MK270 receiver directly.
+4. Keep the Comet KVM as a second path until local Windows and networking are stable.
+5. Confirm firmware detects about 64 GB RAM and the 2 TB SSD.
+6. Enable AMD-V/SVM virtualization only if Task Manager later reports virtualization disabled.
 
 ## 2. Windows first boot
 
-1. Complete Windows OOBE with the normal long-term user account.
-2. Set a strong Windows Hello PIN and record the Microsoft-account recovery path.
-3. Open **Settings → System → Activation**.
-   - If Windows 11 Pro is already activated, leave the retail USB unopened and return it.
-   - If Home is installed, use the purchased Pro license to upgrade.
-   - If no valid license is present, install/activate Pro from the purchased media.
-4. Rename the computer `HERDR-WIN` and reboot.
-5. Run Windows Update repeatedly, including optional driver/firmware updates, until no important updates remain.
-6. Install current MS-A2/AMD drivers from the manufacturer if Device Manager shows missing devices or Windows supplied older generic drivers.
-7. Confirm the clock, time zone, Ethernet, audio, and display are correct.
+1. Complete Windows OOBE using the normal long-term account.
+2. Verify **Settings > System > Activation**:
+   - Activated Windows 11 Pro: return the unopened retail USB.
+   - Windows Home: upgrade with the purchased Pro license.
+   - No valid OS/license: install and activate from the purchased media.
+3. Rename the computer `HERDR-WIN` and reboot.
+4. Run Windows Update repeatedly, including relevant firmware and driver updates.
+5. Confirm Task Manager reports 64 GB RAM, 32 logical processors and virtualization enabled.
+6. Confirm Ethernet, time zone and display behavior.
 
-## 3. Security and recovery
+## 3. Security, recovery and Excel
 
-1. Enable BitLocker/device encryption.
-2. Save the recovery key outside this computer and verify you can retrieve it.
-3. Keep Windows Defender and the firewall enabled.
-4. Set power behavior so AC restoration powers the machine on if the firmware supports it.
-5. Install/configure the CyberPower utility only if it provides tested graceful shutdown for the UPS.
-6. Do not enable automatic Windows sign-in. Excel COM requires an interactive user session; use RDP or the Comet KVM to sign in after a reboot.
+1. Enable BitLocker and verify the recovery key from another device.
+2. Keep Defender and Windows Firewall enabled.
+3. Configure firmware **Restore on AC Power Loss** if available.
+4. Configure the CyberPower UPS for an orderly host shutdown.
+5. Do not enable automatic Windows sign-in.
+6. Install and activate 64-bit Microsoft 365 desktop Excel.
+7. Create, save, reopen and close a disposable workbook in `C:\HerdrExchange`.
+8. Resolve Excel Trust Center, add-in, activation and Protected View prompts.
 
-## 4. Install Office and prove Excel manually
+Excel COM still requires the designated Windows user to be interactively signed in. The Ubuntu VM can start and accept SSH before that login occurs.
 
-1. Install Microsoft 365 desktop apps, 64-bit.
-2. Sign in and activate Office.
-3. Launch Excel manually.
-4. Create, save, reopen, and close a disposable workbook under `C:\HerdrExchange`.
-5. Resolve Trust Center, add-in, activation, or Protected View prompts now.
+## 4. Install the minimum bootstrap tools
 
-## 5. Install the minimum bootstrap tools
-
-Open **Windows Terminal or PowerShell as Administrator** and run:
+From an elevated Windows Terminal or PowerShell window:
 
 ~~~powershell
 winget install --id Microsoft.PowerShell --exact --accept-source-agreements --accept-package-agreements
@@ -75,7 +57,7 @@ winget install --id Git.Git --exact --accept-source-agreements --accept-package-
 winget install --id GitHub.cli --exact --accept-source-agreements --accept-package-agreements
 ~~~
 
-Close the terminal and open **PowerShell 7**. Authenticate GitHub:
+Open PowerShell 7 and clone the repository:
 
 ~~~powershell
 gh auth login --web
@@ -86,56 +68,52 @@ gh repo clone nathanestone-alt/herdr-workstation-bootstrap
 Set-Location .\herdr-workstation-bootstrap
 ~~~
 
-If the final repository name differs, use the URL shown at handoff.
+## 5. Download Ubuntu Server
+
+Download the current Ubuntu Server 24.04 LTS AMD64 ISO from Ubuntu's official site. Save it under `C:\InstallMedia` and verify its SHA256 value against Ubuntu's published checksum before using it.
+
+Do not use an ARM64 image and do not download an unofficial prebuilt VM.
 
 ## 6. Install one temporary Windows agent
 
-Only one Windows agent is required to bootstrap Ubuntu. Installing both on Windows is optional because the durable agent environment will be Ubuntu.
+Install either the current Codex Windows app/CLI or Claude Code from its official source and authenticate it. This Windows agent is the bootstrap operator and emergency fallback; durable Herdr work will run in Ubuntu.
 
-### Preferred: Codex on Windows
-
-Install the current Codex Windows app/CLI from official OpenAI sources, sign in, open this repository, and start a session. Official OpenAI guidance still treats WSL2 as the preferred Linux-native environment; this Windows installation is the bootstrap operator and emergency fallback.
-
-### Alternative: Claude Code on Windows
-
-Use Anthropic's current official Windows installation instructions, launch `claude` from PowerShell 7 in this repository, and sign in.
-
-Do not copy an ARM64 Codex or Claude executable from the Surface.
+Do not copy ARM64 executables from the Surface.
 
 ## 7. Hand control to the Windows agent
 
-Give the agent the prompt in [README.md](README.md). The agent should begin with:
+Give the agent the prompt from [README.md](README.md). It begins with:
 
 ~~~powershell
 pwsh -File .\bootstrap.ps1 -Stage Status
 pwsh -File .\bootstrap.ps1 -Stage WindowsBase
+pwsh -File .\bootstrap.ps1 -Stage HyperVEnable
 ~~~
 
-Expect the agent to stop for at least one reboot during WSL installation.
+Stop and reboot when requested. After reboot, the agent creates the VM using the verified ISO:
 
-## 8. Human checkpoints during agent setup
+~~~powershell
+pwsh -File .\bootstrap.ps1 -Stage VmCreate -UbuntuIsoPath C:\InstallMedia\ubuntu-24.04-live-server-amd64.iso
+~~~
 
-Remain available for these interactive steps:
+The exact ISO filename may differ.
 
-1. Rebooting Windows after WSL/feature installation.
-2. Launching Ubuntu once and choosing the Linux username/password.
-3. Approving `sudo` prompts in Ubuntu.
-4. Browser authentication for GitHub, Codex, Claude, and Tailscale inside Ubuntu.
-5. Confirming Office/Excel UI prompts.
-6. Saving recovery keys and backup recovery media.
-7. Logging back into Windows after a reboot so Excel COM and the WSL startup task can run.
-8. Installing and signing into Tailscale on the laptop and phone.
-9. Creating a separate SSH key in the laptop and phone clients.
-10. Authenticating the Hostinger VPS to Tailscale and approving its new workstation public key.
+## 8. Human checkpoints after agent handoff
+
+Remain available for:
+
+1. The Hyper-V feature reboot.
+2. Ubuntu installation through VMConnect and creation of the Linux username/password.
+3. Removing/detaching the ISO after installation.
+4. `sudo` prompts.
+5. GitHub, Codex, Claude and both Tailscale authentications.
+6. Creating and storing the non-admin `HerdrBridge` SMB password.
+7. Installing laptop and phone SSH keys.
+8. Confirming Office UI prompts and interactive Excel COM.
+9. Tailscale/SSH onboarding of the Hostinger VPS.
+10. Recovery, KVM, UPS and off-LAN tests.
 
 ## Manual runway completion gate
 
-The manual runway is complete when:
+The manual runway is complete when Windows 11 Pro and Office are activated, BitLocker recovery is proven, the verified Ubuntu ISO is available, GitHub can clone this private repository, and one Windows agent is running here. Continue with [AGENT-HANDOFF.md](AGENT-HANDOFF.md).
 
-- Windows 11 Pro and Microsoft 365 are activated.
-- GitHub CLI can clone this private repository.
-- A Windows Codex or Claude session is operating in the repository.
-- The user knows where the BitLocker recovery key is stored.
-- The Surface remains available as a reference.
-
-From that point, follow the agent runbook.

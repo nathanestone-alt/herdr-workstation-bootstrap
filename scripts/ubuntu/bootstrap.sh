@@ -21,19 +21,23 @@ mkdir -p "$state_dir"
 install_base() {
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential ca-certificates curl git git-lfs gh gnupg jq mosh \
+    apt-transport-https build-essential ca-certificates cifs-utils curl git git-lfs gh gnupg jq mosh \
     openssh-client openssh-server pkg-config ripgrep rsync unzip zip
   git lfs install
 
-  if ! grep -Eq '^systemd=true$' /etc/wsl.conf 2>/dev/null; then
-    sudo install -m 0644 "$repo_root/config/wsl.conf" /etc/wsl.conf
-    echo "Installed /etc/wsl.conf. From Windows run 'wsl --shutdown', reopen Ubuntu, and rerun this phase." >&2
-    touch "$state_dir/restart-wsl-required"
-    exit 20
-  fi
   if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
-    echo "PID 1 is not systemd. From Windows run 'wsl --shutdown', reopen Ubuntu, and rerun." >&2
+    echo "PID 1 is not systemd. This bootstrap expects a normal Ubuntu VM boot." >&2
     exit 21
+  fi
+
+  if ! command -v pwsh >/dev/null 2>&1; then
+    source /etc/os-release
+    package="packages-microsoft-prod.deb"
+    curl -fsSLo "$package" "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb"
+    sudo dpkg -i "$package"
+    rm -f "$package"
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y powershell
   fi
 
   sudo systemctl enable --now ssh
@@ -90,7 +94,7 @@ install_tools() {
   fi
   mkdir -p "$HOME/code"
   touch "$state_dir/tools-complete"
-  echo 'Tool installation complete. Authentication and Herdr integrations remain manual.'
+  echo 'Tool installation complete. Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 
 case "$phase" in

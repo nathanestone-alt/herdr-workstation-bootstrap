@@ -7,4 +7,3 @@ localhostForwarding=true
 [experimental]
 autoMemoryReclaim=gradual
 sparseVhd=true
-

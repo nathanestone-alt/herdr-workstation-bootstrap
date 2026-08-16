@@ -12,11 +12,17 @@ check_command() {
   fi
 }
 
-printf 'WSL kernel: %s\n' "$(uname -r)"
+printf 'Kernel: %s\n' "$(uname -r)"
+if grep -qi microsoft /proc/sys/kernel/osrelease; then
+  echo 'FAIL environment is WSL; the primary architecture requires an Ubuntu Hyper-V VM'
+  failures=$((failures + 1))
+else
+  echo 'PASS environment is a standalone Linux VM'
+fi
 printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
 [[ "$(ps -p 1 -o comm=)" == "systemd" ]] || failures=$((failures + 1))
 
-for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun; do
+for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs; do
   check_command "$command"
 done
 if command -v systemctl >/dev/null 2>&1; then
@@ -38,10 +44,10 @@ herdr --version 2>/dev/null || true
 git --version 2>/dev/null || true
 gh --version 2>/dev/null | head -n 1 || true
 mosh --version 2>/dev/null | head -n 1 || true
+pwsh --version 2>/dev/null || true
 
 if [[ "$failures" -ne 0 ]]; then
   echo "Verification failed: $failures check(s)" >&2
   exit 1
 fi
 echo 'Ubuntu bootstrap verification passed.'
-

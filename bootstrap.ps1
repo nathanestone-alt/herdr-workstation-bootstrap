@@ -1,8 +1,10 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('Status', 'WindowsBase', 'WslInstall', 'WslConfigure', 'Excel')]
+    [ValidateSet('Status', 'WindowsBase', 'HyperVEnable', 'VmCreate', 'Excel')]
     [string]$Stage = 'Status'
+    ,
+    [string]$UbuntuIsoPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +55,14 @@ function Show-Status {
     $activation = Get-CimInstance SoftwareLicensingProduct |
         Where-Object { $_.PartialProductKey -and $_.Name -like 'Windows*' } |
         Select-Object -First 1 Name, LicenseStatus
-    $distros = @(& wsl.exe --list --quiet 2>$null) | ForEach-Object { $_ -replace "`0", '' } | Where-Object { $_.Trim() }
+    $hyperV = try {
+        Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop
+    } catch {
+        $null
+    }
+    $vm = if (Get-Command Get-VM -ErrorAction SilentlyContinue) {
+        Get-VM -Name 'herdr-ubuntu' -ErrorAction SilentlyContinue
+    }
 
     [pscustomobject]@{
         ComputerName       = $env:COMPUTERNAME
@@ -66,7 +75,9 @@ function Show-Status {
         CDriveFreeGB       = if ($disk) { [math]::Round($disk.SizeRemaining / 1GB, 1) } else { $null }
         Activation         = if ($activation) { "$($activation.Name); status=$($activation.LicenseStatus)" } else { 'not detected' }
         IsAdministrator    = Test-Administrator
-        WslDistributions   = $distros -join ', '
+        HypervisorPresent  = $computer.HypervisorPresent
+        HyperV             = if ($hyperV) { $hyperV.State } else { 'not detected' }
+        UbuntuVM           = if ($vm) { "$($vm.State); autostart=$($vm.AutomaticStartAction)" } else { 'not created' }
         PowerShell         = $PSVersionTable.PSVersion.ToString()
         Git                = Get-CommandState git
         GitHubCLI          = Get-CommandState gh
@@ -99,24 +110,23 @@ function Install-WindowsBase {
     Write-Host 'Windows base complete. Office activation, BitLocker recovery storage, Tailscale login, and UPS policy remain manual.'
 }
 
-function Install-Wsl {
+function Enable-HyperV {
     Assert-Administrator
-    $distros = @(& wsl.exe --list --quiet 2>$null) | ForEach-Object { $_ -replace "`0", '' } | Where-Object { $_.Trim() }
-    if ($distros -match '^Ubuntu') {
-        Write-Host "Ubuntu already registered: $($distros -join ', ')"
+    $feature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All
+    if ($feature.State -eq 'Enabled') {
+        Write-Host 'Hyper-V is already enabled.'
         return
     }
-    Write-Host 'Installing WSL2 and the current Ubuntu distribution.'
-    & wsl.exe --install --distribution Ubuntu
-    Write-Warning 'A Windows reboot and first interactive Ubuntu launch may be required. Stop here and complete both before WslConfigure.'
+    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
+    Write-Warning 'Hyper-V was enabled. Reboot Windows before running the VmCreate stage.'
 }
 
-function Configure-Wsl {
+function New-UbuntuVm {
     Assert-Administrator
-    Backup-AndCopy -Source (Join-Path $RepoRoot 'config\wslconfig') -Destination (Join-Path $env:USERPROFILE '.wslconfig')
-    & (Join-Path $RepoRoot 'scripts\windows\Register-UbuntuStartup.ps1')
-    & wsl.exe --shutdown
-    Write-Host 'WSL resource limits installed. WSL was shut down so the next launch loads them.'
+    if (-not $UbuntuIsoPath) {
+        throw 'VmCreate requires -UbuntuIsoPath pointing to the downloaded Ubuntu Server 24.04 LTS ISO.'
+    }
+    & (Join-Path $RepoRoot 'scripts\windows\New-HerdrUbuntuVM.ps1') -IsoPath $UbuntuIsoPath
 }
 
 function Install-ExcelEnvironment {
@@ -126,8 +136,7 @@ function Install-ExcelEnvironment {
 switch ($Stage) {
     'Status'        { Show-Status }
     'WindowsBase'  { Install-WindowsBase }
-    'WslInstall'   { Install-Wsl }
-    'WslConfigure' { Configure-Wsl }
+    'HyperVEnable' { Enable-HyperV }
+    'VmCreate'     { New-UbuntuVm }
     'Excel'         { Install-ExcelEnvironment }
 }
-
