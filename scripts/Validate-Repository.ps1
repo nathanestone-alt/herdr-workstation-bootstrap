@@ -44,6 +44,7 @@ if ($bashCandidates) {
     }
     foreach ($relativeTest in @(
         'tests\test-bootstrap-profile.sh',
+        'tests\test-configure-excel-share-inputs.sh',
         'tests\test-configure-vps-client.sh',
         'tests\test-verify-vps-access.sh',
         'tests\test-verify-path.sh'
@@ -82,6 +83,7 @@ $requiredFiles = @(
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
     'scripts\ubuntu\configure-excel-share.sh',
     'tests\test-bootstrap-profile.sh',
+    'tests\test-configure-excel-share-inputs.sh',
     'tests\test-configure-vps-client.sh',
     'tests\test-verify-vps-access.sh',
     'tests\test-verify-path.sh',
@@ -136,7 +138,7 @@ $contentAssertions = @(
     @{ Path = 'scripts\windows\Install-ExcelAutomation.ps1'; Required = @('C:\HerdrTools\excel-automation'); Forbidden = @('C:\HerdrExchange\scripts') },
     @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
     @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', 'command -v "$executable"', 'cargo_install_root', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
-    @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry'); Forbidden = @() },
+    @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry', 'Mount point must be an absolute path', 'protected system path', 'Windows host contains unsupported characters', 'SMB share name contains unsupported characters'); Forbidden = @() },
     @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
     @{ Path = 'scripts\ubuntu\verify-vps-access.sh'; Required = @('OpenSSH could not resolve alias', 'VPS access was not attempted', '$1=""', 'effective IdentityFile'); Forbidden = @('ssh -G "$alias_name" 2>/dev/null') },
     @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE') }
@@ -154,6 +156,12 @@ foreach ($assertion in $contentAssertions) {
             $failures.Add("Forbidden regressive marker '$forbiddenText': $($assertion.Path)")
         }
     }
+}
+
+$verifyContent = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'scripts\ubuntu\verify.sh')
+$sanitizedLoginPrefix = 'PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc'
+if ([regex]::Matches($verifyContent, [regex]::Escape($sanitizedLoginPrefix)).Count -ne 2) {
+    $failures.Add('verify.sh must sanitize PATH independently at both login-shell call sites.')
 }
 
 Get-ChildItem -LiteralPath $RepoRoot -File -Recurse | Where-Object {

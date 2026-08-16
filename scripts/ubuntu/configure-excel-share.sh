@@ -21,6 +21,35 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$mount_point" != /* ]]; then
+  echo 'Mount point must be an absolute path.' >&2
+  exit 2
+fi
+case "$mount_point" in
+  /|/boot|/home|/etc|/usr|/var)
+    echo "Mount point '$mount_point' is a protected system path." >&2
+    exit 2
+    ;;
+esac
+if [[ ! "$mount_point" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+   [[ "$mount_point" == *//* || "$mount_point" == */./* || "$mount_point" == */../* ||
+      "$mount_point" == */. || "$mount_point" == */.. || "$mount_point" == */ ]]; then
+  echo 'Mount point contains unsupported characters or path components.' >&2
+  exit 2
+fi
+if [[ ! "$windows_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+  echo 'Windows host contains unsupported characters.' >&2
+  exit 2
+fi
+if [[ ! "$share_name" =~ ^[A-Za-z0-9][A-Za-z0-9._$-]*$ ]]; then
+  echo 'SMB share name contains unsupported characters.' >&2
+  exit 2
+fi
+if [[ ! "$windows_user" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]]; then
+  echo 'Windows user contains unsupported characters.' >&2
+  exit 2
+fi
+
 command -v mount.cifs >/dev/null 2>&1 || {
   echo 'mount.cifs is missing; run scripts/ubuntu/bootstrap.sh --phase base first.' >&2
   exit 20

@@ -29,7 +29,7 @@ cat > "$managed_bin/bash" <<'EOF'
 set -euo pipefail
 if [[ "${1:-}" == -lc ]]; then
   shift
-  export PATH='/usr/bin:/bin'
+  printf '%s\n' "$PATH" >> "$HOME/.login-shell-input-paths"
   for startup_file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
     if [[ -f "$startup_file" ]]; then
       . "$startup_file"
@@ -57,6 +57,7 @@ chmod +x "$managed_bin/bash" "$managed_bin/uname" "$managed_bin/grep" "$managed_
 run_verify_layout() {
   local layout="$1"
   local output="$test_root/verify-output-$layout.txt"
+  rm -f "$HOME/.login-shell-input-paths"
   rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
   case "$layout" in
     profile) ;;
@@ -92,6 +93,16 @@ run_verify_layout() {
       exit 1
     fi
   done
+  [[ -s "$HOME/.login-shell-input-paths" ]] || {
+    echo "Login-shell PATH input was not captured for layout '$layout'." >&2
+    exit 1
+  }
+  while IFS= read -r login_input_path; do
+    [[ "$login_input_path" == '/usr/bin:/bin' ]] || {
+      echo "verify.sh invoked a login shell with unsanitized PATH '$login_input_path' for layout '$layout'." >&2
+      exit 1
+    }
+  done < "$HOME/.login-shell-input-paths"
 }
 
 run_verify_layout profile
