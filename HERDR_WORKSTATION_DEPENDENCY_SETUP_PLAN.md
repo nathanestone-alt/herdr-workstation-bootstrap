@@ -27,7 +27,7 @@ The prior WSL2 architecture is no longer primary because WSL lifecycle depends o
 ## Migration rules
 
 1. Do not copy ARM64 programs, Rust binaries, Python environments, Node modules or package caches from the Surface.
-2. Reinstall AMD64/x86-64 executables from current official sources.
+2. Reinstall AMD64/x86-64 executables from the reviewed official artifacts pinned in `config/ubuntu-toolchain.lock`.
 3. Clone repositories fresh under `~/code` in Ubuntu.
 4. Migrate only reviewed source, configuration, public keys and personal skills.
 5. Re-authenticate every service. Never copy token/authentication files or browser profiles.
@@ -35,7 +35,7 @@ The prior WSL2 architecture is no longer primary because WSL lifecycle depends o
 
 ## Current Surface reference inventory
 
-Collected 2026-08-16; versions are evidence, not permanent pins.
+Collected 2026-08-16. Surface versions are reference evidence; Ubuntu recovery pins live in `config/ubuntu-toolchain.lock` and change only through a reviewed lock update.
 
 | Component | Surface | MS-A2 treatment |
 |---|---|---|
@@ -152,8 +152,9 @@ Windows paths:
 C:\HerdrExchange\in
 C:\HerdrExchange\out
 C:\HerdrExchange\logs
-C:\HerdrExchange\scripts
 ~~~
+
+Reviewed Windows executables and job-runner code live only under host-owned `C:\HerdrTools`; that directory is not exported by SMB.
 
 Ubuntu path:
 
@@ -163,12 +164,13 @@ Ubuntu path:
 
 Boundary:
 
-1. `New-HerdrExchangeShare.ps1` creates a non-admin local `HerdrBridge` account, NTFS/SMB Change access and a TCP 445 rule restricted to Tailscale's CGNAT range.
+1. `New-HerdrExchangeShare.ps1` creates or verifies the fixed non-admin local `HerdrBridge` account, grants NTFS/SMB Change only to `in`, `out`, and `logs`, removes non-allowlisted share access, enables SMB encryption, and recreates a TCP 445 rule restricted to Tailscale addresses.
 2. `configure-excel-share.sh` stores credentials root-only outside the repository and creates a systemd automount.
 3. Repositories remain in `~/code`; only workbook inputs/outputs/logs cross SMB.
 4. Excel and COM run only in the designated interactive Windows user session.
-5. A reviewed Windows-side job runner accepts narrow operations and files under `C:\HerdrExchange`. It must reject arbitrary code/payloads.
+5. A reviewed Windows-side job runner under `C:\HerdrTools` accepts narrow operations over files under `C:\HerdrExchange`. It must reject arbitrary code/payloads, and the bridge account must not be able to modify it.
 6. A Windows reboot can restore Ubuntu before login, but Excel jobs wait until the Windows automation user signs in.
+7. The bridge password is long, strong, non-expiring, and stored in the password manager plus Ubuntu's root-only credential file. Rotation is an explicit coordinated maintenance operation followed by a write test.
 
 ## Installation and validation sequence
 
@@ -194,10 +196,10 @@ Boundary:
 - [ ] Run `bootstrap.ps1 -Stage HyperVEnable`; reboot if required.
 - [ ] Run `bootstrap.ps1 -Stage VmCreate -UbuntuIsoPath <verified ISO>`.
 - [ ] Install Ubuntu Server with OpenSSH.
-- [ ] Detach the ISO and set the VHD first in firmware boot order.
+- [ ] Stop the VM, run `scripts/windows/New-HerdrUbuntuVM.ps1 -InstallationComplete`, and restart it.
 - [ ] Confirm the VM resource limits and autostart/stop actions.
 - [ ] Clone this repository under `~/code`.
-- [ ] Run Ubuntu bootstrap base and tools phases.
+- [ ] Run Ubuntu bootstrap base and tools phases and archive `~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` with the commissioning record.
 - [ ] Authenticate GitHub, Codex, Claude and `herdr-ubuntu`.
 
 ### Phase 3 — Remote access
@@ -212,6 +214,7 @@ Boundary:
 ### Phase 4 — Excel bridge
 
 - [ ] Create the restricted Windows SMB share and store its password.
+- [ ] Run `Test-HerdrExchangeBoundary.ps1` and prove the bridge account cannot modify `C:\HerdrTools`.
 - [ ] Mount and write-test it from Ubuntu.
 - [ ] Run the disposable Excel COM test.
 - [ ] Build and validate the narrow interactive Windows job runner.
@@ -268,4 +271,3 @@ Keep passwords, tokens, recovery keys, SMB credentials, private SSH keys and Off
 - The validated `pytest` and Windows Python dependency lock.
 - The narrow command schema for the Windows Excel job runner.
 - The exact deferred 20 TB backup-drive model and final Veeam/Backblaze schedule.
-

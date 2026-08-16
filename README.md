@@ -18,12 +18,13 @@ Once an agent is running in this repository, give it this exact instruction:
 ## Entry points
 
 - `bootstrap.ps1` — Windows status, base packages, Hyper-V enablement, VM creation, and Excel environment.
-- `scripts/windows/New-HerdrUbuntuVM.ps1` — idempotent Generation 2 VM creation with bounded resources and host-level autostart.
-- `scripts/windows/New-HerdrExchangeShare.ps1` — restricted Windows SMB exchange for the Ubuntu VM.
-- `scripts/ubuntu/bootstrap.sh` — Ubuntu packages, native PowerShell, systemd, SSH, Tailscale, Rust/RTK, Codex, Claude Code, Herdr, Bun, and optional Node.
+- `scripts/windows/New-HerdrUbuntuVM.ps1` — convergent Generation 2 VM provisioning with invariant checks, partial-create cleanup, bounded resources, and host-level autostart.
+- `scripts/windows/New-HerdrExchangeShare.ps1` — convergent Windows SMB exchange with a fixed non-admin identity, allowlisted writable directories, encrypted SMB, and a Tailscale-only firewall rule.
+- `scripts/ubuntu/bootstrap.sh` — Ubuntu packages plus the checksum-verified, version-locked toolchain in `config/ubuntu-toolchain.lock`.
 - `scripts/ubuntu/configure-excel-share.sh` — credential-protected SMB mount at `/srv/herdr-exchange`.
 - `scripts/ubuntu/verify.sh` — non-destructive Ubuntu verification.
 - `scripts/windows/Test-ExcelCom.py` — disposable native Excel COM smoke test.
+- `scripts/windows/Test-HerdrExchangeBoundary.ps1` — live negative test proving the SMB bridge cannot modify host-owned automation code.
 - `scripts/windows/Export-MigrationPayload.ps1` — allowlisted export from the old Surface; excludes credentials and plugin caches.
 
 ## Documentation

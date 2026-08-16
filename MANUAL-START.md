@@ -104,10 +104,10 @@ Remain available for:
 
 1. The Hyper-V feature reboot.
 2. Ubuntu installation through VMConnect and creation of the Linux username/password.
-3. Removing/detaching the ISO after installation.
+3. Stopping the VM and running the verified `New-HerdrUbuntuVM.ps1 -InstallationComplete` convergence pass after installation.
 4. `sudo` prompts.
 5. GitHub, Codex, Claude and both Tailscale authentications.
-6. Creating and storing the non-admin `HerdrBridge` SMB password.
+6. Creating and storing the long, strong, non-expiring `HerdrBridge` SMB password; any later rotation must update Ubuntu in the same maintenance window.
 7. Installing laptop and phone SSH keys.
 8. Confirming Office UI prompts and interactive Excel COM.
 9. Tailscale/SSH onboarding of the Hostinger VPS.
@@ -116,4 +116,3 @@ Remain available for:
 ## Manual runway completion gate
 
 The manual runway is complete when Windows 11 Pro and Office are activated, BitLocker recovery is proven, the verified Ubuntu ISO is available, GitHub can clone this private repository, and one Windows agent is running here. Continue with [AGENT-HANDOFF.md](AGENT-HANDOFF.md).
-

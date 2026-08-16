@@ -6,4 +6,3 @@ pywin32==311
 pytest
 XlsxWriter==3.2.9
 xlwings==0.34.0
-

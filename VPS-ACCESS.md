@@ -31,6 +31,7 @@ Before changing the VPS:
 3. Identify Hostinger console/recovery options.
 4. Confirm the current backup date.
 5. Create a fresh Hostinger snapshot before changing SSH, firewall, networking, packages, or the OS.
+6. Obtain the VPS ED25519 host-key SHA-256 fingerprint from Hostinger hPanel/console or the already trusted Surface connection. Do not trust a new network scan as the fingerprint source.
 
 Hostinger retains only one manual snapshot at a time and currently deletes snapshots after 20 days. A restore overwrites current VPS content, so also maintain application/data backups appropriate to the workload.
 
@@ -44,12 +45,13 @@ bash scripts/ubuntu/configure-vps-client.sh \
   --alias hostinger-vps-public \
   --host PUBLIC_IP_OR_NAME \
   --user CURRENT_ADMIN_USER \
-  --port CURRENT_SSH_PORT
+  --port CURRENT_SSH_PORT \
+  --host-key-fingerprint SHA256:INDEPENDENTLY_VERIFIED_FINGERPRINT
 ~~~
 
 Choose a strong passphrase when prompted. The private key remains only in Ubuntu at '~/.ssh/hostinger_vps_ed25519'.
 
-The script prints the public key and creates a backed-up SSH client configuration. Add only the public key through Hostinger hPanel under VPS → Manage → Settings → SSH keys, or append it through the existing trusted SSH session to the intended user's authorized_keys.
+The script verifies the scanned ED25519 host key against the independent fingerprint, pins it in `known_hosts`, prints the public key, and creates or converges a backed-up SSH client configuration. Add only the public key through Hostinger hPanel under VPS → Manage → Settings → SSH keys, or append it through the existing trusted SSH session to the intended user's authorized_keys.
 
 Do not remove the old Surface key yet.
 
@@ -67,11 +69,17 @@ Keep the old SSH session open during authentication changes. Do not disable pass
 On the VPS:
 
 ~~~bash
-curl -fsSL https://tailscale.com/install.sh | sh
+installer="$(mktemp)"
+curl --proto '=https' --tlsv1.2 -fsSLo "$installer" https://tailscale.com/install.sh
+printf '%s  %s\n' 805e85ed6f6f81a7ea2e70d52d47e7d5290863299e5c922b2787d71aa312f22e "$installer" | sha256sum --check
+sudo env TAILSCALE_VERSION=1.88.4 sh "$installer"
+rm -f "$installer"
 sudo tailscale up --hostname=hostinger-vps
 tailscale status
 tailscale ip -4
 ~~~
+
+These Tailscale version and installer-checksum pins match `config/ubuntu-toolchain.lock`. Update both locations together after reviewing a newer official release.
 
 Authenticate using the shown URL. Add the Tailscale SSH alias:
 
@@ -81,7 +89,8 @@ bash scripts/ubuntu/configure-vps-client.sh \
   --host hostinger-vps \
   --user CURRENT_ADMIN_USER \
   --port 22 \
-  --existing-key ~/.ssh/hostinger_vps_ed25519
+  --existing-key ~/.ssh/hostinger_vps_ed25519 \
+  --host-key-fingerprint SHA256:THE_SAME_VERIFIED_VPS_HOST_KEY
 ~~~
 
 Test before changing public firewall rules:
@@ -140,4 +149,3 @@ Before material changes, confirm backup/snapshot state, document rollback, check
 - [Hostinger Emergency Mode](https://www.hostinger.com/support/5726577-how-to-use-emergency-mode-on-your-vps-at-hostinger/)
 - [Tailscale Linux installation](https://tailscale.com/docs/install/linux)
 - [Tailscale SSH versus ordinary SSH](https://tailscale.com/kb/1193/tailscale-ssh)
-

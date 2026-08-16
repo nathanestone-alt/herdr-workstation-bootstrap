@@ -22,4 +22,3 @@ Copy this file to 'LOCAL-VPS-INVENTORY.md'; do not put real private details in t
 - MS-A2 Tailscale SSH verified:
 - hPanel recovery verified:
 - notes without secrets:
-

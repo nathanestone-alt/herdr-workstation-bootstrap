@@ -61,13 +61,11 @@ Have the user install Ubuntu with OpenSSH enabled. After installation:
 
 ~~~powershell
 Stop-VM -Name herdr-ubuntu
-Get-VMDvdDrive -VMName herdr-ubuntu | Set-VMDvdDrive -Path $null
-$disk = Get-VMHardDiskDrive -VMName herdr-ubuntu
-Set-VMFirmware -VMName herdr-ubuntu -FirstBootDevice $disk
+pwsh -File .\scripts\windows\New-HerdrUbuntuVM.ps1 -InstallationComplete
 Start-VM -Name herdr-ubuntu
 ~~~
 
-Confirm `AutomaticStartAction=Start` and `AutomaticStopAction=Save`.
+The convergence pass verifies the system VHD, Generation 2, switch, CPU and dynamic-memory bounds, Secure Boot, and automatic start/stop settings before detaching the ISO. It fails closed on incompatible pre-existing state.
 
 ## Phase E — Ubuntu bootstrap
 
@@ -82,7 +80,7 @@ bash scripts/ubuntu/bootstrap.sh --phase base
 bash scripts/ubuntu/bootstrap.sh --phase tools
 ~~~
 
-This installs native PowerShell 7, CIFS support, systemd services, SSH, Mosh, Tailscale, Rust/RTK, Codex, Claude, Herdr, Bun and optional Node.
+This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
 
 Have the user authenticate:
 
@@ -113,23 +111,24 @@ From elevated interactive Windows PowerShell:
 
 ~~~powershell
 pwsh -File .\scripts\windows\New-HerdrExchangeShare.ps1
+pwsh -File .\scripts\windows\Test-HerdrExchangeBoundary.ps1
 pwsh -File .\bootstrap.ps1 -Stage Excel
 ~~~
 
-The user supplies and stores the dedicated non-admin `HerdrBridge` password. From Ubuntu:
+The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only by running the Windows script with `-RotatePassword`, immediately updating Ubuntu, and completing the write test in the same maintenance window. From Ubuntu:
 
 ~~~bash
 bash scripts/ubuntu/configure-excel-share.sh --host herdr-win
 ~~~
 
-Confirm Ubuntu can write a disposable file and Windows can open it. The SMB account must not belong to Administrators or Remote Desktop Users.
+The boundary test runs a child process as `HerdrBridge` and must prove it can write `in` but cannot create a file under `C:\HerdrTools`. Then confirm Ubuntu can write disposable files only below `in`, `out`, and `logs`, and that Windows can open them. The SMB account must not belong to Administrators or Remote Desktop Users.
 
-Create a narrow Windows-side job runner for the actual workbook automation. It must run in the designated interactive Windows session, accept only reviewed operations and paths under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
+Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
 
 ## Phase H — Herdr, skills and plugins
 
 1. Record `herdr --version`.
-2. Install current official Codex and Claude integrations.
+2. Install Codex and Claude integrations compatible with the locked CLI versions; review and update the lock before upgrading.
 3. Reinstall plugins through supported marketplaces; do not copy caches.
 4. Reconnect external apps only with user approval.
 5. Run `bash scripts/ubuntu/install-payload.sh`.
@@ -156,4 +155,3 @@ bash scripts/ubuntu/verify.sh
 ~~~
 
 Also validate repository checks, Windows RDP, off-LAN SSH/Mosh, Herdr detach/reattach, cold-boot/no-login VM recovery, Comet/Fingerbot recovery, Excel COM, SMB permissions, VPS access and backup restoration once the deferred drive arrives.
-

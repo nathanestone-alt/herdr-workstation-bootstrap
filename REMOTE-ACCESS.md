@@ -105,4 +105,3 @@ Do not copy a stale ACL example without validating the current policy syntax.
 10. Inspect the router and confirm no inbound port forwarding exists.
 
 Record working names, usernames and test dates only in the uncommitted commissioning log. Follow [VPS-ACCESS.md](VPS-ACCESS.md) for the separate `hostinger-vps` endpoint.
-

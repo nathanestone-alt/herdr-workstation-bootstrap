@@ -46,7 +46,9 @@ if ($bashCandidates) {
 $requiredFiles = @(
     'scripts\windows\New-HerdrUbuntuVM.ps1',
     'scripts\windows\New-HerdrExchangeShare.ps1',
+    'scripts\windows\Test-HerdrExchangeBoundary.ps1',
     'scripts\ubuntu\configure-excel-share.sh',
+    'config\ubuntu-toolchain.lock',
     'legacy\WSL2-FALLBACK.md'
 )
 foreach ($relativePath in $requiredFiles) {
@@ -81,6 +83,39 @@ foreach ($relativePath in $primaryFiles) {
         if ($content.Contains($pattern, [StringComparison]::OrdinalIgnoreCase)) {
             $failures.Add("Stale primary WSL instruction '$pattern': $relativePath")
         }
+    }
+}
+
+$contentAssertions = @(
+    @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'S-1-5-32-545', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false') },
+    @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', 'exit 41', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @() },
+    @{ Path = 'scripts\windows\Install-ExcelAutomation.ps1'; Required = @('C:\HerdrTools\excel-automation'); Forbidden = @('C:\HerdrExchange\scripts') },
+    @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Orphan VHD', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
+    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
+    @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @("already exists in `$config; no change made") }
+)
+foreach ($assertion in $contentAssertions) {
+    $assertionPath = Join-Path $RepoRoot $assertion.Path
+    $assertionContent = Get-Content -Raw -LiteralPath $assertionPath
+    foreach ($requiredText in $assertion.Required) {
+        if (-not $assertionContent.Contains($requiredText, [StringComparison]::Ordinal)) {
+            $failures.Add("Required remediation marker '$requiredText' missing: $($assertion.Path)")
+        }
+    }
+    foreach ($forbiddenText in $assertion.Forbidden) {
+        if ($assertionContent.Contains($forbiddenText, [StringComparison]::Ordinal)) {
+            $failures.Add("Forbidden regressive marker '$forbiddenText': $($assertion.Path)")
+        }
+    }
+}
+
+Get-ChildItem -LiteralPath $RepoRoot -File -Recurse | Where-Object {
+    $_.FullName -notlike "$(Join-Path $RepoRoot '.git')*" -and
+    $_.Extension -in @('.md', '.ps1', '.py', '.sh', '.txt', '.env', '.html', '.lock')
+} | ForEach-Object {
+    $text = Get-Content -Raw -LiteralPath $_.FullName
+    if ($text -match '(?:\r?\n){2,}\z') {
+        $failures.Add("Extra blank line at EOF: $($_.FullName)")
     }
 }
 
