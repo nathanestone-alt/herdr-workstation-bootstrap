@@ -141,7 +141,7 @@ OneDrive is a transfer and version-history layer, not an automation workspace:
 1. Upload a uniquely named workbook to `Inbox` from the laptop.
 2. The reviewed staging helper must reject the `Offline`, `RecallOnOpen`, and `RecallOnDataAccess` attributes, then require unchanged size, last-write time, and SHA-256 across two exclusive reads separated by a settle interval. A green OneDrive icon or Always keep on this device request alone is not acceptance evidence.
 3. Preserve the Inbox original, record its SHA-256, copy it into a job-specific directory below `C:\HerdrExchange\in`, and immediately re-hash that copy. Refuse the job unless both hashes match.
-4. Ubuntu agents may inspect the bridge copy. Immediately before Excel/COM execution, the Windows runner must copy the accepted workbook into host-owned `C:\HerdrReviewJobs\<job-id>`, which is not shared with `HerdrBridge`, and re-hash it against the accepted staged hash. Excel opens only that immutable last-mile copy.
+4. Ubuntu agents may inspect the bridge copy. Immediately before Excel/COM execution, the Windows runner must copy the accepted workbook into protected, host-owned `C:\HerdrReviewJobs\<job-id>`, which is not shared with `HerdrBridge`, and re-hash it against the accepted staged hash. `New-HerdrExchangeShare.ps1` establishes the DACL, the boundary test proves bridge writes fail, and Excel opens only that immutable last-mile copy.
 5. Copy the completed workbook plus a small provenance manifest to `Outbox`; include the source, bridge-stage, last-mile and result paths/hashes, timestamp, and originating repository/branch/commit when applicable.
 6. After acceptance, move the transfer set to `Archive` according to the retention policy.
 

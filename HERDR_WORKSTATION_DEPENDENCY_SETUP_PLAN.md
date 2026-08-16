@@ -165,7 +165,7 @@ Ubuntu path:
 Boundary:
 
 1. `New-HerdrExchangeShare.ps1` creates or verifies the fixed non-admin local `HerdrBridge` account, grants NTFS/SMB Change only to `in`, `out`, and `logs`, removes non-allowlisted share access, enables SMB encryption, and recreates a TCP 445 rule restricted to Tailscale addresses.
-2. `configure-excel-share.sh` validates fstab and the explicit Ubuntu owner before mutation, proves a candidate password through a separate `nosharesock` mount/write test, then atomically installs the root-only credential and converged systemd automount. Ownership changes require `--reassign-owner`.
+2. `configure-excel-share.sh` validates fstab and the explicit Ubuntu owner before mutation, proves a candidate password through a separate `nosharesock` mount/write test, installs the proven root-only credential before converging fstab, and reports the exact recovery state if a busy live mount cannot be replaced. Ownership changes require `--reassign-owner`.
 3. Repositories remain in `~/code`; only workbook inputs/outputs/logs cross SMB.
 4. Excel and COM run only in the designated interactive Windows user session.
 5. A reviewed Windows-side job runner under `C:\HerdrTools` accepts narrow operations over files under `C:\HerdrExchange`. It must reject arbitrary code/payloads, and the bridge account must not be able to modify it.
@@ -180,7 +180,7 @@ GitHub remains authoritative for repositories. Use the Windows OneDrive client o
 - Keep OneDrive off Ubuntu; Ubuntu reaches only the restricted `/srv/herdr-exchange` staging area.
 - Require a hydration/stability gate: reject Offline/Recall attributes and require two exclusive reads with stable size, last-write time and SHA-256 across a settle interval.
 - Preserve each Inbox original, stage a copied workbook under `C:\HerdrExchange\in\<job-id>`, and verify its hash again after the copy.
-- Before Excel/COM opens a workbook, copy the accepted bridge file into non-shared, host-owned `C:\HerdrReviewJobs\<job-id>` and re-verify the accepted hash. The bridge identity must never have write access to that last-mile directory.
+- Before Excel/COM opens a workbook, copy the accepted bridge file into non-shared, host-owned `C:\HerdrReviewJobs\<job-id>` and re-verify the accepted hash. `New-HerdrExchangeShare.ps1` protects that root DACL and `Test-HerdrExchangeBoundary.ps1` proves the bridge identity cannot write there.
 - Return the result through Outbox with a manifest containing source, bridge-stage, last-mile and result paths/hashes, timestamps, and repository/branch/commit provenance when the workbook came from STModel work.
 - Never operate Excel automation directly in OneDrive or a bridge-writable directory, and never store repositories, VM disks, secrets, logs, or databases there.
 - Treat macros, external links, and data connections as executable content requiring an explicit trust decision.

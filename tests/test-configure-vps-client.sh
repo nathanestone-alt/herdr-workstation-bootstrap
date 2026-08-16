@@ -112,7 +112,12 @@ fi
 printf '\nHost *\n  AddKeysToAgent yes\n' >> "$HOME/.ssh/config"
 bash "$script" --alias wildcard-vps --host wildcard.example --user admin --port 22 \
   --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
-[[ "$(head -n 2 "$HOME/.ssh/config" | tail -n 1)" == 'Host wildcard-vps' ]]
+grep -Fq '# BEGIN herdr-bootstrap wildcard-vps' "$HOME/.ssh/config"
+mapfile -t managed_aliases < <(sed -n 's/^# BEGIN herdr-bootstrap //p' "$HOME/.ssh/config")
+[[ "$(printf '%s\n' "${managed_aliases[@]}")" == "$(printf '%s\n' "${managed_aliases[@]}" | LC_ALL=C sort)" ]] || {
+  echo 'Managed SSH alias blocks are not in deterministic order.' >&2
+  exit 1
+}
 
 mkdir -p "$HOME/.ssh/config.d"
 printf 'Host included-vps\n  HostName attacker.example\n  ProxyJump attacker.example\n' > "$HOME/.ssh/config.d/common"
@@ -121,5 +126,29 @@ bash "$script" --alias included-vps --host included.example --user admin --port 
   --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
 bash "$script" --alias match-vps --host match.example --user admin --port 22 \
   --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
+
+multi_common=(--existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" --user admin --port 22)
+bash "$script" --alias alpha-vps --host alpha.example "${multi_common[@]}" >/dev/null
+bash "$script" --alias beta-vps --host beta.example "${multi_common[@]}" >/dev/null
+config_hash_before="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+backup_count_before="$(find "$HOME/.ssh" -maxdepth 1 -type f -name 'config.*.bak' | wc -l)"
+bash "$script" --alias alpha-vps --host alpha.example "${multi_common[@]}" >/dev/null
+config_hash_after="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+backup_count_after="$(find "$HOME/.ssh" -maxdepth 1 -type f -name 'config.*.bak' | wc -l)"
+[[ "$config_hash_before" == "$config_hash_after" && "$backup_count_before" == "$backup_count_after" ]] || {
+  echo 'Re-converging an earlier alias rewrote the deterministic managed region.' >&2
+  exit 1
+}
+
+printf '\nHost *\n  SendEnv UNSAFE_TEST_VALUE\n' >> "$HOME/.ssh/config"
+if bash "$script" --alias sendenv-vps --host sendenv.example "${multi_common[@]}" >/dev/null 2>&1; then
+  echo 'Expected an unmanaged accumulating SendEnv option to fail.' >&2
+  exit 1
+fi
+printf '\nHost *\n  IdentityFile %s\n  LocalForward 9999 127.0.0.1:22\n' "$HOME/.ssh/attacker-key" >> "$HOME/.ssh/config"
+if bash "$script" --alias accumulating-vps --host accumulating.example "${multi_common[@]}" >/dev/null 2>&1; then
+  echo 'Expected an unmanaged accumulating identity/forward option to fail.' >&2
+  exit 1
+fi
 
 echo 'configure-vps-client convergence tests passed.'

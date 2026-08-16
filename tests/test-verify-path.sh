@@ -12,11 +12,8 @@ mkdir -p "$profile_dir"
 cat > "$profile_dir/profile.sh" <<'EOF'
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 EOF
-for profile_file in "$HOME/.profile" "$HOME/.bash_profile"; do
-  printf '. "$HOME/.config/herdr-workstation/profile.sh"\n' > "$profile_file"
-done
-export HERDR_VERIFY_TEST_MODE=1
-export HERDR_TEST_LOGIN_PROFILE="$HOME/.bash_profile"
+printf '. "$HOME/.config/herdr-workstation/profile.sh"\n' > "$HOME/.profile"
+printf '. "$HOME/.profile"\n' > "$HOME/.bash_profile"
 
 checked_commands=(git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs)
 fixture_commands=("${checked_commands[@]}" systemctl)
@@ -25,8 +22,43 @@ for command_name in "${fixture_commands[@]}"; do
   chmod +x "$managed_bin/$command_name"
 done
 
+# Exercise verify.sh's real bash -lc branch without allowing Git Bash's
+# machine-wide /etc/profile to replace the fixture HOME. The wrapper still
+# passes the exact -lc payload to Bash, so malformed nested quoting fails.
+cat > "$managed_bin/bash" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == -lc ]]; then
+  shift
+  . "$HOME/.bash_profile"
+  exec /bin/bash --noprofile --norc -c "$1"
+fi
+exec /bin/bash "$@"
+EOF
+cat > "$managed_bin/uname" <<'EOF'
+#!/bin/bash
+printf '6.8.0-test\n'
+EOF
+cat > "$managed_bin/grep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+cat > "$managed_bin/ps" <<'EOF'
+#!/bin/bash
+printf 'systemd\n'
+EOF
+chmod +x "$managed_bin/bash" "$managed_bin/uname" "$managed_bin/grep" "$managed_bin/ps"
+
 output="$test_root/verify-output.txt"
-PATH='/usr/bin:/bin' bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1 || true
+set +e
+PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  cat "$output" >&2
+  echo "verify.sh exited non-zero in the production login-shell path (status=$status)." >&2
+  exit 1
+fi
 if grep -q '^FAIL command ' "$output"; then
   cat "$output" >&2
   echo 'verify.sh failed to discover a managed command from a fresh minimal PATH.' >&2

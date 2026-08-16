@@ -60,7 +60,7 @@ ssh-add ~/.ssh/hostinger_vps_ed25519
 
 `verify-vps-access.sh` fails with the exact `ssh-add` remediation when the configured public key is not loaded.
 
-The script verifies the scanned ED25519 host key against the independent fingerprint, requires exactly one key for that host token, pins it in `known_hosts`, prints the public key, and creates or converges a backed-up SSH block at the top of the client configuration. It validates the effective configuration with `ssh -G`, so later `Host *`, `Include`, and `Match` content cannot redirect the verified hostname, user, port, identity, host-key files, or proxy path. Add only the public key through Hostinger hPanel under VPS → Manage → Settings → SSH keys, or append it through the existing trusted SSH session to the intended user's authorized_keys.
+The script verifies the scanned ED25519 host key against the independent fingerprint, requires exactly one key for that host token, pins it in `known_hosts`, prints the public key, and converges every managed alias in one deterministic sorted region at the top of the client configuration. It validates the effective configuration with `ssh -G`, requires exactly one managed identity, clears/rejects forwarding and certificate accumulators, and rejects proxy or host-key redirection, so later `Host *`, `Include`, and `Match` content cannot weaken the verified target. Add only the public key through Hostinger hPanel under VPS → Manage → Settings → SSH keys, or append it through the existing trusted SSH session to the intended user's authorized_keys.
 
 Do not remove the old Surface key yet.
 

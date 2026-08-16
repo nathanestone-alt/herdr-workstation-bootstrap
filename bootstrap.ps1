@@ -4,7 +4,13 @@ param(
     [ValidateSet('Status', 'WindowsBase', 'HyperVEnable', 'VmCreate', 'Excel')]
     [string]$Stage = 'Status'
     ,
-    [string]$UbuntuIsoPath
+    [string]$UbuntuIsoPath,
+    [int]$VmProcessorCount = 16,
+    [UInt64]$VmMinimumMemoryBytes = 8GB,
+    [UInt64]$VmStartupMemoryBytes = 16GB,
+    [UInt64]$VmMaximumMemoryBytes = 32GB,
+    [int]$VmHostProcessorReserve = 4,
+    [UInt64]$VmHostMemoryReserveBytes = 16GB
 )
 
 $ErrorActionPreference = 'Stop'
@@ -126,7 +132,16 @@ function New-UbuntuVm {
     if (-not $UbuntuIsoPath) {
         throw 'VmCreate requires -UbuntuIsoPath pointing to the downloaded Ubuntu Server 24.04 LTS ISO.'
     }
-    & (Join-Path $RepoRoot 'scripts\windows\New-HerdrUbuntuVM.ps1') -IsoPath $UbuntuIsoPath
+    $vmParameters = @{
+        IsoPath = $UbuntuIsoPath
+        ProcessorCount = $VmProcessorCount
+        MinimumMemoryBytes = $VmMinimumMemoryBytes
+        StartupMemoryBytes = $VmStartupMemoryBytes
+        MaximumMemoryBytes = $VmMaximumMemoryBytes
+        HostProcessorReserve = $VmHostProcessorReserve
+        HostMemoryReserveBytes = $VmHostMemoryReserveBytes
+    }
+    & (Join-Path $RepoRoot 'scripts\windows\New-HerdrUbuntuVM.ps1') @vmParameters
 }
 
 function Install-ExcelEnvironment {

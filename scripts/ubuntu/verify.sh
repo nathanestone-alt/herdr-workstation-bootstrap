@@ -26,12 +26,7 @@ printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
 for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs; do
   check_command "$command"
 done
-if [[ "${HERDR_VERIFY_TEST_MODE:-0}" == 1 ]]; then
-  [[ -f "${HERDR_TEST_LOGIN_PROFILE:-}" ]] || { echo 'FAIL test login profile missing' >&2; exit 2; }
-  login_path="$(HOME="$HOME" bash --noprofile --norc -c '. "$1"; printf "%s" "$PATH"' bash "$HERDR_TEST_LOGIN_PROFILE")"
-else
-  login_path="$(HOME="$HOME" bash -lc 'printf "%s" "$PATH')"
-fi
+login_path="$(HOME="$HOME" bash -lc 'printf "%s" "$PATH"')"
 for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   if [[ ":$login_path:" == *":$required_path:"* ]]; then
     echo "PASS login PATH includes $required_path"
@@ -41,11 +36,7 @@ for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   fi
 done
 for command in rtk codex claude herdr; do
-  if [[ "${HERDR_VERIFY_TEST_MODE:-0}" == 1 ]]; then
-    login_command="$(HOME="$HOME" bash --noprofile --norc -c '. "$1"; command -v "$2"' bash "$HERDR_TEST_LOGIN_PROFILE" "$command" 2>/dev/null || true)"
-  else
-    login_command="$(HOME="$HOME" bash -lc "command -v $command" 2>/dev/null || true)"
-  fi
+  login_command="$(HOME="$HOME" bash -lc "command -v $command" 2>/dev/null || true)"
   if [[ -n "$login_command" ]]; then
     echo "PASS login command $command $login_command"
   else

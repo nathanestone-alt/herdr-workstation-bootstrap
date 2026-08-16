@@ -55,7 +55,7 @@ Start-VM -Name herdr-ubuntu
 vmconnect.exe localhost herdr-ubuntu
 ~~~
 
-The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. It uses the Default Switch and is configured to start 30 seconds after the Hyper-V service starts, before Windows user login.
+The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. Default safety reserves require at least 20 logical processors and 48 GB installed RAM. On other hardware, pass reviewed `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` overrides through `bootstrap.ps1 -Stage VmCreate`. The VM uses the Default Switch and starts 30 seconds after Hyper-V, before Windows user login.
 
 Have the user install Ubuntu with OpenSSH enabled. After installation:
 
@@ -121,7 +121,7 @@ The user supplies and stores a long, strong password for the fixed, dedicated no
 bash scripts/ubuntu/configure-excel-share.sh --host herdr-win --owner HERDR_UBUNTU_USER
 ~~~
 
-The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and considers only active-profile TCP rules that explicitly name port 445 or a numeric range containing it. The boundary test runs a child process as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including the guarded `scripts` name), cannot create a file under `C:\HerdrTools`, and that no other applicable inbound allow rule explicitly exposes TCP 445.
+The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and includes explicit port 445/ranges plus unscoped TCP rules whose application and service filters can reach SMB. It also creates and protects host-owned `C:\HerdrReviewJobs`. The boundary test runs as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including `scripts`), cannot write `C:\HerdrTools` or `C:\HerdrReviewJobs`, and that no other applicable inbound allow rule exposes TCP 445.
 
 Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
 
@@ -156,6 +156,6 @@ Follow [VPS-ACCESS.md](VPS-ACCESS.md). Preserve hPanel recovery and the Surface 
 bash scripts/ubuntu/verify.sh
 ~~~
 
-Bootstrap installs convergent hooks in `~/.profile` and `~/.bash_profile`. The verification script checks both its controlled PATH and a separate real Bash login shell; Phase K fails if `rtk`, `codex`, `claude`, or `herdr` is not discoverable through the login profile.
+Bootstrap installs a convergent hook in `~/.profile` and updates `~/.bash_profile` only when that file already exists, preserving Ubuntu's normal `.profile` to `.bashrc` login chain. The verification script checks both its controlled PATH and a separate real Bash login shell; Phase K fails if `rtk`, `codex`, `claude`, or `herdr` is not discoverable through the login profile.
 
 Also validate repository checks, Windows RDP, off-LAN SSH/Mosh, Herdr detach/reattach, cold-boot/no-login VM recovery, Comet/Fingerbot recovery, Excel COM, SMB permissions, VPS access and backup restoration once the deferred drive arrives.

@@ -5,16 +5,19 @@ param(
     [string]$LocalUser = 'HerdrBridge',
     [string]$SharePath = 'C:\HerdrExchange',
     [string]$ToolsPath = 'C:\HerdrTools',
+    [string]$ReviewJobsPath = 'C:\HerdrReviewJobs',
     [SecureString]$Password
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'HerdrFirewallPolicy.ps1')
 if (-not $Password) {
     $Password = Read-Host "Password for $env:COMPUTERNAME\$LocalUser" -AsSecureString
 }
 $credential = [PSCredential]::new("$env:COMPUTERNAME\$LocalUser", $Password)
 $probeName = ".herdr-boundary-$([Guid]::NewGuid().ToString('N')).tmp"
 $toolsProbe = Join-Path $ToolsPath $probeName
+$reviewJobsProbe = Join-Path $ReviewJobsPath $probeName
 $rootProbe = Join-Path $SharePath $probeName
 $rootDirectoryProbe = Join-Path $SharePath ".herdr-boundary-$([Guid]::NewGuid().ToString('N')).dir"
 $legacyDirectoryProbe = Join-Path $SharePath 'scripts'
@@ -29,6 +32,13 @@ try {
     [IO.File]::WriteAllText('$($rootProbe.Replace("'", "''"))', 'forbidden')
     Remove-Item -LiteralPath '$($rootProbe.Replace("'", "''"))' -Force -ErrorAction SilentlyContinue
     exit 43
+}
+catch [UnauthorizedAccessException] {
+}
+try {
+    [IO.File]::WriteAllText('$($reviewJobsProbe.Replace("'", "''"))', 'forbidden')
+    Remove-Item -LiteralPath '$($reviewJobsProbe.Replace("'", "''"))' -Force -ErrorAction SilentlyContinue
+    exit 46
 }
 catch [UnauthorizedAccessException] {
 }
@@ -73,17 +83,19 @@ catch {
 }
 
 Remove-Item -LiteralPath $toolsProbe -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $reviewJobsProbe -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $rootProbe -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $rootDirectoryProbe -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $legacyDirectoryProbe -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $exchangeProbe -Force -ErrorAction SilentlyContinue
 switch ($process.ExitCode) {
-    0 { Write-Host 'Boundary test passed: HerdrBridge can write exchange inputs, cannot write the exchange root, and cannot write host-owned tools.' }
+    0 { Write-Host 'Boundary test passed: HerdrBridge can write exchange inputs, cannot write the exchange root, and cannot write host-owned tools or review jobs.' }
     41 { throw "Boundary failure: $LocalUser could write '$ToolsPath'." }
     42 { throw "Boundary failure: $LocalUser could not write '$SharePath\in'." }
     43 { throw "Boundary failure: $LocalUser could write directly to '$SharePath'." }
     44 { throw "Boundary failure: $LocalUser could create a directory directly under '$SharePath'." }
     45 { throw "Boundary failure: $LocalUser could create the guarded legacy directory '$SharePath\scripts'." }
+    46 { throw "Boundary failure: $LocalUser could write host-owned Excel review jobs at '$ReviewJobsPath'." }
     default { throw "Boundary probe exited unexpectedly with code $($process.ExitCode)." }
 }
 
@@ -109,6 +121,16 @@ $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | For
         'Public' { 'Public' }
     }
 } | Select-Object -Unique)
+function Test-RuleExposesSmb([object]$FirewallRule) {
+    $programs = @($FirewallRule | Get-NetFirewallApplicationFilter | ForEach-Object { [string]$_.Program })
+    $services = @($FirewallRule | Get-NetFirewallServiceFilter | ForEach-Object { [string]$_.Service })
+    foreach ($portFilter in @($FirewallRule | Get-NetFirewallPortFilter)) {
+        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services) {
+            return $true
+        }
+    }
+    return $false
+}
 $conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow)) {
     if ($firewallRule.DisplayName -eq $managedRuleName) { continue }
     $ruleProfiles = @(([string]$firewallRule.Profile) -split ',\s*')
@@ -116,24 +138,23 @@ $conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled Tru
         @($ruleProfiles | Where-Object { $_ -in $activeProfiles }).Count -eq 0) {
         continue
     }
-    foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
-        $includes445 = $false
-        foreach ($portExpression in @($portFilter.LocalPort)) {
-            $text = [string]$portExpression
-            if ($text -eq '445' -or
-                ($text -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 445 -and [int]$Matches[2] -ge 445)) {
-                $includes445 = $true
-                break
-            }
-        }
-        if (($portFilter.Protocol -in @('TCP', 6)) -and $includes445) {
-            $firewallRule
-            break
+    if (Test-RuleExposesSmb -FirewallRule $firewallRule) {
+        $program = @($firewallRule | Get-NetFirewallApplicationFilter | Select-Object -ExpandProperty Program) -join ','
+        $service = @($firewallRule | Get-NetFirewallServiceFilter | Select-Object -ExpandProperty Service) -join ','
+        $remote = @($firewallRule | Get-NetFirewallAddressFilter | Select-Object -ExpandProperty RemoteAddress) -join ','
+        [pscustomobject]@{
+            DisplayName = $firewallRule.DisplayName
+            Program = $program
+            Service = $service
+            Profile = [string]$firewallRule.Profile
+            RemoteAddress = $remote
         }
     }
 }
 if (@($conflictingRules).Count -gt 0) {
-    $names = @($conflictingRules | Select-Object -ExpandProperty DisplayName -Unique) -join "', '"
-    throw "Boundary failure: other enabled inbound allow rules expose TCP 445: '$names'."
+    $details = @($conflictingRules | ForEach-Object {
+        "'$($_.DisplayName)' (program=$($_.Program); service=$($_.Service); profile=$($_.Profile); remote=$($_.RemoteAddress))"
+    }) -join '; '
+    throw "Boundary failure: other enabled inbound allow rules expose TCP 445: $details."
 }
 Write-Host 'Boundary test passed: no other enabled inbound allow rule exposes TCP 445.'

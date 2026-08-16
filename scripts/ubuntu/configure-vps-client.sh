@@ -51,7 +51,8 @@ desired_block="$(mktemp)"
 current_block="$(mktemp)"
 replacement="$(mktemp)"
 unmanaged_config="$(mktemp)"
-trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement" "$unmanaged_config"' EXIT
+managed_blocks_dir="$(mktemp -d)"
+trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement" "$unmanaged_config"; rm -rf "$managed_blocks_dir"' EXIT
 ssh-keyscan -T 10 -p "$port" -t ed25519 "$host_name" > "$scan_file" 2>/dev/null || {
   echo "Could not retrieve the ED25519 host key from $host_name:$port." >&2; exit 25;
 }
@@ -105,27 +106,59 @@ end_marker="# END herdr-bootstrap $alias_name"
   printf '  PermitLocalCommand no\n'
   printf '  RemoteCommand none\n'
   printf '  KnownHostsCommand none\n'
+  printf '  ClearAllForwardings yes\n'
   printf '  ServerAliveInterval 30\n'
   printf '  ServerAliveCountMax 3\n'
   printf 'Host *\n'
   printf '%s\n' "$end_marker"
 } > "$desired_block"
 
-mapfile -t begin_lines < <(grep -nFx "$marker" "$config" | cut -d: -f1)
-mapfile -t end_lines < <(grep -nFx "$end_marker" "$config" | cut -d: -f1)
-if (( ${#begin_lines[@]} == 0 && ${#end_lines[@]} == 0 )); then
-  cp "$config" "$unmanaged_config"
-elif (( ${#begin_lines[@]} == 1 && ${#end_lines[@]} == 1 && begin_lines[0] < end_lines[0] )); then
-  begin="${begin_lines[0]}"
-  end="${end_lines[0]}"
-  if (( begin > 1 )); then head -n "$((begin - 1))" "$config" > "$unmanaged_config"; fi
-  tail -n "+$((end + 1))" "$config" >> "$unmanaged_config"
-else
-  echo "Managed block markers for '$alias_name' are missing, duplicated, or out of order; refusing to rewrite $config." >&2
+managed_alias=""
+managed_file=""
+line_number=0
+while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+  line_number=$((line_number + 1))
+  if [[ -z "$managed_alias" && "$config_line" =~ ^#\ BEGIN\ herdr-bootstrap\ ([A-Za-z0-9._-]+)$ ]]; then
+    managed_alias="${BASH_REMATCH[1]}"
+    managed_file="$managed_blocks_dir/$managed_alias.block"
+    [[ ! -e "$managed_file" ]] || {
+      echo "Managed block for '$managed_alias' is duplicated at $config:$line_number." >&2
+      exit 26
+    }
+    printf '%s\n' "$config_line" > "$managed_file"
+    continue
+  fi
+  if [[ -n "$managed_alias" ]]; then
+    [[ ! "$config_line" =~ ^#\ BEGIN\ herdr-bootstrap\ ([A-Za-z0-9._-]+)$ ]] || {
+      echo "Managed block for '$managed_alias' is nested or missing its end marker before $config:$line_number." >&2
+      exit 26
+    }
+    printf '%s\n' "$config_line" >> "$managed_file"
+    if [[ "$config_line" == "# END herdr-bootstrap $managed_alias" ]]; then
+      managed_alias=""
+      managed_file=""
+    fi
+    continue
+  fi
+  printf '%s\n' "$config_line" >> "$unmanaged_config"
+done < "$config"
+[[ -z "$managed_alias" ]] || {
+  echo "Managed block for '$managed_alias' is missing its end marker in $config." >&2
   exit 26
-fi
+}
+awk '
+  BEGIN { started=0; pending="" }
+  {
+    if (!started && $0 == "") next
+    if ($0 == "") { pending=pending "\n"; next }
+    if (pending != "") { printf "%s", pending; pending="" }
+    print
+    started=1
+  }
+' "$unmanaged_config" > "$current_block"
+mv "$current_block" "$unmanaged_config"
+cp "$desired_block" "$managed_blocks_dir/$alias_name.block"
 
-inside_managed=false
 line_number=0
 while IFS= read -r config_line || [[ -n "$config_line" ]]; do
   line_number=$((line_number + 1))
@@ -141,7 +174,12 @@ while IFS= read -r config_line || [[ -n "$config_line" ]]; do
   fi
 done < "$unmanaged_config"
 
-cat "$desired_block" > "$replacement"
+mapfile -t managed_block_files < <(find "$managed_blocks_dir" -maxdepth 1 -type f -name '*.block' -print | LC_ALL=C sort)
+: > "$replacement"
+for block_index in "${!managed_block_files[@]}"; do
+  (( block_index == 0 )) || printf '\n' >> "$replacement"
+  cat "${managed_block_files[$block_index]}" >> "$replacement"
+done
 if [[ -s "$unmanaged_config" ]]; then
   printf '\n' >> "$replacement"
   cat "$unmanaged_config" >> "$replacement"
@@ -152,8 +190,13 @@ effective_value() { awk -v key="$1" '$1 == key { $1=""; sub(/^ /, ""); print; ex
 [[ "$(effective_value hostname)" == "$host_name" ]] || { echo 'Effective SSH HostName does not match the verified target.' >&2; exit 26; }
 [[ "$(effective_value user)" == "$user_name" ]] || { echo 'Effective SSH User does not match the requested account.' >&2; exit 26; }
 [[ "$(effective_value port)" == "$port" ]] || { echo 'Effective SSH Port does not match the requested port.' >&2; exit 26; }
-[[ "$(effective_value identityfile)" == "$key_path" ]] || { echo 'Effective SSH IdentityFile was altered by unmanaged configuration.' >&2; exit 26; }
+mapfile -t effective_identity_files < <(awk '$1 == "identityfile" { $1=""; sub(/^ /, ""); print }' <<< "$effective_config")
+(( ${#effective_identity_files[@]} == 1 )) && [[ "${effective_identity_files[0]}" == "$key_path" ]] || {
+  echo 'Effective SSH configuration must contain exactly the one managed IdentityFile.' >&2
+  exit 26
+}
 [[ "$(effective_value identitiesonly)" == yes ]] || { echo 'Effective SSH IdentitiesOnly is not yes.' >&2; exit 26; }
+[[ "$(effective_value clearallforwardings)" == yes ]] || { echo 'Effective SSH ClearAllForwardings is not yes.' >&2; exit 26; }
 effective_strict="$(effective_value stricthostkeychecking)"
 [[ "$effective_strict" == yes || "$effective_strict" == true ]] || { echo 'Effective SSH StrictHostKeyChecking is not enabled.' >&2; exit 26; }
 for unsafe_option in proxycommand proxyjump hostkeyalias; do
@@ -162,6 +205,13 @@ for unsafe_option in proxycommand proxyjump hostkeyalias; do
     echo "Effective SSH $unsafe_option is '$unsafe_value'; refusing unmanaged redirection." >&2
     exit 26
   }
+done
+for accumulating_option in certificatefile localforward remoteforward dynamicforward sendenv setenv; do
+  accumulating_values="$(awk -v key="$accumulating_option" '$1 == key { print }' <<< "$effective_config")"
+  if [[ -n "$accumulating_values" && "$accumulating_values" != "$accumulating_option none" ]]; then
+    echo "Effective SSH $accumulating_option contains unmanaged accumulating values; refusing the alias." >&2
+    exit 26
+  fi
 done
 
 if ! cmp -s "$config" "$replacement"; then

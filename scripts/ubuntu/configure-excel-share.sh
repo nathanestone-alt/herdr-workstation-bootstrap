@@ -112,19 +112,30 @@ sudo -u "$owner_name" sh -c 'printf "%s\n" "Herdr credential test" > "$1"; rm -f
 sudo umount "$probe_mount"
 probe_mounted=false
 
+sudo install -m 0600 -o root -g root "$credential_tmp" "$credentials_file"
+fstab_changed=false
 if ! cmp -s "$fstab_current" "$replacement"; then
   stamp="$(date +%Y%m%d-%H%M%S)-$$"
   sudo cp /etc/fstab "/etc/fstab.${stamp}.herdr-backup"
   sudo install -m 0644 -o root -g root "$replacement" /etc/fstab
+  fstab_changed=true
 fi
-
 if mountpoint -q "$mount_point"; then
   echo "Unmounting $mount_point after the replacement credential passed an isolated SMB write test."
-  sudo umount "$mount_point"
+  if ! sudo umount "$mount_point"; then
+    echo "The replacement credential is installed and fstab_changed=$fstab_changed, but the existing SMB session remains mounted because $mount_point is busy." >&2
+    if command -v fuser >/dev/null 2>&1; then
+      sudo fuser -m "$mount_point" >&2 || true
+    fi
+    echo 'Close processes using the mount and rerun this script; do not rotate the Windows password again.' >&2
+    exit 24
+  fi
 fi
-sudo install -m 0600 -o root -g root "$credential_tmp" "$credentials_file"
 sudo systemctl daemon-reload
-sudo mount "$mount_point"
+if ! sudo mount "$mount_point"; then
+  echo 'The replacement credential and fstab are installed, but the live mount failed. Correct the reported mount error and rerun this script; do not rotate the Windows password again.' >&2
+  exit 24
+fi
 test_file="$mount_point/in/.ubuntu-write-test-$$"
 sudo -u "$owner_name" sh -c 'printf "%s\n" "Herdr Ubuntu VM SMB write test" > "$1"; rm -f "$1"' sh "$test_file"
 echo "PASS mounted //${windows_host}/${share_name} at $mount_point for $owner_name (uid=$owner_uid,gid=$owner_gid) with a successful write test."

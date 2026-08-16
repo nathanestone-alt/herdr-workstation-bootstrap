@@ -7,11 +7,13 @@ param(
     [string]$ShareName = 'HerdrExchange',
     [string]$Path = 'C:\HerdrExchange',
     [string]$ToolsPath = 'C:\HerdrTools',
+    [string]$ReviewJobsPath = 'C:\HerdrReviewJobs',
     [SecureString]$Password,
     [switch]$RotatePassword
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'HerdrFirewallPolicy.ps1')
 $requiredUser = 'HerdrBridge'
 function Assert-DedicatedBridgeMembership([object]$User) {
     $ordinaryUsersSid = 'S-1-5-32-545'
@@ -39,11 +41,11 @@ function Assert-DedicatedBridgeMembership([object]$User) {
     }
 }
 
-function Test-FirewallPortIncludes445([object]$LocalPort) {
-    foreach ($portExpression in @($LocalPort)) {
-        $text = [string]$portExpression
-        if ($text -eq '445') { return $true }
-        if ($text -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 445 -and [int]$Matches[2] -ge 445) {
+function Test-FirewallRuleExposesSmb([object]$FirewallRule) {
+    $programs = @($FirewallRule | Get-NetFirewallApplicationFilter | ForEach-Object { [string]$_.Program })
+    $services = @($FirewallRule | Get-NetFirewallServiceFilter | ForEach-Object { [string]$_.Service })
+    foreach ($portFilter in @($FirewallRule | Get-NetFirewallPortFilter)) {
+        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services) {
             return $true
         }
     }
@@ -65,11 +67,16 @@ function Get-ConflictingSmbFirewallRules([string]$ManagedRuleName) {
             @($ruleProfiles | Where-Object { $_ -in $activeProfiles }).Count -eq 0) {
             continue
         }
-        foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
-            if (($portFilter.Protocol -in @('TCP', 6)) -and
-                (Test-FirewallPortIncludes445 -LocalPort $portFilter.LocalPort)) {
-                $firewallRule
-                break
+        if (Test-FirewallRuleExposesSmb -FirewallRule $firewallRule) {
+            $program = @($firewallRule | Get-NetFirewallApplicationFilter | Select-Object -ExpandProperty Program) -join ','
+            $service = @($firewallRule | Get-NetFirewallServiceFilter | Select-Object -ExpandProperty Service) -join ','
+            $remote = @($firewallRule | Get-NetFirewallAddressFilter | Select-Object -ExpandProperty RemoteAddress) -join ','
+            [pscustomobject]@{
+                DisplayName = $firewallRule.DisplayName
+                Program = $program
+                Service = $service
+                Profile = [string]$firewallRule.Profile
+                RemoteAddress = $remote
             }
         }
     }
@@ -80,9 +87,18 @@ if ($LocalUser -cne $requiredUser) {
 
 $sharePath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
 $toolsPathResolved = [IO.Path]::GetFullPath($ToolsPath).TrimEnd('\')
-if ($toolsPathResolved.Equals($sharePath, [StringComparison]::OrdinalIgnoreCase) -or
-    $toolsPathResolved.StartsWith("$sharePath\", [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'The host-owned tools directory must be outside the SMB share.'
+$reviewJobsPathResolved = [IO.Path]::GetFullPath($ReviewJobsPath).TrimEnd('\')
+if ($toolsPathResolved.Equals($reviewJobsPathResolved, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The host-owned tools and Excel review directories must be distinct.'
+}
+foreach ($hostOwnedPath in @($toolsPathResolved, $reviewJobsPathResolved)) {
+    if ($hostOwnedPath.Equals([IO.Path]::GetPathRoot($hostOwnedPath).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to apply a protected host-owned ACL to drive root '$hostOwnedPath'."
+    }
+    if ($hostOwnedPath.Equals($sharePath, [StringComparison]::OrdinalIgnoreCase) -or
+        $hostOwnedPath.StartsWith("$sharePath\", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Host-owned directory '$hostOwnedPath' must be outside the SMB share."
+    }
 }
 if (Test-Path -LiteralPath (Join-Path $sharePath 'scripts')) {
     throw "Legacy shared scripts directory detected. Move reviewed executables to '$toolsPathResolved', remove the old directory, and retry."
@@ -91,8 +107,10 @@ if (Test-Path -LiteralPath (Join-Path $sharePath 'scripts')) {
 $ruleName = 'Herdr Exchange SMB over Tailscale'
 $conflictingRules = @(Get-ConflictingSmbFirewallRules -ManagedRuleName $ruleName)
 if ($conflictingRules.Count -gt 0) {
-    $names = @($conflictingRules | Select-Object -ExpandProperty DisplayName -Unique) -join "', '"
-    throw "Preflight found other active-profile inbound allow rules that explicitly include TCP 445: '$names'. No account, ACL, share, or firewall state was changed."
+    $details = @($conflictingRules | ForEach-Object {
+        "'$($_.DisplayName)' (program=$($_.Program); service=$($_.Service); profile=$($_.Profile); remote=$($_.RemoteAddress))"
+    }) -join '; '
+    throw "Preflight found other active-profile inbound allow rules that expose TCP 445: $details. No account, ACL, share, or firewall state was changed."
 }
 
 $account = Get-LocalUser -Name $LocalUser -ErrorAction SilentlyContinue
@@ -139,7 +157,7 @@ if ($usersSid.Value -notin $directGroupSids) {
 }
 Assert-DedicatedBridgeMembership -User $account
 
-foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved)) {
+foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved, $reviewJobsPathResolved)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
 
@@ -175,6 +193,21 @@ foreach ($writableDirectory in @("$sharePath\in", "$sharePath\out", "$sharePath\
     /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$($operatorIdentity):(OI)(CI)F" /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Failed to protect host-owned tools directory '$toolsPathResolved'." }
 
+$reviewAcl = Get-Acl -LiteralPath $reviewJobsPathResolved
+$reviewAcl.SetAccessRuleProtection($true, $false)
+foreach ($existingRule in @($reviewAcl.Access)) {
+    $reviewAcl.RemoveAccessRuleSpecific($existingRule)
+}
+foreach ($principal in @(
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
+    $operatorSid
+)) {
+    $reviewAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $principal, [Security.AccessControl.FileSystemRights]::FullControl, $inheritFlags, $propagation, $allow))
+}
+Set-Acl -LiteralPath $reviewJobsPathResolved -AclObject $reviewAcl
+
 $share = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
 if ($share -and -not ([IO.Path]::GetFullPath($share.Path).TrimEnd('\')).Equals($sharePath, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Existing share '$ShareName' points to '$($share.Path)', not '$sharePath'. Remove or rename it manually, then retry."
@@ -204,4 +237,5 @@ New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Pro
 Write-Host "Converged \\$env:COMPUTERNAME\$ShareName for $identity."
 Write-Host "Writable bridge directories: '$sharePath\in', '$sharePath\out', and '$sharePath\logs'."
 Write-Host "Host-owned executable directory (not shared): '$toolsPathResolved'."
+Write-Host "Host-owned Excel review directory (not shared): '$reviewJobsPathResolved'."
 Write-Warning 'The long, strong bridge password intentionally does not expire. Store it in the password manager and rotate it only with a coordinated Ubuntu credential update.'

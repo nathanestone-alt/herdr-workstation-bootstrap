@@ -50,6 +50,7 @@ download_verified() {
 
 converge_profile_hook() {
   local profile_file="$1"
+  local chain_profile="${2:-false}"
   local marker='# BEGIN herdr-workstation PATH'
   local end_marker='# END herdr-workstation PATH'
   local replacement
@@ -78,7 +79,15 @@ converge_profile_hook() {
   fi
   {
     printf '%s\n' "$marker"
-    printf '. "$HOME/.config/herdr-workstation/profile.sh"\n'
+    if [[ "$chain_profile" == true ]]; then
+      printf '%s\n' 'if [[ "${HERDR_PROFILE_CHAIN_ACTIVE:-0}" != 1 ]]; then'
+      printf '%s\n' '  export HERDR_PROFILE_CHAIN_ACTIVE=1'
+      printf '%s\n' '  [[ -f "$HOME/.profile" ]] && . "$HOME/.profile"'
+      printf '%s\n' '  unset HERDR_PROFILE_CHAIN_ACTIVE'
+      printf '%s\n' 'fi'
+    else
+      printf '. "$HOME/.config/herdr-workstation/profile.sh"\n'
+    fi
     printf '%s\n' "$end_marker"
   } >> "$replacement"
   if ! cmp -s "$profile_file" "$replacement"; then
@@ -140,8 +149,14 @@ install_tools() {
     "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
     rm -f "$rustup_init"
   fi
-  # shellcheck disable=SC1091
-  source "$HOME/.cargo/env"
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+  command -v rustup >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 || {
+    echo 'The locked rustup is present but rustup/cargo are not both discoverable. Use the default ~/.cargo layout or set CARGO_HOME before retrying.' >&2
+    exit 24
+  }
   [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
     echo "rustup version does not match lock after reinstall ($RUSTUP_VERSION)." >&2; exit 24;
   }
@@ -159,9 +174,17 @@ install_tools() {
     echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
   }
   cargo install --path "$HOME/src/rtk" --locked --force
-  for executable in rustup cargo rustc rtk; do
-    ln -sfn "$HOME/.cargo/bin/$executable" "$bin_dir/$executable"
+  for executable in rustup cargo rustc; do
+    executable_path="$(command -v "$executable")"
+    ln -sfn "$executable_path" "$bin_dir/$executable"
   done
+  cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  cargo_install_root="${CARGO_INSTALL_ROOT:-$cargo_home}"
+  [[ -x "$cargo_install_root/bin/rtk" ]] || {
+    echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
+    exit 24
+  }
+  ln -sfn "$cargo_install_root/bin/rtk" "$bin_dir/rtk"
 
   profile_dir="$HOME/.config/herdr-workstation"
   mkdir -p "$profile_dir"
@@ -175,7 +198,9 @@ install_tools() {
   install -m 0644 "$profile_script_tmp" "$profile_dir/profile.sh"
   rm -f "$profile_script_tmp"
   converge_profile_hook "$HOME/.profile"
-  converge_profile_hook "$HOME/.bash_profile"
+  if [[ -e "$HOME/.bash_profile" ]]; then
+    converge_profile_hook "$HOME/.bash_profile" true
+  fi
 
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
@@ -231,13 +256,15 @@ install_tools() {
   mkdir -p "$HOME/code"
   touch "$state_dir/tools-complete"
   echo "Tool installation complete. Resolved manifest: $manifest"
-  echo "The tools are available immediately through $bin_dir. Managed .profile and .bash_profile hooks make them available in new Bash login shells."
+  echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile chain, makes them available in new Bash login shells."
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 
-case "$phase" in
-  base) install_base ;;
-  tools) install_tools ;;
-  all) install_base; install_tools ;;
-  *) echo "Unsupported phase: $phase" >&2; exit 2 ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "$phase" in
+    base) install_base ;;
+    tools) install_tools ;;
+    all) install_base; install_tools ;;
+    *) echo "Unsupported phase: $phase" >&2; exit 2 ;;
+  esac
+fi
