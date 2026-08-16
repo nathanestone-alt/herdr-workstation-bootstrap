@@ -139,12 +139,13 @@ Configure the native Windows OneDrive client with a dedicated `Herdr Review Exch
 OneDrive is a transfer and version-history layer, not an automation workspace:
 
 1. Upload a uniquely named workbook to `Inbox` from the laptop.
-2. Wait for Windows to report that the file is fully local, preserve the original, calculate its SHA-256 hash, and copy it into a job-specific directory below `C:\HerdrExchange\in`.
-3. Run review or Excel COM work only against that staged local copy. Never run automation directly against the live OneDrive path because sync locks, Files On-Demand hydration, and conflict copies make it nondeterministic.
-4. Copy the completed workbook plus a small provenance manifest to `Outbox`; include the source filename/hash, timestamp, originating repository/branch/commit when applicable, and result hash.
-5. After acceptance, move the transfer set to `Archive` according to the retention policy.
+2. The reviewed staging helper must reject the `Offline`, `RecallOnOpen`, and `RecallOnDataAccess` attributes, then require unchanged size, last-write time, and SHA-256 across two exclusive reads separated by a settle interval. A green OneDrive icon or Always keep on this device request alone is not acceptance evidence.
+3. Preserve the Inbox original, record its SHA-256, copy it into a job-specific directory below `C:\HerdrExchange\in`, and immediately re-hash that copy. Refuse the job unless both hashes match.
+4. Ubuntu agents may inspect the bridge copy. Immediately before Excel/COM execution, the Windows runner must copy the accepted workbook into host-owned `C:\HerdrReviewJobs\<job-id>`, which is not shared with `HerdrBridge`, and re-hash it against the accepted staged hash. Excel opens only that immutable last-mile copy.
+5. Copy the completed workbook plus a small provenance manifest to `Outbox`; include the source, bridge-stage, last-mile and result paths/hashes, timestamp, and originating repository/branch/commit when applicable.
+6. After acceptance, move the transfer set to `Archive` according to the retention policy.
 
-Do not place Git working trees, Hyper-V disks, credentials, private keys, automation logs, or active databases in OneDrive. Do not enable macros or external links in an untrusted workbook merely because it arrived through the exchange.
+Do not place Git working trees, Hyper-V disks, credentials, private keys, automation logs, or active databases in OneDrive. Never add the OneDrive exchange, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or any child directory as an Excel Trusted Location. Do not enable macros or external links in an untrusted workbook merely because it arrived through the exchange.
 
 ## Remote access and recovery
 
@@ -232,7 +233,7 @@ Backblaze complements this system by protecting supported user data offsite. It 
 - [ ] Configure separate Windows and Ubuntu Tailscale nodes, SSH, Mosh and RDP.
 - [ ] Create and write-test the restricted SMB Excel exchange.
 - [ ] Sign in to OneDrive on Windows, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the tree Always keep on this device.
-- [ ] Complete a round-trip workbook review from laptop → OneDrive Inbox → staged SMB job → OneDrive Outbox, verifying hashes and preserving the original.
+- [ ] After the reviewed staging helper exists and passes its hydration, stability, hash and last-mile-isolation tests, complete a round-trip workbook review from laptop → OneDrive Inbox → staged SMB job → host-owned Excel job → OneDrive Outbox.
 - [ ] Port the Herdr coordination payload to Linux and pass its native-`pwsh` regression suite before enabling it.
 - [ ] Configure Comet, Fingerbot and independent KVM power.
 - [ ] Upload and boot-test recovery virtual media.

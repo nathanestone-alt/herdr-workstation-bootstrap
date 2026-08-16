@@ -50,7 +50,8 @@ scan_file="$(mktemp)"
 desired_block="$(mktemp)"
 current_block="$(mktemp)"
 replacement="$(mktemp)"
-trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement"' EXIT
+unmanaged_config="$(mktemp)"
+trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement" "$unmanaged_config"' EXIT
 ssh-keyscan -T 10 -p "$port" -t ed25519 "$host_name" > "$scan_file" 2>/dev/null || {
   echo "Could not retrieve the ED25519 host key from $host_name:$port." >&2; exit 25;
 }
@@ -72,7 +73,9 @@ if [[ -n "$existing_host_keys" ]]; then
   printf '%s\n' "$existing_host_keys" | grep -v '^#' > "$current_block" || true
   mapfile -t recorded_fingerprints < <(ssh-keygen -lf "$current_block" -E sha256 | awk '{ print $2 }')
   if (( ${#recorded_fingerprints[@]} != 1 )) || [[ "${recorded_fingerprints[0]:-}" != "$host_key_fingerprint" ]]; then
-    echo "known_hosts must contain exactly one key for $host_token and it must match the verified fingerprint. Resolve stale or extra entries manually." >&2
+    recorded_types="$(awk '!/^#/ { print $2 }' "$current_block" | sort -u | paste -sd, -)"
+    echo "known_hosts must contain exactly one verified key for $host_token; recorded key types: ${recorded_types:-unknown}." >&2
+    echo "After independently re-verifying the fingerprint, remove all entries with: ssh-keygen -R '$host_token' -f '$known_hosts' ; then rerun this script to install the verified ED25519 key." >&2
     exit 25
   fi
 else
@@ -84,36 +87,6 @@ touch "$config"
 chmod 600 "$config"
 marker="# BEGIN herdr-bootstrap $alias_name"
 end_marker="# END herdr-bootstrap $alias_name"
-host_pattern_matches_alias() {
-  local candidate="${alias_name,,}"
-  local pattern normalized
-  local positive_match=false
-  for pattern in "$@"; do
-    normalized="${pattern,,}"
-    if [[ "$normalized" == '!'* ]]; then
-      [[ "$candidate" == ${normalized:1} ]] && return 1
-    elif [[ "$candidate" == $normalized ]]; then
-      positive_match=true
-    fi
-  done
-  [[ "$positive_match" == true ]]
-}
-
-inside_managed=false
-line_number=0
-while IFS= read -r config_line || [[ -n "$config_line" ]]; do
-  line_number=$((line_number + 1))
-  if [[ "$config_line" == "$marker" ]]; then inside_managed=true; continue; fi
-  if [[ "$config_line" == "$end_marker" ]]; then inside_managed=false; continue; fi
-  [[ "$inside_managed" == true ]] && continue
-  if [[ "$config_line" =~ ^[[:space:]]*[Hh][Oo][Ss][Tt][[:space:]]+(.+)$ ]]; then
-    read -r -a host_patterns <<< "${BASH_REMATCH[1]}"
-    if host_pattern_matches_alias "${host_patterns[@]}"; then
-      echo "Unmanaged Host stanza at $config:$line_number matches alias '$alias_name'; refusing because OpenSSH first-value precedence would override the managed block." >&2
-      exit 26
-    fi
-  fi
-done < "$config"
 {
   printf '%s\n' "$marker"
   printf 'Host %s\n' "$alias_name"
@@ -124,36 +97,80 @@ done < "$config"
   printf '  IdentitiesOnly yes\n'
   printf '  StrictHostKeyChecking yes\n'
   printf '  UserKnownHostsFile ~/.ssh/known_hosts\n'
+  printf '  GlobalKnownHostsFile none\n'
+  printf '  UpdateHostKeys no\n'
+  printf '  ProxyCommand none\n'
+  printf '  ProxyJump none\n'
+  printf '  CanonicalizeHostname no\n'
+  printf '  PermitLocalCommand no\n'
+  printf '  RemoteCommand none\n'
+  printf '  KnownHostsCommand none\n'
   printf '  ServerAliveInterval 30\n'
   printf '  ServerAliveCountMax 3\n'
+  printf 'Host *\n'
   printf '%s\n' "$end_marker"
 } > "$desired_block"
 
 mapfile -t begin_lines < <(grep -nFx "$marker" "$config" | cut -d: -f1)
 mapfile -t end_lines < <(grep -nFx "$end_marker" "$config" | cut -d: -f1)
 if (( ${#begin_lines[@]} == 0 && ${#end_lines[@]} == 0 )); then
-  stamp="$(date +%Y%m%d-%H%M%S)-$$"
-  cp "$config" "$config.$stamp.bak"
-  if [[ -s "$config" ]]; then printf '\n' >> "$config"; fi
-  cat "$desired_block" >> "$config"
+  cp "$config" "$unmanaged_config"
 elif (( ${#begin_lines[@]} == 1 && ${#end_lines[@]} == 1 && begin_lines[0] < end_lines[0] )); then
   begin="${begin_lines[0]}"
   end="${end_lines[0]}"
-  sed -n "${begin},${end}p" "$config" > "$current_block"
-  if ! cmp -s "$current_block" "$desired_block"; then
-    stamp="$(date +%Y%m%d-%H%M%S)-$$"
-    cp "$config" "$config.$stamp.bak"
-    if (( begin > 1 )); then head -n "$((begin - 1))" "$config" > "$replacement"; fi
-    cat "$desired_block" >> "$replacement"
-    tail -n "+$((end + 1))" "$config" >> "$replacement"
-    install -m 0600 "$replacement" "$config"
-    echo "Updated SSH alias '$alias_name'; backup: $config.$stamp.bak"
-  else
-    echo "SSH alias '$alias_name' already matches the requested configuration."
-  fi
+  if (( begin > 1 )); then head -n "$((begin - 1))" "$config" > "$unmanaged_config"; fi
+  tail -n "+$((end + 1))" "$config" >> "$unmanaged_config"
 else
   echo "Managed block markers for '$alias_name' are missing, duplicated, or out of order; refusing to rewrite $config." >&2
   exit 26
+fi
+
+inside_managed=false
+line_number=0
+while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+  line_number=$((line_number + 1))
+  if [[ "$config_line" =~ ^[[:space:]]*[Hh][Oo][Ss][Tt][[:space:]]+(.+)$ ]]; then
+    read -r -a host_patterns <<< "${BASH_REMATCH[1]}"
+    for host_pattern in "${host_patterns[@]}"; do
+      normalized="${host_pattern,,}"
+      if [[ "$normalized" != '!'* && "$normalized" == "${alias_name,,}" ]]; then
+        echo "Unmanaged exact Host stanza at $config:$line_number duplicates alias '$alias_name'; rename or remove it before retrying." >&2
+        exit 26
+      fi
+    done
+  fi
+done < "$unmanaged_config"
+
+cat "$desired_block" > "$replacement"
+if [[ -s "$unmanaged_config" ]]; then
+  printf '\n' >> "$replacement"
+  cat "$unmanaged_config" >> "$replacement"
+fi
+
+effective_config="$(ssh -G -F "$replacement" "$alias_name" 2>/dev/null)"
+effective_value() { awk -v key="$1" '$1 == key { $1=""; sub(/^ /, ""); print; exit }' <<< "$effective_config"; }
+[[ "$(effective_value hostname)" == "$host_name" ]] || { echo 'Effective SSH HostName does not match the verified target.' >&2; exit 26; }
+[[ "$(effective_value user)" == "$user_name" ]] || { echo 'Effective SSH User does not match the requested account.' >&2; exit 26; }
+[[ "$(effective_value port)" == "$port" ]] || { echo 'Effective SSH Port does not match the requested port.' >&2; exit 26; }
+[[ "$(effective_value identityfile)" == "$key_path" ]] || { echo 'Effective SSH IdentityFile was altered by unmanaged configuration.' >&2; exit 26; }
+[[ "$(effective_value identitiesonly)" == yes ]] || { echo 'Effective SSH IdentitiesOnly is not yes.' >&2; exit 26; }
+effective_strict="$(effective_value stricthostkeychecking)"
+[[ "$effective_strict" == yes || "$effective_strict" == true ]] || { echo 'Effective SSH StrictHostKeyChecking is not enabled.' >&2; exit 26; }
+for unsafe_option in proxycommand proxyjump hostkeyalias; do
+  unsafe_value="$(effective_value "$unsafe_option")"
+  [[ -z "$unsafe_value" || "$unsafe_value" == none ]] || {
+    echo "Effective SSH $unsafe_option is '$unsafe_value'; refusing unmanaged redirection." >&2
+    exit 26
+  }
+done
+
+if ! cmp -s "$config" "$replacement"; then
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  cp "$config" "$config.$stamp.bak"
+  install -m 0600 "$replacement" "$config"
+  echo "Updated and prepended SSH alias '$alias_name'; backup: $config.$stamp.bak"
+else
+  echo "SSH alias '$alias_name' already matches the requested top-precedence configuration."
 fi
 
 echo

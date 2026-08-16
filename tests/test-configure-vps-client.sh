@@ -109,4 +109,17 @@ if bash "$script" --alias duplicate-vps --host duplicate.example --user admin --
   exit 1
 fi
 
+printf '\nHost *\n  AddKeysToAgent yes\n' >> "$HOME/.ssh/config"
+bash "$script" --alias wildcard-vps --host wildcard.example --user admin --port 22 \
+  --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
+[[ "$(head -n 2 "$HOME/.ssh/config" | tail -n 1)" == 'Host wildcard-vps' ]]
+
+mkdir -p "$HOME/.ssh/config.d"
+printf 'Host included-vps\n  HostName attacker.example\n  ProxyJump attacker.example\n' > "$HOME/.ssh/config.d/common"
+printf '\nInclude config.d/*\nMatch host match-vps\n  HostName attacker.example\nMatch all\n' >> "$HOME/.ssh/config"
+bash "$script" --alias included-vps --host included.example --user admin --port 22 \
+  --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
+bash "$script" --alias match-vps --host match.example --user admin --port 22 \
+  --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null
+
 echo 'configure-vps-client convergence tests passed.'

@@ -165,7 +165,7 @@ Ubuntu path:
 Boundary:
 
 1. `New-HerdrExchangeShare.ps1` creates or verifies the fixed non-admin local `HerdrBridge` account, grants NTFS/SMB Change only to `in`, `out`, and `logs`, removes non-allowlisted share access, enables SMB encryption, and recreates a TCP 445 rule restricted to Tailscale addresses.
-2. `configure-excel-share.sh` stores credentials root-only outside the repository and creates a systemd automount.
+2. `configure-excel-share.sh` validates fstab and the explicit Ubuntu owner before mutation, proves a candidate password through a separate `nosharesock` mount/write test, then atomically installs the root-only credential and converged systemd automount. Ownership changes require `--reassign-owner`.
 3. Repositories remain in `~/code`; only workbook inputs/outputs/logs cross SMB.
 4. Excel and COM run only in the designated interactive Windows user session.
 5. A reviewed Windows-side job runner under `C:\HerdrTools` accepts narrow operations over files under `C:\HerdrExchange`. It must reject arbitrary code/payloads, and the bridge account must not be able to modify it.
@@ -178,12 +178,15 @@ GitHub remains authoritative for repositories. Use the Windows OneDrive client o
 
 - Create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive` under the signed-in Windows OneDrive root and mark them Always keep on this device.
 - Keep OneDrive off Ubuntu; Ubuntu reaches only the restricted `/srv/herdr-exchange` staging area.
-- Preserve each Inbox original and stage a copied, hashed workbook under `C:\HerdrExchange\in\<job-id>` before review or COM automation.
-- Return the result through Outbox with a manifest containing source and result hashes, timestamps, and repository/branch/commit provenance when the workbook came from STModel work.
-- Never operate Excel automation directly in a syncing OneDrive directory, and never store repositories, VM disks, secrets, logs, or databases there.
+- Require a hydration/stability gate: reject Offline/Recall attributes and require two exclusive reads with stable size, last-write time and SHA-256 across a settle interval.
+- Preserve each Inbox original, stage a copied workbook under `C:\HerdrExchange\in\<job-id>`, and verify its hash again after the copy.
+- Before Excel/COM opens a workbook, copy the accepted bridge file into non-shared, host-owned `C:\HerdrReviewJobs\<job-id>` and re-verify the accepted hash. The bridge identity must never have write access to that last-mile directory.
+- Return the result through Outbox with a manifest containing source, bridge-stage, last-mile and result paths/hashes, timestamps, and repository/branch/commit provenance when the workbook came from STModel work.
+- Never operate Excel automation directly in OneDrive or a bridge-writable directory, and never store repositories, VM disks, secrets, logs, or databases there.
 - Treat macros, external links, and data connections as executable content requiring an explicit trust decision.
+- Never configure OneDrive, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or their children as Excel Trusted Locations.
 
-Add a reviewed Windows staging helper later; it should require a fully hydrated regular file, reject path traversal and unexpected extensions, create collision-resistant job IDs, copy rather than move the original, hash both directions, and never accept arbitrary commands.
+Add and validate the reviewed Windows staging helper before the round-trip commissioning checkbox can pass. It owns hydration/stability checks, path and extension validation, collision-resistant job IDs, bridge and last-mile copies, all hash comparisons, the provenance manifest, and cleanup; it never accepts arbitrary commands.
 
 ## Installation and validation sequence
 
@@ -232,7 +235,7 @@ Add a reviewed Windows staging helper later; it should require a fully hydrated 
 - [ ] Run the disposable Excel COM test.
 - [ ] Build and validate the narrow interactive Windows job runner.
 - [ ] Configure the OneDrive `Herdr Review Exchange` tree as Always keep on this device.
-- [ ] Round-trip an STModel workbook through Inbox, a hashed local staging copy, Excel review, and Outbox without using GitHub for the workbook handoff.
+- [ ] After the staging helper is implemented and tested, round-trip an STModel workbook through Inbox, hashed bridge staging, host-owned last-mile Excel review, and Outbox without using GitHub for the workbook handoff.
 - [ ] Confirm Excel remains unavailable before Windows login while Ubuntu remains available.
 
 ### Phase 5 — Skills, plugins and projects

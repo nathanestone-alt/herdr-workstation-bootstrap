@@ -48,6 +48,46 @@ download_verified() {
   }
 }
 
+converge_profile_hook() {
+  local profile_file="$1"
+  local marker='# BEGIN herdr-workstation PATH'
+  local end_marker='# END herdr-workstation PATH'
+  local replacement
+  replacement="$(mktemp)"
+  touch "$profile_file"
+  mapfile -t begin_lines < <(grep -nFx "$marker" "$profile_file" | cut -d: -f1)
+  mapfile -t end_lines < <(grep -nFx "$end_marker" "$profile_file" | cut -d: -f1)
+  if (( ${#begin_lines[@]} == 0 && ${#end_lines[@]} == 0 )); then
+    cp "$profile_file" "$replacement"
+  elif (( ${#begin_lines[@]} == 1 && ${#end_lines[@]} == 1 && begin_lines[0] < end_lines[0] )); then
+    begin="${begin_lines[0]}"
+    end="${end_lines[0]}"
+    remove_start="$begin"
+    if (( begin > 1 )) && [[ -z "$(sed -n "$((begin - 1))p" "$profile_file")" ]]; then
+      remove_start=$((begin - 1))
+    fi
+    if (( remove_start > 1 )); then head -n "$((remove_start - 1))" "$profile_file" > "$replacement"; fi
+    tail -n "+$((end + 1))" "$profile_file" >> "$replacement"
+  else
+    echo "Managed PATH markers in $profile_file are missing, duplicated, or out of order." >&2
+    exit 24
+  fi
+  if [[ -s "$replacement" ]]; then
+    if [[ "$(tail -c 1 "$replacement" | wc -l)" -eq 0 ]]; then printf '\n' >> "$replacement"; fi
+    printf '\n' >> "$replacement"
+  fi
+  {
+    printf '%s\n' "$marker"
+    printf '. "$HOME/.config/herdr-workstation/profile.sh"\n'
+    printf '%s\n' "$end_marker"
+  } >> "$replacement"
+  if ! cmp -s "$profile_file" "$replacement"; then
+    cp "$profile_file" "$profile_file.$(date +%Y%m%d-%H%M%S)-$$.bak"
+    install -m 0644 "$replacement" "$profile_file"
+  fi
+  rm -f "$replacement"
+}
+
 install_base() {
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -123,6 +163,20 @@ install_tools() {
     ln -sfn "$HOME/.cargo/bin/$executable" "$bin_dir/$executable"
   done
 
+  profile_dir="$HOME/.config/herdr-workstation"
+  mkdir -p "$profile_dir"
+  profile_script_tmp="$(mktemp)"
+  {
+    printf '%s\n' '# Managed by herdr-workstation-bootstrap.'
+    printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac'
+    printf '%s\n' 'case ":$PATH:" in *":$HOME/.cargo/bin:"*) ;; *) PATH="$HOME/.cargo/bin:$PATH" ;; esac'
+    printf '%s\n' 'export PATH'
+  } > "$profile_script_tmp"
+  install -m 0644 "$profile_script_tmp" "$profile_dir/profile.sh"
+  rm -f "$profile_script_tmp"
+  converge_profile_hook "$HOME/.profile"
+  converge_profile_hook "$HOME/.bash_profile"
+
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
     archive="$(mktemp --suffix=.tar.gz)"
@@ -177,7 +231,7 @@ install_tools() {
   mkdir -p "$HOME/code"
   touch "$state_dir/tools-complete"
   echo "Tool installation complete. Resolved manifest: $manifest"
-  echo "The tools are available immediately through $bin_dir. Start a new login shell before normal interactive use so Ubuntu's profile also exports that directory."
+  echo "The tools are available immediately through $bin_dir. Managed .profile and .bash_profile hooks make them available in new Bash login shells."
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 

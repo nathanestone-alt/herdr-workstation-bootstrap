@@ -45,7 +45,9 @@ On the current Surface:
 7. Create, save, reopen and close a disposable workbook in `C:\HerdrExchange`.
 8. Resolve Excel Trust Center, add-in, activation and Protected View prompts.
 9. Sign in to the native Windows OneDrive client, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the full tree Always keep on this device.
-10. Do not make the OneDrive folder an Excel trusted location; trust macros, links and data connections only for a specifically verified workbook.
+10. Do not make OneDrive, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or any child an Excel Trusted Location; trust macros, links and data connections only for a specifically verified workbook.
+
+`New-HerdrExchangeShare.ps1` establishes direct membership of `HerdrBridge` in the built-in Users group and rejects membership in any other local group; do not add it to groups manually.
 
 Excel COM still requires the designated Windows user to be interactively signed in. The Ubuntu VM can start and accept SSH before that login occurs.
 

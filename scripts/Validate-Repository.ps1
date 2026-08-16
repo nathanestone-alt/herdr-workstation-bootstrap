@@ -48,6 +48,7 @@ $requiredFiles = @(
     'scripts\windows\New-HerdrExchangeShare.ps1',
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
     'scripts\ubuntu\configure-excel-share.sh',
+    'tests\test-verify-path.sh',
     'config\ubuntu-toolchain.lock',
     'legacy\WSL2-FALLBACK.md'
 )
@@ -87,13 +88,14 @@ foreach ($relativePath in $primaryFiles) {
 }
 
 $contentAssertions = @(
-    @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'S-1-5-32-545', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false') },
-    @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', '-WorkingDirectory "$env:SystemRoot\Temp"', 'exit 41', 'exit 43', 'Get-NetFirewallPortFilter', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @() },
+    @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'S-1-5-32-545', 'Add-LocalGroupMember', 'Get-NetConnectionProfile', 'Preflight found', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false', '$text -eq ''Any''') },
+    @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', '-WorkingDirectory "$env:SystemRoot\Temp"', 'exit 41', 'exit 43', 'exit 44', 'exit 45', 'Get-NetFirewallPortFilter', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @('$text -eq ''Any''') },
     @{ Path = 'scripts\windows\Install-ExcelAutomation.ps1'; Required = @('C:\HerdrTools\excel-automation'); Forbidden = @('C:\HerdrExchange\scripts') },
-    @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
-    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', 'ln -sfn "$HOME/.cargo/bin/$executable"', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
-    @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('mountpoint -q', 'sudo umount', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry'); Forbidden = @() },
-    @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'host_pattern_matches_alias', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @("already exists in `$config; no change made") }
+    @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
+    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', 'converge_profile_hook', '.bash_profile', 'ln -sfn "$HOME/.cargo/bin/$executable"', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
+    @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry'); Forbidden = @() },
+    @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @("already exists in `$config; no change made") },
+    @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('bash -lc', 'PASS login command'); Forbidden = @() }
 )
 foreach ($assertion in $contentAssertions) {
     $assertionPath = Join-Path $RepoRoot $assertion.Path

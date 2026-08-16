@@ -11,13 +11,25 @@ param(
     [UInt64]$StartupMemoryBytes = 16GB,
     [UInt64]$MinimumMemoryBytes = 8GB,
     [UInt64]$MaximumMemoryBytes = 32GB,
-    [UInt64]$VhdSizeBytes = 500GB
+    [UInt64]$VhdSizeBytes = 500GB,
+    [int]$HostProcessorReserve = 4,
+    [UInt64]$HostMemoryReserveBytes = 16GB
 )
 
 $ErrorActionPreference = 'Stop'
-if ($ProcessorCount -lt 1 -or $MinimumMemoryBytes -gt $StartupMemoryBytes -or
+if ($ProcessorCount -lt 1 -or $HostProcessorReserve -lt 1 -or $HostMemoryReserveBytes -lt 4GB -or
+    $MinimumMemoryBytes -gt $StartupMemoryBytes -or
     $StartupMemoryBytes -gt $MaximumMemoryBytes -or $VhdSizeBytes -lt 64GB) {
     throw 'Invalid VM resource bounds.'
+}
+$hostSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+$hostLogicalProcessors = [int]$hostSystem.NumberOfLogicalProcessors
+$hostPhysicalMemoryBytes = [UInt64]$hostSystem.TotalPhysicalMemory
+if ($ProcessorCount + $HostProcessorReserve -gt $hostLogicalProcessors) {
+    throw "Requested $ProcessorCount VM processors plus a $HostProcessorReserve-processor host reserve exceeds the host capacity of $hostLogicalProcessors logical processors. Pass reviewed explicit values before creating the VM."
+}
+if ($MaximumMemoryBytes + $HostMemoryReserveBytes -gt $hostPhysicalMemoryBytes) {
+    throw "Requested VM maximum memory $MaximumMemoryBytes plus host reserve $HostMemoryReserveBytes exceeds installed memory $hostPhysicalMemoryBytes. Pass reviewed explicit values before creating the VM."
 }
 if (-not $InstallationComplete) {
     if ([string]::IsNullOrWhiteSpace($IsoPath) -or -not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {

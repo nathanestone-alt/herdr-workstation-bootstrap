@@ -16,7 +16,12 @@ $credential = [PSCredential]::new("$env:COMPUTERNAME\$LocalUser", $Password)
 $probeName = ".herdr-boundary-$([Guid]::NewGuid().ToString('N')).tmp"
 $toolsProbe = Join-Path $ToolsPath $probeName
 $rootProbe = Join-Path $SharePath $probeName
+$rootDirectoryProbe = Join-Path $SharePath ".herdr-boundary-$([Guid]::NewGuid().ToString('N')).dir"
+$legacyDirectoryProbe = Join-Path $SharePath 'scripts'
 $exchangeProbe = Join-Path (Join-Path $SharePath 'in') $probeName
+if (Test-Path -LiteralPath $legacyDirectoryProbe) {
+    throw "Cannot run the guarded-directory probe because '$legacyDirectoryProbe' already exists; inspect it manually."
+}
 
 $child = @"
 `$ErrorActionPreference = 'Stop'
@@ -24,6 +29,20 @@ try {
     [IO.File]::WriteAllText('$($rootProbe.Replace("'", "''"))', 'forbidden')
     Remove-Item -LiteralPath '$($rootProbe.Replace("'", "''"))' -Force -ErrorAction SilentlyContinue
     exit 43
+}
+catch [UnauthorizedAccessException] {
+}
+try {
+    [IO.Directory]::CreateDirectory('$($rootDirectoryProbe.Replace("'", "''"))') | Out-Null
+    Remove-Item -LiteralPath '$($rootDirectoryProbe.Replace("'", "''"))' -Recurse -Force -ErrorAction SilentlyContinue
+    exit 44
+}
+catch [UnauthorizedAccessException] {
+}
+try {
+    [IO.Directory]::CreateDirectory('$($legacyDirectoryProbe.Replace("'", "''"))') | Out-Null
+    Remove-Item -LiteralPath '$($legacyDirectoryProbe.Replace("'", "''"))' -Recurse -Force -ErrorAction SilentlyContinue
+    exit 45
 }
 catch [UnauthorizedAccessException] {
 }
@@ -55,12 +74,16 @@ catch {
 
 Remove-Item -LiteralPath $toolsProbe -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $rootProbe -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $rootDirectoryProbe -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $legacyDirectoryProbe -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $exchangeProbe -Force -ErrorAction SilentlyContinue
 switch ($process.ExitCode) {
     0 { Write-Host 'Boundary test passed: HerdrBridge can write exchange inputs, cannot write the exchange root, and cannot write host-owned tools.' }
     41 { throw "Boundary failure: $LocalUser could write '$ToolsPath'." }
     42 { throw "Boundary failure: $LocalUser could not write '$SharePath\in'." }
     43 { throw "Boundary failure: $LocalUser could write directly to '$SharePath'." }
+    44 { throw "Boundary failure: $LocalUser could create a directory directly under '$SharePath'." }
+    45 { throw "Boundary failure: $LocalUser could create the guarded legacy directory '$SharePath\scripts'." }
     default { throw "Boundary probe exited unexpectedly with code $($process.ExitCode)." }
 }
 
@@ -79,19 +102,31 @@ $expectedRemoteAddresses = @('100.64.0.0/10', 'fd7a:115c:a1e0::/48')
 if (@(Compare-Object -ReferenceObject $expectedRemoteAddresses -DifferenceObject $managedRemoteAddresses).Count -ne 0) {
     throw "Boundary failure: '$managedRuleName' is not restricted to the expected Tailscale address ranges."
 }
+$activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
+    switch ([string]$_.NetworkCategory) {
+        'DomainAuthenticated' { 'Domain' }
+        'Private' { 'Private' }
+        'Public' { 'Public' }
+    }
+} | Select-Object -Unique)
 $conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow)) {
     if ($firewallRule.DisplayName -eq $managedRuleName) { continue }
+    $ruleProfiles = @(([string]$firewallRule.Profile) -split ',\s*')
+    if ($activeProfiles.Count -gt 0 -and 'Any' -notin $ruleProfiles -and
+        @($ruleProfiles | Where-Object { $_ -in $activeProfiles }).Count -eq 0) {
+        continue
+    }
     foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
         $includes445 = $false
         foreach ($portExpression in @($portFilter.LocalPort)) {
             $text = [string]$portExpression
-            if ($text -eq 'Any' -or $text -eq '445' -or
+            if ($text -eq '445' -or
                 ($text -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 445 -and [int]$Matches[2] -ge 445)) {
                 $includes445 = $true
                 break
             }
         }
-        if (($portFilter.Protocol -in @('TCP', 6, 'Any', 256)) -and $includes445) {
+        if (($portFilter.Protocol -in @('TCP', 6)) -and $includes445) {
             $firewallRule
             break
         }

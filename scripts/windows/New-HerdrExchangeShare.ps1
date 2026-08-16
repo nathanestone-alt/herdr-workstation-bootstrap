@@ -42,12 +42,37 @@ function Assert-DedicatedBridgeMembership([object]$User) {
 function Test-FirewallPortIncludes445([object]$LocalPort) {
     foreach ($portExpression in @($LocalPort)) {
         $text = [string]$portExpression
-        if ($text -eq 'Any' -or $text -eq '445') { return $true }
+        if ($text -eq '445') { return $true }
         if ($text -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 445 -and [int]$Matches[2] -ge 445) {
             return $true
         }
     }
     return $false
+}
+
+function Get-ConflictingSmbFirewallRules([string]$ManagedRuleName) {
+    $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
+        switch ([string]$_.NetworkCategory) {
+            'DomainAuthenticated' { 'Domain' }
+            'Private' { 'Private' }
+            'Public' { 'Public' }
+        }
+    } | Select-Object -Unique)
+    foreach ($firewallRule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow)) {
+        if ($firewallRule.DisplayName -eq $ManagedRuleName) { continue }
+        $ruleProfiles = @(([string]$firewallRule.Profile) -split ',\s*')
+        if ($activeProfiles.Count -gt 0 -and 'Any' -notin $ruleProfiles -and
+            @($ruleProfiles | Where-Object { $_ -in $activeProfiles }).Count -eq 0) {
+            continue
+        }
+        foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
+            if (($portFilter.Protocol -in @('TCP', 6)) -and
+                (Test-FirewallPortIncludes445 -LocalPort $portFilter.LocalPort)) {
+                $firewallRule
+                break
+            }
+        }
+    }
 }
 if ($LocalUser -cne $requiredUser) {
     throw "The SMB bridge must use the dedicated '$requiredUser' account."
@@ -61,6 +86,13 @@ if ($toolsPathResolved.Equals($sharePath, [StringComparison]::OrdinalIgnoreCase)
 }
 if (Test-Path -LiteralPath (Join-Path $sharePath 'scripts')) {
     throw "Legacy shared scripts directory detected. Move reviewed executables to '$toolsPathResolved', remove the old directory, and retry."
+}
+
+$ruleName = 'Herdr Exchange SMB over Tailscale'
+$conflictingRules = @(Get-ConflictingSmbFirewallRules -ManagedRuleName $ruleName)
+if ($conflictingRules.Count -gt 0) {
+    $names = @($conflictingRules | Select-Object -ExpandProperty DisplayName -Unique) -join "', '"
+    throw "Preflight found other active-profile inbound allow rules that explicitly include TCP 445: '$names'. No account, ACL, share, or firewall state was changed."
 }
 
 $account = Get-LocalUser -Name $LocalUser -ErrorAction SilentlyContinue
@@ -96,6 +128,14 @@ else {
 $account = Get-LocalUser -Name $LocalUser
 if (-not $account.Enabled -or $null -ne $account.PasswordExpires) {
     throw 'The bridge account does not satisfy the enabled, non-expiring credential policy.'
+}
+$usersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$directGroupSids = @(([ADSI]"WinNT://$env:COMPUTERNAME/$($account.Name),user").psbase.Invoke('Groups') | ForEach-Object {
+    $sidBytes = $_.GetType().InvokeMember('objectSID', 'GetProperty', $null, $_, $null)
+    [Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0).Value
+})
+if ($usersSid.Value -notin $directGroupSids) {
+    Add-LocalGroupMember -SID $usersSid -Member $account.SID -ErrorAction Stop
 }
 Assert-DedicatedBridgeMembership -User $account
 
@@ -157,24 +197,9 @@ foreach ($access in @(Get-SmbShareAccess -Name $ShareName)) {
 }
 Grant-SmbShareAccess -Name $ShareName -AccountName $identity -AccessRight Change -Force | Out-Null
 
-$ruleName = 'Herdr Exchange SMB over Tailscale'
 Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP `
     -LocalPort 445 -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48') -Profile Any | Out-Null
-$conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow)) {
-    if ($firewallRule.DisplayName -eq $ruleName) { continue }
-    foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
-        if (($portFilter.Protocol -in @('TCP', 6, 'Any', 256)) -and
-            (Test-FirewallPortIncludes445 -LocalPort $portFilter.LocalPort)) {
-            $firewallRule
-            break
-        }
-    }
-}
-if (@($conflictingRules).Count -gt 0) {
-    $names = @($conflictingRules | Select-Object -ExpandProperty DisplayName -Unique) -join "', '"
-    throw "Other enabled inbound allow rules expose TCP 445: '$names'. Disable or narrow them, then rerun."
-}
 
 Write-Host "Converged \\$env:COMPUTERNAME\$ShareName for $identity."
 Write-Host "Writable bridge directories: '$sharePath\in', '$sharePath\out', and '$sharePath\logs'."
