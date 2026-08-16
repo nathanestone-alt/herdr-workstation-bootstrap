@@ -185,7 +185,9 @@ if ($usersSid.Value -notin $directGroupSids) {
 }
 Assert-DedicatedBridgeMembership -User $account
 
-foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved)) {
+New-Item -ItemType Directory -Path $sharePath -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $sharePath '.herdr-exchange-root'), 'herdr-exchange-root-v1')
+foreach ($directory in @("$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
 
@@ -240,7 +242,6 @@ Grant-SmbShareAccess -Name $ShareName -AccountName $identity -AccessRight Change
 Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP `
     -LocalPort 445 -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48') -Profile Any | Out-Null
-[IO.File]::WriteAllText((Join-Path $sharePath '.herdr-exchange-root'), 'herdr-exchange-root-v1')
 
 Write-Host "Converged \\$env:COMPUTERNAME\$ShareName for $identity."
 Write-Host "Writable bridge directories: '$sharePath\in', '$sharePath\out', and '$sharePath\logs'."

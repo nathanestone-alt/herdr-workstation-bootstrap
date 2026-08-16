@@ -13,22 +13,43 @@ function Resolve-HerdrExchangePath {
     param(
         [Parameter(Mandatory)][string]$Path,
         [switch]$AllowExistingUnmanagedPath,
-        [switch]$ExistingManagedShare
+        [switch]$ExistingManagedShare,
+        [AllowNull()][string[]]$ProtectedRoots
     )
 
+    if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal) -or
+        $Path.StartsWith('\\.\', [StringComparison]::Ordinal) -or
+        $Path.StartsWith('\??\', [StringComparison]::Ordinal)) {
+        throw "The SMB share path must not use a Windows device namespace: '$Path'."
+    }
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal)) {
+        throw "The SMB share path must be on a local fixed drive, not a UNC path: '$Path'."
+    }
     if (-not [IO.Path]::IsPathFullyQualified($Path)) {
         throw "The SMB share path must be absolute: '$Path'."
     }
-    $resolved = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $pathRoot = [IO.Path]::GetPathRoot($resolved).TrimEnd('\')
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $driveRoot = [IO.Path]::GetPathRoot($fullPath)
+    $resolved = $fullPath.TrimEnd('\')
+    $pathRoot = $driveRoot.TrimEnd('\')
+    if ($driveRoot -notmatch '^[A-Za-z]:\\$' -or
+        [IO.DriveInfo]::new($driveRoot).DriveType -ne [IO.DriveType]::Fixed) {
+        throw "The SMB share path must be on a local fixed drive: '$resolved'."
+    }
     if ($resolved.Equals($pathRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to use drive root '$resolved' as the SMB share."
     }
 
-    $protectedPaths = @(
-        $env:SystemRoot, $env:ProgramData, $env:ProgramFiles,
-        ${env:ProgramFiles(x86)}, (Join-Path $env:SystemDrive 'Users')
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $protectedPaths = if ($PSBoundParameters.ContainsKey('ProtectedRoots')) {
+        @($ProtectedRoots)
+    }
+    else {
+        @(
+            $env:SystemRoot, $env:ProgramData, $env:ProgramFiles,
+            ${env:ProgramFiles(x86)}, (Join-Path $env:SystemDrive 'Users')
+        )
+    }
+    $protectedPaths = @($protectedPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     foreach ($protectedPath in $protectedPaths) {
         if ((Test-HerdrPathSameOrDescendant -Candidate $resolved -Ancestor $protectedPath) -or
             (Test-HerdrPathSameOrDescendant -Candidate $protectedPath -Ancestor $resolved)) {

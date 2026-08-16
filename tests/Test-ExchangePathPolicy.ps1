@@ -20,24 +20,57 @@ Assert-Rejected -Path (Join-Path $env:SystemRoot 'Temp') -Expected 'protected sy
 Assert-Rejected -Path $env:ProgramData -Expected 'protected system path'
 Assert-Rejected -Path (Join-Path $env:SystemDrive 'Users') -Expected 'protected system path'
 Assert-Rejected -Path $env:SystemRoot -Expected 'protected system path' -AllowExisting
+Assert-Rejected -Path '\\?\C:\Windows' -Expected 'device namespace' -AllowExisting
+Assert-Rejected -Path '\\host\share\sub' -Expected 'local fixed drive'
 
 $fixture = Join-Path $PSScriptRoot "herdr-exchange-policy-$([Guid]::NewGuid().ToString('N'))"
+$fixtureProtectedPath = @(Join-Path $PSScriptRoot 'synthetic-protected-root')
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
-    Assert-Rejected -Path $fixture -Expected 'not marked as Herdr-managed'
-    $resolved = Resolve-HerdrExchangePath -Path $fixture -AllowExistingUnmanagedPath
+    try {
+        Resolve-HerdrExchangePath -Path $fixture -ProtectedRoots $fixtureProtectedPath | Out-Null
+        throw 'Expected the existing unmarked fixture to be rejected.'
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains('not marked as Herdr-managed', [StringComparison]::OrdinalIgnoreCase)) { throw }
+    }
+    $resolved = Resolve-HerdrExchangePath -Path $fixture -AllowExistingUnmanagedPath -ProtectedRoots $fixtureProtectedPath
     if (-not $resolved.Equals($fixture, [StringComparison]::OrdinalIgnoreCase)) { throw 'Explicit authorization returned the wrong path.' }
     [IO.File]::WriteAllText((Join-Path $fixture '.herdr-exchange-root'), 'herdr-exchange-root-v1')
-    Assert-Rejected -Path $fixture -Expected 'not marked as Herdr-managed'
-    $resolved = Resolve-HerdrExchangePath -Path $fixture -ExistingManagedShare
+    try {
+        Resolve-HerdrExchangePath -Path $fixture -ProtectedRoots $fixtureProtectedPath | Out-Null
+        throw 'Expected a marker without a matching share to be rejected.'
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains('not marked as Herdr-managed', [StringComparison]::OrdinalIgnoreCase)) { throw }
+    }
+    $resolved = Resolve-HerdrExchangePath -Path $fixture -ExistingManagedShare -ProtectedRoots $fixtureProtectedPath
     if (-not $resolved.Equals($fixture, [StringComparison]::OrdinalIgnoreCase)) { throw 'Managed-marker convergence returned the wrong path.' }
 }
 finally {
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }
 
+$junctionTarget = Join-Path $PSScriptRoot "herdr-exchange-target-$([Guid]::NewGuid().ToString('N'))"
+$junctionPath = Join-Path $PSScriptRoot "herdr-exchange-junction-$([Guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+    New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget | Out-Null
+    try {
+        Resolve-HerdrExchangePath -Path $junctionPath -AllowExistingUnmanagedPath -ProtectedRoots $fixtureProtectedPath | Out-Null
+        throw 'Expected a reparse-point fixture to be rejected.'
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains('reparse point', [StringComparison]::OrdinalIgnoreCase)) { throw }
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $junctionPath) { Remove-Item -LiteralPath $junctionPath -Force }
+    if (Test-Path -LiteralPath $junctionTarget) { Remove-Item -LiteralPath $junctionTarget -Recurse -Force }
+}
+
 $freshPath = Join-Path $PSScriptRoot "herdr-exchange-new-$([Guid]::NewGuid().ToString('N'))"
-$resolvedFresh = Resolve-HerdrExchangePath -Path $freshPath
+$resolvedFresh = Resolve-HerdrExchangePath -Path $freshPath -ProtectedRoots $fixtureProtectedPath
 if (-not $resolvedFresh.Equals($freshPath, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $freshPath)) {
     throw 'Fresh-path validation mutated the path or returned the wrong value.'
 }
