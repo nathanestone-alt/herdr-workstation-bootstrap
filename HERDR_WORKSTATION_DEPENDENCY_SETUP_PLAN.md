@@ -212,7 +212,7 @@ Add and validate the reviewed Windows staging helper before the round-trip commi
 - [ ] Run `bootstrap.ps1 -Stage HyperVEnable`; reboot if required.
 - [ ] Run `bootstrap.ps1 -Stage VmCreate -UbuntuIsoPath <verified ISO>`.
 - [ ] Install Ubuntu Server with OpenSSH.
-- [ ] Stop the VM, run `scripts/windows/New-HerdrUbuntuVM.ps1 -InstallationComplete` with the exact same resource and host-reserve overrides used at creation (omit them only when creation used defaults), and restart it.
+- [ ] Stop the VM, run `bootstrap.ps1 -Stage VmComplete` with the exact same `-Vm*` resource and host-reserve overrides used for `VmCreate` (omit them only when creation used defaults), and restart it.
 - [ ] Confirm the VM resource limits and autostart/stop actions.
 - [ ] Clone this repository under `~/code`.
 - [ ] Run Ubuntu bootstrap base and tools phases and archive `~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` with the commissioning record.

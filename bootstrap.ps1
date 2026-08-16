@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('Status', 'WindowsBase', 'HyperVEnable', 'VmCreate', 'Excel')]
+    [ValidateSet('Status', 'WindowsBase', 'HyperVEnable', 'VmCreate', 'VmComplete', 'Excel')]
     [string]$Stage = 'Status'
     ,
     [string]$UbuntuIsoPath,
@@ -127,13 +127,8 @@ function Enable-HyperV {
     Write-Warning 'Hyper-V was enabled. Reboot Windows before running the VmCreate stage.'
 }
 
-function New-UbuntuVm {
-    Assert-Administrator
-    if (-not $UbuntuIsoPath) {
-        throw 'VmCreate requires -UbuntuIsoPath pointing to the downloaded Ubuntu Server 24.04 LTS ISO.'
-    }
-    $vmParameters = @{
-        IsoPath = $UbuntuIsoPath
+function Get-UbuntuVmResourceParameters {
+    return @{
         ProcessorCount = $VmProcessorCount
         MinimumMemoryBytes = $VmMinimumMemoryBytes
         StartupMemoryBytes = $VmStartupMemoryBytes
@@ -141,6 +136,22 @@ function New-UbuntuVm {
         HostProcessorReserve = $VmHostProcessorReserve
         HostMemoryReserveBytes = $VmHostMemoryReserveBytes
     }
+}
+
+function New-UbuntuVm {
+    Assert-Administrator
+    if (-not $UbuntuIsoPath) {
+        throw 'VmCreate requires -UbuntuIsoPath pointing to the downloaded Ubuntu Server 24.04 LTS ISO.'
+    }
+    $vmParameters = Get-UbuntuVmResourceParameters
+    $vmParameters.IsoPath = $UbuntuIsoPath
+    & (Join-Path $RepoRoot 'scripts\windows\New-HerdrUbuntuVM.ps1') @vmParameters
+}
+
+function Complete-UbuntuVm {
+    Assert-Administrator
+    $vmParameters = Get-UbuntuVmResourceParameters
+    $vmParameters.InstallationComplete = $true
     & (Join-Path $RepoRoot 'scripts\windows\New-HerdrUbuntuVM.ps1') @vmParameters
 }
 
@@ -153,5 +164,6 @@ switch ($Stage) {
     'WindowsBase'  { Install-WindowsBase }
     'HyperVEnable' { Enable-HyperV }
     'VmCreate'     { New-UbuntuVm }
+    'VmComplete'   { Complete-UbuntuVm }
     'Excel'         { Install-ExcelEnvironment }
 }

@@ -67,6 +67,12 @@ try {
 catch {
     $failures.Add("Behavioral regression test failed: tests\Test-HostOwnedAclPolicy.ps1 ($($_.Exception.Message))")
 }
+try {
+    & (Join-Path $RepoRoot 'tests\Test-BootstrapVmDispatcher.ps1')
+}
+catch {
+    $failures.Add("Behavioral regression test failed: tests\Test-BootstrapVmDispatcher.ps1 ($($_.Exception.Message))")
+}
 
 $requiredFiles = @(
     'scripts\windows\HerdrFirewallPolicy.ps1',
@@ -80,6 +86,7 @@ $requiredFiles = @(
     'tests\test-verify-vps-access.sh',
     'tests\test-verify-path.sh',
     'tests\Test-FirewallPolicy.ps1',
+    'tests\Test-BootstrapVmDispatcher.ps1',
     'tests\Test-HostOwnedAclPolicy.ps1',
     'config\ubuntu-toolchain.lock',
     'legacy\WSL2-FALLBACK.md'
@@ -122,6 +129,7 @@ foreach ($relativePath in $primaryFiles) {
 # These are anti-deletion tripwires. Behavioral claims are covered by the
 # executable regression tests above and by commissioning on the target host.
 $contentAssertions = @(
+    @{ Path = 'bootstrap.ps1'; Required = @("'VmComplete'", 'function Complete-UbuntuVm', '$vmParameters.InstallationComplete = $true', "'VmComplete'   { Complete-UbuntuVm }"); Forbidden = @() },
     @{ Path = 'scripts\windows\HerdrHostOwnedAclPolicy.ps1'; Required = @('Snapshot descendants before protecting the root', "'/inheritance:r'", "'/grant:r'", "'/remove'", 'S-1-5-18', 'S-1-5-32-544', '$OperatorSid.Value', 'Unexpected ACL entry'); Forbidden = @('AccessControlType]::Deny', 'S-1-5-11', "'/T'", "'/C'") },
     @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'C:\HerdrReviewJobs', 'Protect-HostOwnedTree -TargetPath $toolsPathResolved', 'S-1-5-32-545', 'Add-LocalGroupMember', 'Get-NetConnectionProfile', 'Preflight found', 'AcceptedFirewallRule', 'LocalAddress', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false', '$toolsPathResolved /remove:g', '$toolsPathResolved /inheritance:r') },
     @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', '-WorkingDirectory "$env:SystemRoot\Temp"', 'C:\HerdrReviewJobs', 'AcceptedFirewallRule', 'LocalAddress', 'exit 41', 'exit 43', 'exit 44', 'exit 45', 'exit 46', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @() },

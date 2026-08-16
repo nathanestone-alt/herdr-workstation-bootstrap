@@ -94,6 +94,35 @@ spaced_effective="$(ssh -G -F "$HOME/.ssh/config" spaced-vps 2>/dev/null | awk '
   exit 1
 }
 
+config_hash_before_rejections="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+known_hosts_hash_before_rejections="$(sha256sum "$HOME/.ssh/known_hosts" | awk '{print $1}')"
+rejected_key_paths=(
+  "$HOME/.ssh/bad%key"
+  "$HOME/.ssh/bad\"key"
+  "$HOME/.ssh/bad\\key"
+  "$HOME/.ssh/"$'bad\nkey'
+)
+for rejected_key_path in "${rejected_key_paths[@]}"; do
+  rejection_output="$test_root/rejected-key-${#rejected_key_path}.txt"
+  set +e
+  bash "$script" --alias rejected-vps --host rejected.example --user admin --port 22 \
+    --existing-key "$rejected_key_path" --host-key-fingerprint "$fingerprint" >"$rejection_output" 2>&1
+  rejection_status=$?
+  set -e
+  [[ "$rejection_status" -eq 2 ]] || {
+    cat "$rejection_output" >&2
+    echo "Rejected IdentityFile path returned status $rejection_status instead of 2." >&2
+    exit 1
+  }
+  grep -Fq 'Identity-file path contains unsupported SSH configuration metacharacters.' "$rejection_output" || {
+    cat "$rejection_output" >&2
+    echo 'Rejected IdentityFile path did not produce the exact diagnostic.' >&2
+    exit 1
+  }
+  [[ "$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')" == "$config_hash_before_rejections" ]]
+  [[ "$(sha256sum "$HOME/.ssh/known_hosts" | awk '{print $1}')" == "$known_hosts_hash_before_rejections" ]]
+done
+
 bash "$script" "${common[@]}" --host two.example --user deploy --port 2222 >/dev/null
 [[ "$(grep -Fc '# BEGIN herdr-bootstrap test-vps' "$HOME/.ssh/config")" == 1 ]]
 grep -Fq '  HostName two.example' "$HOME/.ssh/config"

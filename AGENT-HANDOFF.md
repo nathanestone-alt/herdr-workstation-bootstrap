@@ -57,17 +57,17 @@ vmconnect.exe localhost herdr-ubuntu
 
 The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. Default safety reserves require at least 20 logical processors and 48 GB installed RAM. On other hardware, pass reviewed `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` overrides through `bootstrap.ps1 -Stage VmCreate`. The VM uses the Default Switch and starts 30 seconds after Hyper-V, before Windows user login.
 
-If VM creation used any reviewed resource or host-reserve override, record the exact arguments in the commissioning record and repeat every one of them on the later `New-HerdrUbuntuVM.ps1 -InstallationComplete` command. A bare completion command re-applies the script defaults.
+If VM creation used any reviewed resource or host-reserve override, record the exact `-Vm*` arguments in the commissioning record and repeat every one of them on the later `bootstrap.ps1 -Stage VmComplete` command. A bare completion command re-applies the script defaults.
 
 Have the user install Ubuntu with OpenSSH enabled. After installation:
 
 ~~~powershell
 Stop-VM -Name herdr-ubuntu
-pwsh -File .\scripts\windows\New-HerdrUbuntuVM.ps1 -InstallationComplete
+pwsh -File .\bootstrap.ps1 -Stage VmComplete
 Start-VM -Name herdr-ubuntu
 ~~~
 
-The bare completion command above is only for a VM created with the defaults. Otherwise append the identical resource and host-reserve override arguments.
+The bare completion command above is only for a VM created with the defaults. Otherwise append the identical `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` arguments used for `VmCreate`; `bootstrap.ps1` translates and forwards them to the lower-level completion script.
 
 The convergence pass verifies the system VHD, Generation 2, switch, CPU and dynamic-memory bounds, Secure Boot, and automatic start/stop settings before detaching the ISO. It fails closed on incompatible pre-existing state.
 
