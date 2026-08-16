@@ -1,0 +1,9 @@
+# Compatibility baseline captured from the ARM64 Surface on 2026-08-16.
+# Validate these packages on x86-64 Python 3.13 before promotion.
+numpy==2.4.6
+openpyxl==3.1.5
+pywin32==311
+pytest
+XlsxWriter==3.2.9
+xlwings==0.34.0
+

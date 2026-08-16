@@ -1,0 +1,27 @@
+# Migration payload is exported separately and may contain private local material.
+payload/*
+!payload/README.md
+
+# Logs and generated state
+logs/
+*.log
+*.bak
+*.tmp
+.bootstrap-state/
+LOCAL-COMMISSIONING-LOG.md
+
+# Credentials must never be committed
+*.key
+*.pem
+auth.json
+credentials.json
+known_hosts
+id_ed25519
+id_rsa
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
