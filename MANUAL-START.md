@@ -108,7 +108,7 @@ Remain available for:
 
 1. The Hyper-V feature reboot.
 2. Ubuntu installation through VMConnect and creation of the Linux username/password.
-3. Stopping the VM and running the verified `New-HerdrUbuntuVM.ps1 -InstallationComplete` convergence pass after installation.
+3. Stopping the VM and running the verified `New-HerdrUbuntuVM.ps1 -InstallationComplete` convergence pass after installation. If VM creation used resource or host-reserve overrides, repeat the exact same arguments on this command; a bare completion pass re-applies defaults.
 4. `sudo` prompts.
 5. GitHub, Codex, Claude and both Tailscale authentications.
 6. Creating and storing the long, strong, non-expiring `HerdrBridge` SMB password; any later rotation must update Ubuntu in the same maintenance window.

@@ -27,6 +27,18 @@ try {
 
     Protect-HostOwnedTree -TargetPath $root -OperatorSid $operatorSid
     @(Get-ChildItem -LiteralPath $root -Force -Recurse) | Out-Null
+    $fileAcl = Get-Acl -LiteralPath (Join-Path $child 'existing.txt')
+    $fileRules = @($fileAcl.Access)
+    if ($fileRules.Count -lt 3) {
+        throw 'A host-owned leaf file was left without the required allow-only DACL.'
+    }
+    foreach ($fileRule in $fileRules) {
+        $fileSid = $fileRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($fileSid -notin @('S-1-5-18', 'S-1-5-32-544', $operatorSid.Value) -or
+            $fileRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            throw "Unexpected leaf-file ACL entry '$($fileRule.IdentityReference):$($fileRule.FileSystemRights)'."
+        }
+    }
     $operatorProbe = Join-Path $root 'operator-write.tmp'
     [IO.File]::WriteAllText($operatorProbe, 'allowed')
     Remove-Item -LiteralPath $operatorProbe -Force

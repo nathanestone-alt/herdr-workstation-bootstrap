@@ -29,6 +29,7 @@ cat > "$managed_bin/bash" <<'EOF'
 set -euo pipefail
 if [[ "${1:-}" == -lc ]]; then
   shift
+  export PATH='/usr/bin:/bin'
   for startup_file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
     if [[ -f "$startup_file" ]]; then
       . "$startup_file"
@@ -96,4 +97,18 @@ run_verify_layout() {
 run_verify_layout profile
 run_verify_layout bash-profile
 run_verify_layout bash-login
+
+rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
+: > "$HOME/.profile"
+negative_output="$test_root/verify-output-missing-hook.txt"
+if PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$negative_output" 2>&1; then
+  cat "$negative_output" >&2
+  echo 'verify.sh passed even though the managed login-shell PATH hook was absent.' >&2
+  exit 1
+fi
+grep -q '^FAIL login PATH omits ' "$negative_output" || {
+  cat "$negative_output" >&2
+  echo 'Missing-hook negative case did not fail the login PATH gate.' >&2
+  exit 1
+}
 echo 'verify.sh managed-PATH regression test passed.'

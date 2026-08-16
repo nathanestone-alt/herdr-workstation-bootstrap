@@ -209,10 +209,7 @@ foreach ($writableDirectory in @("$sharePath\in", "$sharePath\out", "$sharePath\
     & icacls.exe $writableDirectory /grant:r "$($identity):(OI)(CI)M" /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Failed to grant NTFS Modify permission on '$writableDirectory'." }
 }
-& icacls.exe $toolsPathResolved /remove:g $identity /T /C | Out-Null
-& icacls.exe $toolsPathResolved /inheritance:r `
-    /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$($operatorIdentity):(OI)(CI)F" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Failed to protect host-owned tools directory '$toolsPathResolved'." }
+Protect-HostOwnedTree -TargetPath $toolsPathResolved -OperatorSid $operatorSid
 
 $share = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
 if ($share -and -not ([IO.Path]::GetFullPath($share.Path).TrimEnd('\')).Equals($sharePath, [StringComparison]::OrdinalIgnoreCase)) {

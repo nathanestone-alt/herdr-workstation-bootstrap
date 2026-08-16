@@ -26,7 +26,8 @@ printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
 for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs; do
   check_command "$command"
 done
-login_path="$(HOME="$HOME" bash -lc 'printf "%s" "$PATH"')"
+login_shell="$(command -v bash)"
+login_path="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc 'printf "%s" "$PATH"')"
 for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   if [[ ":$login_path:" == *":$required_path:"* ]]; then
     echo "PASS login PATH includes $required_path"
@@ -36,7 +37,7 @@ for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   fi
 done
 for command in rtk codex claude herdr; do
-  login_command="$(HOME="$HOME" bash -lc "command -v $command" 2>/dev/null || true)"
+  login_command="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc "command -v $command" 2>/dev/null || true)"
   if [[ -n "$login_command" ]]; then
     echo "PASS login command $command $login_command"
   else

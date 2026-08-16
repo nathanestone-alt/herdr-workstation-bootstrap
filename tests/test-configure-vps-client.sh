@@ -79,6 +79,21 @@ bash "$script" "${common[@]}" --host one.example --user admin --port 22 >/dev/nu
 [[ "$(grep -Fc '# BEGIN herdr-bootstrap test-vps' "$HOME/.ssh/config")" == 1 ]]
 grep -Fq '  HostName one.example' "$HOME/.ssh/config"
 
+mkdir -p "$HOME/.ssh/key dir"
+cp "$HOME/.ssh/test-key" "$HOME/.ssh/key dir/test key"
+cp "$HOME/.ssh/test-key.pub" "$HOME/.ssh/key dir/test key.pub"
+bash "$script" --alias spaced-vps --host spaced.example --user admin --port 22 \
+  --existing-key "$HOME/.ssh/key dir/test key" --host-key-fingerprint "$fingerprint" >/dev/null
+grep -Fq "  IdentityFile \"$HOME/.ssh/key dir/test key\"" "$HOME/.ssh/config" || {
+  echo 'Spaced IdentityFile path was not emitted as one quoted SSH token.' >&2
+  exit 1
+}
+spaced_effective="$(ssh -G -F "$HOME/.ssh/config" spaced-vps 2>/dev/null | awk '$1 == "identityfile" { $1=""; sub(/^ /, ""); print; exit }')"
+[[ "$spaced_effective" == "$HOME/.ssh/key dir/test key" ]] || {
+  echo 'Spaced IdentityFile path did not survive OpenSSH effective-config resolution.' >&2
+  exit 1
+}
+
 bash "$script" "${common[@]}" --host two.example --user deploy --port 2222 >/dev/null
 [[ "$(grep -Fc '# BEGIN herdr-bootstrap test-vps' "$HOME/.ssh/config")" == 1 ]]
 grep -Fq '  HostName two.example' "$HOME/.ssh/config"

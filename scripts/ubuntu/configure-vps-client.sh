@@ -41,6 +41,12 @@ fi
 if [[ -n "$existing_key" ]]; then
   key_path="${existing_key/#\~/$HOME}"
 fi
+case "$key_path" in
+  *$'\n'*|*$'\r'*|*'"'*|*'%'*|*\\*)
+    echo 'Identity-file path contains unsupported SSH configuration metacharacters.' >&2
+    exit 2
+    ;;
+esac
 
 install -d -m 700 "$HOME/.ssh"
 if [[ ! -f "$key_path" ]]; then
@@ -102,7 +108,7 @@ end_marker="# END herdr-bootstrap $alias_name"
   printf '  HostName %s\n' "$host_name"
   printf '  User %s\n' "$user_name"
   printf '  Port %s\n' "$port"
-  printf '  IdentityFile %s\n' "$key_path"
+  printf '  IdentityFile "%s"\n' "$key_path"
   printf '  IdentitiesOnly yes\n'
   printf '  StrictHostKeyChecking yes\n'
   printf '  UserKnownHostsFile ~/.ssh/known_hosts\n'
@@ -250,6 +256,9 @@ validate_effective_alias() {
   expected_user="$(awk '$1 == "User" { print $2; exit }' "$block_file")"
   expected_port="$(awk '$1 == "Port" { print $2; exit }' "$block_file")"
   expected_key="$(awk '$1 == "IdentityFile" { $1=""; sub(/^[[:space:]]+/, ""); print; exit }' "$block_file")"
+  if [[ "$expected_key" == \"*\" ]]; then
+    expected_key="${expected_key:1:${#expected_key}-2}"
+  fi
   : > "$ssh_error"
   if ! effective_config="$(ssh -G -F "$validation_config" "$checked_alias" 2>"$ssh_error")"; then
     echo "OpenSSH could not resolve managed alias '$checked_alias'; the client configuration was not changed." >&2
