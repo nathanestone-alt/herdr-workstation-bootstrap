@@ -92,7 +92,8 @@ install_tools() {
     exit 21
   fi
 
-  if ! command -v rustup >/dev/null 2>&1; then
+  installed_rustup="$(rustup --version 2>/dev/null | awk 'NR == 1 { print $1 " " $2 }' || true)"
+  if [[ "$installed_rustup" != "rustup $RUSTUP_VERSION" ]]; then
     rustup_init="$(mktemp)"
     download_verified "$RUSTUP_INIT_URL" "$RUSTUP_INIT_SHA256" "$rustup_init"
     chmod 0700 "$rustup_init"
@@ -101,7 +102,9 @@ install_tools() {
   fi
   # shellcheck disable=SC1091
   source "$HOME/.cargo/env"
-  rustup --version | grep -Fq "$RUSTUP_VERSION" || { echo 'rustup version does not match lock.' >&2; exit 24; }
+  [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
+    echo "rustup version does not match lock after reinstall ($RUSTUP_VERSION)." >&2; exit 24;
+  }
   rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
   rustup default "$RUST_TOOLCHAIN"
 
@@ -116,6 +119,9 @@ install_tools() {
     echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
   }
   cargo install --path "$HOME/src/rtk" --locked --force
+  for executable in rustup cargo rustc rtk; do
+    ln -sfn "$HOME/.cargo/bin/$executable" "$bin_dir/$executable"
+  done
 
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
@@ -145,10 +151,10 @@ install_tools() {
   install -m 0755 "$herdr_temp" "$bin_dir/herdr"
   rm -f "$herdr_temp"
 
-  codex --version | grep -Fq "$CODEX_VERSION" || { echo 'Codex version does not match lock.' >&2; exit 24; }
-  claude --version | grep -Fq "$CLAUDE_VERSION" || { echo 'Claude version does not match lock.' >&2; exit 24; }
-  bun --version | grep -Fxq "$BUN_VERSION" || { echo 'Bun version does not match lock.' >&2; exit 24; }
-  herdr --version | grep -Fq "$HERDR_VERSION" || { echo 'Herdr version does not match lock.' >&2; exit 24; }
+  [[ "$(codex --version | awk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
+  [[ "$(claude --version | awk '{ print $1 }')" == "$CLAUDE_VERSION" ]] || { echo 'Claude version does not match lock.' >&2; exit 24; }
+  [[ "$(bun --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
+  [[ "$(herdr --version | awk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
 
   manifest="$state_dir/toolchain-manifest.txt"
   {
@@ -171,6 +177,7 @@ install_tools() {
   mkdir -p "$HOME/code"
   touch "$state_dir/tools-complete"
   echo "Tool installation complete. Resolved manifest: $manifest"
+  echo "The tools are available immediately through $bin_dir. Start a new login shell before normal interactive use so Ubuntu's profile also exports that directory."
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 

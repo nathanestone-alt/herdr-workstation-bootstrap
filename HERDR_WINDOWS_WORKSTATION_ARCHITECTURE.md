@@ -130,6 +130,22 @@ Excel automation must run in an interactive Windows user session:
 - Exchange workbooks through the restricted `HerdrExchange` SMB share mounted at `/srv/herdr-exchange` in Ubuntu.
 - Invoke Excel through a reviewed Windows-side job runner in the interactive user session; Hyper-V has no WSL-style `powershell.exe` interop.
 
+### OneDrive review exchange
+
+Use GitHub as the source of truth for repositories and OneDrive as the human-facing exchange for one-off documents and workbook reviews. This provides a lightweight path for reviewing an STModel workbook without creating a Git branch or performing a full repository handoff.
+
+Configure the native Windows OneDrive client with a dedicated `Herdr Review Exchange` folder containing `Inbox`, `Outbox`, and `Archive`. Mark the entire folder **Always keep on this device**. Do not install or mount OneDrive inside Ubuntu.
+
+OneDrive is a transfer and version-history layer, not an automation workspace:
+
+1. Upload a uniquely named workbook to `Inbox` from the laptop.
+2. Wait for Windows to report that the file is fully local, preserve the original, calculate its SHA-256 hash, and copy it into a job-specific directory below `C:\HerdrExchange\in`.
+3. Run review or Excel COM work only against that staged local copy. Never run automation directly against the live OneDrive path because sync locks, Files On-Demand hydration, and conflict copies make it nondeterministic.
+4. Copy the completed workbook plus a small provenance manifest to `Outbox`; include the source filename/hash, timestamp, originating repository/branch/commit when applicable, and result hash.
+5. After acceptance, move the transfer set to `Archive` according to the retention policy.
+
+Do not place Git working trees, Hyper-V disks, credentials, private keys, automation logs, or active databases in OneDrive. Do not enable macros or external links in an untrusted workbook merely because it arrived through the exchange.
+
 ## Remote access and recovery
 
 Normal access:
@@ -215,6 +231,8 @@ Backblaze complements this system by protecting supported user data offsite. It 
 - [ ] Install and test Herdr persistence.
 - [ ] Configure separate Windows and Ubuntu Tailscale nodes, SSH, Mosh and RDP.
 - [ ] Create and write-test the restricted SMB Excel exchange.
+- [ ] Sign in to OneDrive on Windows, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the tree Always keep on this device.
+- [ ] Complete a round-trip workbook review from laptop → OneDrive Inbox → staged SMB job → OneDrive Outbox, verifying hashes and preserving the original.
 - [ ] Port the Herdr coordination payload to Linux and pass its native-`pwsh` regression suite before enabling it.
 - [ ] Configure Comet, Fingerbot and independent KVM power.
 - [ ] Upload and boot-test recovery virtual media.

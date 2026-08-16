@@ -44,6 +44,8 @@ On the current Surface:
 6. Install and activate 64-bit Microsoft 365 desktop Excel.
 7. Create, save, reopen and close a disposable workbook in `C:\HerdrExchange`.
 8. Resolve Excel Trust Center, add-in, activation and Protected View prompts.
+9. Sign in to the native Windows OneDrive client, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the full tree Always keep on this device.
+10. Do not make the OneDrive folder an Excel trusted location; trust macros, links and data connections only for a specifically verified workbook.
 
 Excel COM still requires the designated Windows user to be interactively signed in. The Ubuntu VM can start and accept SSH before that login occurs.
 

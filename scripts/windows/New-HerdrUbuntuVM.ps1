@@ -42,6 +42,8 @@ if (-not $existing) {
         throw "Orphan VHD '$vhdPath' exists without VM '$VmName'. Validate and move or remove it explicitly before retrying."
     }
     New-Item -ItemType Directory -Path $vhdDirectory -Force | Out-Null
+    $preexistingPaths = @(Get-ChildItem -LiteralPath $VmRoot -Force -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName)
     $createdVhd = $false
     try {
         New-VHD -Path $vhdPath -Dynamic -SizeBytes $VhdSizeBytes | Out-Null
@@ -50,10 +52,18 @@ if (-not $existing) {
             -VHDPath $vhdPath -SwitchName $SwitchName | Out-Null
     }
     catch {
+        $creationError = $_
         if ($createdVhd -and -not (Get-VM -Name $VmName -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath $vhdPath)) {
             Remove-Item -LiteralPath $vhdPath -Force
         }
-        throw
+        $residualPaths = @(Get-ChildItem -LiteralPath $VmRoot -Force -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName |
+            Where-Object { $_ -notin $preexistingPaths -and $_ -ne $vhdPath })
+        if ($residualPaths.Count -gt 0) {
+            $residualSummary = ($residualPaths | Select-Object -First 10) -join "', '"
+            throw "VM creation failed and left residual configuration under '$VmRoot': '$residualSummary'. Inspect and remove only the failed '$VmName' configuration before retrying. Original error: $($creationError.Exception.Message)"
+        }
+        throw $creationError
     }
     $existing = Get-VM -Name $VmName
 }
@@ -63,6 +73,15 @@ if ($existing.State -ne 'Off') {
 }
 if ($existing.Generation -ne 2) {
     throw "VM '$VmName' is Generation $($existing.Generation); Generation 2 is required."
+}
+$expectedVmRoot = [IO.Path]::GetFullPath($VmRoot).TrimEnd('\')
+$actualVmRoot = [IO.Path]::GetFullPath($existing.Path).TrimEnd('\')
+if (-not $actualVmRoot.Equals($expectedVmRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "VM '$VmName' configuration is rooted at '$($existing.Path)', not '$expectedVmRoot'."
+}
+$checkpoints = @(Get-VMSnapshot -VMName $VmName -ErrorAction Stop)
+if ($checkpoints.Count -gt 0) {
+    throw "VM '$VmName' has $($checkpoints.Count) checkpoint(s). Merge or remove them explicitly before convergence or recovery."
 }
 
 $disks = @(Get-VMHardDiskDrive -VMName $VmName)
@@ -86,7 +105,8 @@ Set-VMProcessor -VMName $VmName -Count $ProcessorCount
 Set-VMMemory -VMName $VmName -DynamicMemoryEnabled $true `
     -MinimumBytes $MinimumMemoryBytes -StartupBytes $StartupMemoryBytes -MaximumBytes $MaximumMemoryBytes -Buffer 20
 Set-VMFirmware -VMName $VmName -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
-Set-VM -Name $VmName -AutomaticStartAction Start -AutomaticStartDelay 30 -AutomaticStopAction Save
+Set-VM -Name $VmName -AutomaticStartAction Start -AutomaticStartDelay 30 -AutomaticStopAction Save `
+    -AutomaticCheckpointsEnabled $false
 
 $disk = $disks[0]
 $dvdDrives = @(Get-VMDvdDrive -VMName $VmName)

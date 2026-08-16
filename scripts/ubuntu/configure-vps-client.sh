@@ -69,9 +69,10 @@ if [[ "$port" != "22" ]]; then
 fi
 existing_host_keys="$(ssh-keygen -F "$host_token" -f "$known_hosts" 2>/dev/null || true)"
 if [[ -n "$existing_host_keys" ]]; then
-  if ! printf '%s\n' "$existing_host_keys" | grep -v '^#' > "$current_block" || \
-      ! ssh-keygen -lf "$current_block" -E sha256 | awk '{ print $2 }' | grep -Fxq "$host_key_fingerprint"; then
-    echo "Existing known_hosts entry for $host_token does not match the verified fingerprint. Resolve it manually." >&2
+  printf '%s\n' "$existing_host_keys" | grep -v '^#' > "$current_block" || true
+  mapfile -t recorded_fingerprints < <(ssh-keygen -lf "$current_block" -E sha256 | awk '{ print $2 }')
+  if (( ${#recorded_fingerprints[@]} != 1 )) || [[ "${recorded_fingerprints[0]:-}" != "$host_key_fingerprint" ]]; then
+    echo "known_hosts must contain exactly one key for $host_token and it must match the verified fingerprint. Resolve stale or extra entries manually." >&2
     exit 25
   fi
 else
@@ -83,6 +84,36 @@ touch "$config"
 chmod 600 "$config"
 marker="# BEGIN herdr-bootstrap $alias_name"
 end_marker="# END herdr-bootstrap $alias_name"
+host_pattern_matches_alias() {
+  local candidate="${alias_name,,}"
+  local pattern normalized
+  local positive_match=false
+  for pattern in "$@"; do
+    normalized="${pattern,,}"
+    if [[ "$normalized" == '!'* ]]; then
+      [[ "$candidate" == ${normalized:1} ]] && return 1
+    elif [[ "$candidate" == $normalized ]]; then
+      positive_match=true
+    fi
+  done
+  [[ "$positive_match" == true ]]
+}
+
+inside_managed=false
+line_number=0
+while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+  line_number=$((line_number + 1))
+  if [[ "$config_line" == "$marker" ]]; then inside_managed=true; continue; fi
+  if [[ "$config_line" == "$end_marker" ]]; then inside_managed=false; continue; fi
+  [[ "$inside_managed" == true ]] && continue
+  if [[ "$config_line" =~ ^[[:space:]]*[Hh][Oo][Ss][Tt][[:space:]]+(.+)$ ]]; then
+    read -r -a host_patterns <<< "${BASH_REMATCH[1]}"
+    if host_pattern_matches_alias "${host_patterns[@]}"; then
+      echo "Unmanaged Host stanza at $config:$line_number matches alias '$alias_name'; refusing because OpenSSH first-value precedence would override the managed block." >&2
+      exit 26
+    fi
+  fi
+done < "$config"
 {
   printf '%s\n' "$marker"
   printf 'Host %s\n' "$alias_name"

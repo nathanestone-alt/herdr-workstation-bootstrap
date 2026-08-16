@@ -172,6 +172,19 @@ Boundary:
 6. A Windows reboot can restore Ubuntu before login, but Excel jobs wait until the Windows automation user signs in.
 7. The bridge password is long, strong, non-expiring, and stored in the password manager plus Ubuntu's root-only credential file. Rotation is an explicit coordinated maintenance operation followed by a write test.
 
+### OneDrive one-off file and workbook review lane
+
+GitHub remains authoritative for repositories. Use the Windows OneDrive client only for one-off files and workbook review handoffs that do not justify a Git branch or full project transfer.
+
+- Create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive` under the signed-in Windows OneDrive root and mark them Always keep on this device.
+- Keep OneDrive off Ubuntu; Ubuntu reaches only the restricted `/srv/herdr-exchange` staging area.
+- Preserve each Inbox original and stage a copied, hashed workbook under `C:\HerdrExchange\in\<job-id>` before review or COM automation.
+- Return the result through Outbox with a manifest containing source and result hashes, timestamps, and repository/branch/commit provenance when the workbook came from STModel work.
+- Never operate Excel automation directly in a syncing OneDrive directory, and never store repositories, VM disks, secrets, logs, or databases there.
+- Treat macros, external links, and data connections as executable content requiring an explicit trust decision.
+
+Add a reviewed Windows staging helper later; it should require a fully hydrated regular file, reject path traversal and unexpected extensions, create collision-resistant job IDs, copy rather than move the original, hash both directions, and never accept arbitrary commands.
+
 ## Installation and validation sequence
 
 ### Phase 0 — Manual runway
@@ -214,10 +227,12 @@ Boundary:
 ### Phase 4 — Excel bridge
 
 - [ ] Create the restricted Windows SMB share and store its password.
-- [ ] Run `Test-HerdrExchangeBoundary.ps1` and prove the bridge account cannot modify `C:\HerdrTools`.
+- [ ] Run `Test-HerdrExchangeBoundary.ps1` and prove the bridge account can write only the exchange subdirectories, cannot modify the exchange root or `C:\HerdrTools`, and has no competing inbound TCP 445 allow rule.
 - [ ] Mount and write-test it from Ubuntu.
 - [ ] Run the disposable Excel COM test.
 - [ ] Build and validate the narrow interactive Windows job runner.
+- [ ] Configure the OneDrive `Herdr Review Exchange` tree as Always keep on this device.
+- [ ] Round-trip an STModel workbook through Inbox, a hashed local staging copy, Excel review, and Outbox without using GitHub for the workbook handoff.
 - [ ] Confirm Excel remains unavailable before Windows login while Ubuntu remains available.
 
 ### Phase 5 — Skills, plugins and projects
@@ -270,4 +285,5 @@ Keep passwords, tokens, recovery keys, SMB credentials, private SSH keys and Off
 - Whether the pinned RTK revision remains necessary.
 - The validated `pytest` and Windows Python dependency lock.
 - The narrow command schema for the Windows Excel job runner.
+- The retention period and exact provenance-manifest schema for the OneDrive review exchange.
 - The exact deferred 20 TB backup-drive model and final Veeam/Backblaze schedule.

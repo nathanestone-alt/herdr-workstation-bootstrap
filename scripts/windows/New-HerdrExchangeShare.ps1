@@ -15,12 +15,39 @@ $ErrorActionPreference = 'Stop'
 $requiredUser = 'HerdrBridge'
 function Assert-DedicatedBridgeMembership([object]$User) {
     $ordinaryUsersSid = 'S-1-5-32-545'
-    foreach ($group in @(Get-LocalGroup)) {
-        $memberSids = @(Get-LocalGroupMember -Group $group -ErrorAction Stop | ForEach-Object { $_.SID.Value })
-        if ($memberSids -contains $User.SID.Value -and $group.SID.Value -ne $ordinaryUsersSid) {
-            throw "Bridge account '$($User.Name)' belongs to prohibited local group '$($group.Name)'. It may belong only to the built-in Users group."
+    try {
+        $adsiUser = [ADSI]"WinNT://$env:COMPUTERNAME/$($User.Name),user"
+        $memberGroups = @($adsiUser.psbase.Invoke('Groups'))
+    }
+    catch {
+        throw "Could not enumerate actual group memberships for bridge account '$($User.Name)' via ADSI: $($_.Exception.Message)"
+    }
+    $isOrdinaryUser = $false
+    foreach ($group in $memberGroups) {
+        $groupName = $group.GetType().InvokeMember('Name', 'GetProperty', $null, $group, $null)
+        $sidBytes = $group.GetType().InvokeMember('objectSID', 'GetProperty', $null, $group, $null)
+        $groupSid = [Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0).Value
+        if ($groupSid -eq $ordinaryUsersSid) {
+            $isOrdinaryUser = $true
+        }
+        else {
+            throw "Bridge account '$($User.Name)' belongs to prohibited local group '$groupName'. It may belong only to the built-in Users group."
         }
     }
+    if (-not $isOrdinaryUser) {
+        throw "Bridge account '$($User.Name)' is not a member of the built-in Users group."
+    }
+}
+
+function Test-FirewallPortIncludes445([object]$LocalPort) {
+    foreach ($portExpression in @($LocalPort)) {
+        $text = [string]$portExpression
+        if ($text -eq 'Any' -or $text -eq '445') { return $true }
+        if ($text -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 445 -and [int]$Matches[2] -ge 445) {
+            return $true
+        }
+    }
+    return $false
 }
 if ($LocalUser -cne $requiredUser) {
     throw "The SMB bridge must use the dedicated '$requiredUser' account."
@@ -77,15 +104,33 @@ foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$shareP
 }
 
 $identity = "$env:COMPUTERNAME\$LocalUser"
-& icacls.exe $sharePath /remove:g $identity /T /C | Out-Null
-& icacls.exe $sharePath /grant:r "$($identity):(RX)" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Failed to grant NTFS read/traverse permission on the share root.' }
+$operatorIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$rootAcl = Get-Acl -LiteralPath $sharePath
+$rootAcl.SetAccessRuleProtection($true, $false)
+foreach ($existingRule in @($rootAcl.Access)) {
+    $rootAcl.RemoveAccessRuleSpecific($existingRule)
+}
+$inheritFlags = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$noInherit = [Security.AccessControl.InheritanceFlags]::None
+$propagation = [Security.AccessControl.PropagationFlags]::None
+$allow = [Security.AccessControl.AccessControlType]::Allow
+foreach ($principal in @(
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+    [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
+    $operatorSid
+)) {
+    $rootAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $principal, [Security.AccessControl.FileSystemRights]::FullControl, $inheritFlags, $propagation, $allow))
+}
+$rootAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $account.SID, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $noInherit, $propagation, $allow))
+Set-Acl -LiteralPath $sharePath -AclObject $rootAcl
 foreach ($writableDirectory in @("$sharePath\in", "$sharePath\out", "$sharePath\logs")) {
     & icacls.exe $writableDirectory /grant:r "$($identity):(OI)(CI)M" /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Failed to grant NTFS Modify permission on '$writableDirectory'." }
 }
 & icacls.exe $toolsPathResolved /remove:g $identity /T /C | Out-Null
-$operatorIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 & icacls.exe $toolsPathResolved /inheritance:r `
     /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$($operatorIdentity):(OI)(CI)F" /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Failed to protect host-owned tools directory '$toolsPathResolved'." }
@@ -116,6 +161,20 @@ $ruleName = 'Herdr Exchange SMB over Tailscale'
 Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP `
     -LocalPort 445 -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48') -Profile Any | Out-Null
+$conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow)) {
+    if ($firewallRule.DisplayName -eq $ruleName) { continue }
+    foreach ($portFilter in @($firewallRule | Get-NetFirewallPortFilter)) {
+        if (($portFilter.Protocol -in @('TCP', 6, 'Any', 256)) -and
+            (Test-FirewallPortIncludes445 -LocalPort $portFilter.LocalPort)) {
+            $firewallRule
+            break
+        }
+    }
+}
+if (@($conflictingRules).Count -gt 0) {
+    $names = @($conflictingRules | Select-Object -ExpandProperty DisplayName -Unique) -join "', '"
+    throw "Other enabled inbound allow rules expose TCP 445: '$names'. Disable or narrow them, then rerun."
+}
 
 Write-Host "Converged \\$env:COMPUTERNAME\$ShareName for $identity."
 Write-Host "Writable bridge directories: '$sharePath\in', '$sharePath\out', and '$sharePath\logs'."

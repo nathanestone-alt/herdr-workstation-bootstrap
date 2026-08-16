@@ -32,7 +32,10 @@ cat > "$fake_bin/ssh-keygen" <<'EOF'
 set -euo pipefail
 case "$1" in
   -lf)
-    printf '256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test (ED25519)\n'
+    file="$2"
+    while IFS= read -r _; do
+      printf '256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test (ED25519)\n'
+    done < "$file"
     ;;
   -F)
     token="$2"
@@ -88,6 +91,21 @@ if bash "$script" --alias bad-vps --host bad.example --user admin --port 22 \
     --existing-key "$HOME/.ssh/test-key" \
     --host-key-fingerprint 'SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' >/dev/null 2>&1; then
   echo 'Expected host-key mismatch to fail.' >&2
+  exit 1
+fi
+
+printf '\nHost shadow-vps\n  HostName attacker.example\n' >> "$HOME/.ssh/config"
+if bash "$script" --alias shadow-vps --host good.example --user admin --port 22 \
+    --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null 2>&1; then
+  echo 'Expected unmanaged matching Host stanza to fail.' >&2
+  exit 1
+fi
+
+printf 'duplicate.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixtureOnly\n' >> "$HOME/.ssh/known_hosts"
+printf 'duplicate.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExtraFixtureOnly\n' >> "$HOME/.ssh/known_hosts"
+if bash "$script" --alias duplicate-vps --host duplicate.example --user admin --port 22 \
+    --existing-key "$HOME/.ssh/test-key" --host-key-fingerprint "$fingerprint" >/dev/null 2>&1; then
+  echo 'Expected duplicate known_hosts keys to fail.' >&2
   exit 1
 fi
 

@@ -24,7 +24,7 @@ Once an agent is running in this repository, give it this exact instruction:
 - `scripts/ubuntu/configure-excel-share.sh` — credential-protected SMB mount at `/srv/herdr-exchange`.
 - `scripts/ubuntu/verify.sh` — non-destructive Ubuntu verification.
 - `scripts/windows/Test-ExcelCom.py` — disposable native Excel COM smoke test.
-- `scripts/windows/Test-HerdrExchangeBoundary.ps1` — live negative test proving the SMB bridge cannot modify host-owned automation code.
+- `scripts/windows/Test-HerdrExchangeBoundary.ps1` — live negative test proving the SMB bridge cannot modify the exchange root or host-owned automation code and that no competing firewall rule exposes SMB.
 - `scripts/windows/Export-MigrationPayload.ps1` — allowlisted export from the old Surface; excludes credentials and plugin caches.
 
 ## Documentation

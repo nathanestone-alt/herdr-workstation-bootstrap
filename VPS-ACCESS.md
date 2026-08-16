@@ -51,6 +51,15 @@ bash scripts/ubuntu/configure-vps-client.sh \
 
 Choose a strong passphrase when prompted. The private key remains only in Ubuntu at '~/.ssh/hostinger_vps_ed25519'.
 
+Load that passphrase-protected identity into an agent before either non-interactive verification gate:
+
+~~~bash
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/hostinger_vps_ed25519
+~~~
+
+`verify-vps-access.sh` fails with the exact `ssh-add` remediation when the configured public key is not loaded.
+
 The script verifies the scanned ED25519 host key against the independent fingerprint, pins it in `known_hosts`, prints the public key, and creates or converges a backed-up SSH client configuration. Add only the public key through Hostinger hPanel under VPS → Manage → Settings → SSH keys, or append it through the existing trusted SSH session to the intended user's authorized_keys.
 
 Do not remove the old Surface key yet.

@@ -115,15 +115,17 @@ pwsh -File .\scripts\windows\Test-HerdrExchangeBoundary.ps1
 pwsh -File .\bootstrap.ps1 -Stage Excel
 ~~~
 
-The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only by running the Windows script with `-RotatePassword`, immediately updating Ubuntu, and completing the write test in the same maintenance window. From Ubuntu:
+The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only in a coordinated maintenance window: run the Windows script with `-RotatePassword` (it securely prompts for the new password), then immediately run the Ubuntu command below with that same password. The Ubuntu script unmounts any existing SMB session before replacing the credential, converges its managed `/etc/fstab` block, creates a fresh encrypted SMB session, and must pass the write test before the window ends.
 
 ~~~bash
 bash scripts/ubuntu/configure-excel-share.sh --host herdr-win
 ~~~
 
-The boundary test runs a child process as `HerdrBridge` and must prove it can write `in` but cannot create a file under `C:\HerdrTools`. Then confirm Ubuntu can write disposable files only below `in`, `out`, and `logs`, and that Windows can open them. The SMB account must not belong to Administrators or Remote Desktop Users.
+The boundary test runs a child process as `HerdrBridge` and must prove it can write `in`, cannot write directly under `C:\HerdrExchange`, cannot create a file under `C:\HerdrTools`, and that no other enabled inbound allow rule exposes TCP 445. Then confirm Ubuntu can write disposable files only below `in`, `out`, and `logs`, and that Windows can open them. The SMB account must belong only to the built-in Users group.
 
 Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
+
+Configure the Windows OneDrive client with `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, all marked Always keep on this device. GitHub remains authoritative for repositories. For a one-off workbook review, preserve the OneDrive Inbox original, hash it, copy it into `C:\HerdrExchange\in\<job-id>`, perform Excel/COM work on that staged copy, then copy the result and provenance manifest to OneDrive Outbox. Never automate directly inside OneDrive, mount OneDrive in Ubuntu, or place repositories, VM disks, credentials, logs, or databases in the synced tree.
 
 ## Phase H — Herdr, skills and plugins
 
@@ -153,5 +155,7 @@ Follow [VPS-ACCESS.md](VPS-ACCESS.md). Preserve hPanel recovery and the Surface 
 ~~~bash
 bash scripts/ubuntu/verify.sh
 ~~~
+
+The verification script prepends the managed `~/.local/bin` and `~/.cargo/bin` locations itself, so it is valid immediately after bootstrap. Start a new Ubuntu login shell before normal interactive work so the standard profile also carries the managed tool path.
 
 Also validate repository checks, Windows RDP, off-LAN SSH/Mosh, Herdr detach/reattach, cold-boot/no-login VM recovery, Comet/Fingerbot recovery, Excel COM, SMB permissions, VPS access and backup restoration once the deferred drive arrives.
