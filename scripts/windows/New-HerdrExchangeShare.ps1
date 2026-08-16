@@ -8,6 +8,7 @@ param(
     [string]$Path = 'C:\HerdrExchange',
     [string]$ToolsPath = 'C:\HerdrTools',
     [string]$ReviewJobsPath = 'C:\HerdrReviewJobs',
+    [string[]]$AcceptedFirewallRule = @(),
     [SecureString]$Password,
     [switch]$RotatePassword
 )
@@ -41,11 +42,62 @@ function Assert-DedicatedBridgeMembership([object]$User) {
     }
 }
 
+function Protect-HostOwnedTree([string]$TargetPath, [Security.Principal.SecurityIdentifier]$OperatorSid) {
+    New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
+    & icacls.exe $TargetPath /deny '*S-1-5-11:(OI)(CI)M' /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to place the fail-safe Authenticated Users deny ACE on '$TargetPath'."
+    }
+    $allowedSids = @('S-1-5-18', 'S-1-5-32-544', $OperatorSid.Value)
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $items = @((Get-Item -LiteralPath $TargetPath)) + @(Get-ChildItem -LiteralPath $TargetPath -Force -Recurse)
+    foreach ($item in $items) {
+        $acl = Get-Acl -LiteralPath $item.FullName
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($existingRule in @($acl.Access)) {
+            $acl.RemoveAccessRuleSpecific($existingRule)
+        }
+        $inheritance = if ($item.PSIsContainer) {
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        }
+        else {
+            [Security.AccessControl.InheritanceFlags]::None
+        }
+        foreach ($sidText in $allowedSids) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new($sidText),
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                $propagation,
+                $allow))
+        }
+        Set-Acl -LiteralPath $item.FullName -AclObject $acl
+    }
+    foreach ($item in $items) {
+        $acl = Get-Acl -LiteralPath $item.FullName
+        if (-not $acl.AreAccessRulesProtected) {
+            throw "Host-owned path '$($item.FullName)' still inherits access rules."
+        }
+        foreach ($accessRule in @($acl.Access)) {
+            try {
+                $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            }
+            catch {
+                throw "Could not resolve ACL identity '$($accessRule.IdentityReference)' on '$($item.FullName)'."
+            }
+            if ($sid -notin $allowedSids -or $accessRule.AccessControlType -ne $allow) {
+                throw "Unexpected ACL entry '$($accessRule.IdentityReference):$($accessRule.FileSystemRights)' on '$($item.FullName)'."
+            }
+        }
+    }
+}
+
 function Test-FirewallRuleExposesSmb([object]$FirewallRule) {
     $programs = @($FirewallRule | Get-NetFirewallApplicationFilter | ForEach-Object { [string]$_.Program })
     $services = @($FirewallRule | Get-NetFirewallServiceFilter | ForEach-Object { [string]$_.Service })
     foreach ($portFilter in @($FirewallRule | Get-NetFirewallPortFilter)) {
-        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services) {
+        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services -Owner @([string]$FirewallRule.Owner)) {
             return $true
         }
     }
@@ -70,13 +122,22 @@ function Get-ConflictingSmbFirewallRules([string]$ManagedRuleName) {
         if (Test-FirewallRuleExposesSmb -FirewallRule $firewallRule) {
             $program = @($firewallRule | Get-NetFirewallApplicationFilter | Select-Object -ExpandProperty Program) -join ','
             $service = @($firewallRule | Get-NetFirewallServiceFilter | Select-Object -ExpandProperty Service) -join ','
-            $remote = @($firewallRule | Get-NetFirewallAddressFilter | Select-Object -ExpandProperty RemoteAddress) -join ','
+            $addressFilters = @($firewallRule | Get-NetFirewallAddressFilter)
+            $localAddresses = @($addressFilters | Select-Object -ExpandProperty LocalAddress)
+            $remoteAddresses = @($addressFilters | Select-Object -ExpandProperty RemoteAddress)
+            if ((Test-HerdrFirewallAddressScopeIsTailnetOnly -Address $localAddresses) -or
+                (Test-HerdrFirewallAddressScopeIsTailnetOnly -Address $remoteAddresses)) {
+                Write-Host "Tailnet-confined inbound rule is compatible: '$($firewallRule.DisplayName)' (name=$($firewallRule.Name))."
+                continue
+            }
             [pscustomobject]@{
+                Name = [string]$firewallRule.Name
                 DisplayName = $firewallRule.DisplayName
                 Program = $program
                 Service = $service
                 Profile = [string]$firewallRule.Profile
-                RemoteAddress = $remote
+                LocalAddress = $localAddresses -join ','
+                RemoteAddress = $remoteAddresses -join ','
             }
         }
     }
@@ -105,12 +166,21 @@ if (Test-Path -LiteralPath (Join-Path $sharePath 'scripts')) {
 }
 
 $ruleName = 'Herdr Exchange SMB over Tailscale'
-$conflictingRules = @(Get-ConflictingSmbFirewallRules -ManagedRuleName $ruleName)
+$potentialConflicts = @(Get-ConflictingSmbFirewallRules -ManagedRuleName $ruleName)
+$acceptedNames = @($AcceptedFirewallRule | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+foreach ($acceptedName in $acceptedNames) {
+    if (@($potentialConflicts | Where-Object { $_.Name -ieq $acceptedName }).Count -eq 0) {
+        throw "Accepted firewall rule '$acceptedName' is not an active conflicting SMB exposure. No state was changed."
+    }
+    Write-Warning "Explicitly accepted firewall exposure '$acceptedName'. Record this reviewed exception in the commissioning log."
+}
+$conflictingRules = @($potentialConflicts | Where-Object { $_.Name -notin $acceptedNames })
 if ($conflictingRules.Count -gt 0) {
     $details = @($conflictingRules | ForEach-Object {
-        "'$($_.DisplayName)' (program=$($_.Program); service=$($_.Service); profile=$($_.Profile); remote=$($_.RemoteAddress))"
+        $escapedName = $_.Name.Replace("'", "''")
+        "'$($_.DisplayName)' (name=$($_.Name); program=$($_.Program); service=$($_.Service); profile=$($_.Profile); local=$($_.LocalAddress); remote=$($_.RemoteAddress)); remediate: Disable-NetFirewallRule -Name '$escapedName'"
     }) -join '; '
-    throw "Preflight found other active-profile inbound allow rules that expose TCP 445: $details. No account, ACL, share, or firewall state was changed."
+    throw "Preflight found other active-profile inbound allow rules that expose TCP 445: $details. Disable each rule after review, or document the exception and rerun with -AcceptedFirewallRule '<exact-name>'. No account, ACL, share, or firewall state was changed."
 }
 
 $account = Get-LocalUser -Name $LocalUser -ErrorAction SilentlyContinue
@@ -157,13 +227,14 @@ if ($usersSid.Value -notin $directGroupSids) {
 }
 Assert-DedicatedBridgeMembership -User $account
 
-foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved, $reviewJobsPathResolved)) {
+foreach ($directory in @($sharePath, "$sharePath\in", "$sharePath\out", "$sharePath\logs", $toolsPathResolved)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
 
 $identity = "$env:COMPUTERNAME\$LocalUser"
 $operatorIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+Protect-HostOwnedTree -TargetPath $reviewJobsPathResolved -OperatorSid $operatorSid
 $rootAcl = Get-Acl -LiteralPath $sharePath
 $rootAcl.SetAccessRuleProtection($true, $false)
 foreach ($existingRule in @($rootAcl.Access)) {
@@ -192,21 +263,6 @@ foreach ($writableDirectory in @("$sharePath\in", "$sharePath\out", "$sharePath\
 & icacls.exe $toolsPathResolved /inheritance:r `
     /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "$($operatorIdentity):(OI)(CI)F" /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Failed to protect host-owned tools directory '$toolsPathResolved'." }
-
-$reviewAcl = Get-Acl -LiteralPath $reviewJobsPathResolved
-$reviewAcl.SetAccessRuleProtection($true, $false)
-foreach ($existingRule in @($reviewAcl.Access)) {
-    $reviewAcl.RemoveAccessRuleSpecific($existingRule)
-}
-foreach ($principal in @(
-    [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
-    [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
-    $operatorSid
-)) {
-    $reviewAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
-        $principal, [Security.AccessControl.FileSystemRights]::FullControl, $inheritFlags, $propagation, $allow))
-}
-Set-Acl -LiteralPath $reviewJobsPathResolved -AclObject $reviewAcl
 
 $share = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
 if ($share -and -not ([IO.Path]::GetFullPath($share.Path).TrimEnd('\')).Equals($sharePath, [StringComparison]::OrdinalIgnoreCase)) {

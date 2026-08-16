@@ -110,9 +110,10 @@ Follow [REMOTE-ACCESS.md](REMOTE-ACCESS.md). Required gates:
 From elevated interactive Windows PowerShell:
 
 ~~~powershell
-pwsh -File .\scripts\windows\New-HerdrExchangeShare.ps1
-pwsh -File .\scripts\windows\Test-HerdrExchangeBoundary.ps1
-pwsh -File .\bootstrap.ps1 -Stage Excel
+$acceptedFirewallRules = @() # Populate only after reviewing and recording an exception reported by preflight.
+& .\scripts\windows\New-HerdrExchangeShare.ps1 -AcceptedFirewallRule $acceptedFirewallRules
+& .\scripts\windows\Test-HerdrExchangeBoundary.ps1 -AcceptedFirewallRule $acceptedFirewallRules
+& .\bootstrap.ps1 -Stage Excel
 ~~~
 
 The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only in a coordinated maintenance window: run the Windows script with `-RotatePassword` (it securely prompts for the new password), then immediately run the Ubuntu command below with that same password. The Ubuntu script unmounts any existing SMB session before replacing the credential, converges its managed `/etc/fstab` block, creates a fresh encrypted SMB session, and must pass the write test before the window ends.
@@ -121,7 +122,7 @@ The user supplies and stores a long, strong password for the fixed, dedicated no
 bash scripts/ubuntu/configure-excel-share.sh --host herdr-win --owner HERDR_UBUNTU_USER
 ~~~
 
-The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and includes explicit port 445/ranges plus unscoped TCP rules whose application and service filters can reach SMB. It also creates and protects host-owned `C:\HerdrReviewJobs`. The boundary test runs as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including `scripts`), cannot write `C:\HerdrTools` or `C:\HerdrReviewJobs`, and that no other applicable inbound allow rule exposes TCP 445.
+The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and covers explicit port 445/ranges plus unscoped TCP-capable rules, including `Protocol=Any`; owner-scoped AppContainer rules are excluded. Tailscale rules whose local or remote addresses are confined to `100.64.0.0/10` or `fd7a:115c:a1e0::/48` are compatible by scope. On stock Windows 11, Network Discovery for Teredo and WFD Driver-only rules may be reported. Review each exact rule name: disable an unnecessary rule with the printed `Disable-NetFirewallRule -Name '<name>'` command, or record the reason for retaining it and pass that exact name through `-AcceptedFirewallRule` to both commands above. Never accept a rule by display name or merely to make the gate pass. The script also creates and recursively protects host-owned `C:\HerdrReviewJobs`, then reads its DACL back. The boundary test runs as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including `scripts`), cannot write `C:\HerdrTools` or `C:\HerdrReviewJobs`, and that no unconfined, unaccepted inbound allow rule exposes TCP 445.
 
 Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
 

@@ -230,7 +230,7 @@ Add and validate the reviewed Windows staging helper before the round-trip commi
 ### Phase 4 — Excel bridge
 
 - [ ] Create the restricted Windows SMB share and store its password.
-- [ ] Run `Test-HerdrExchangeBoundary.ps1` and prove the bridge account can write only the exchange subdirectories, cannot modify the exchange root or `C:\HerdrTools`, and has no competing inbound TCP 445 allow rule.
+- [ ] Run `Test-HerdrExchangeBoundary.ps1` with the same recorded `-AcceptedFirewallRule` names used during share setup; prove the bridge account can write only the exchange subdirectories, cannot modify the exchange root, `C:\HerdrTools`, or `C:\HerdrReviewJobs`, and has no unconfined, unaccepted inbound TCP 445 exposure.
 - [ ] Mount and write-test it from Ubuntu.
 - [ ] Run the disposable Excel COM test.
 - [ ] Build and validate the narrow interactive Windows job runner.

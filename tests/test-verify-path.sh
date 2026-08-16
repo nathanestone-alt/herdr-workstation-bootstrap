@@ -13,7 +13,6 @@ cat > "$profile_dir/profile.sh" <<'EOF'
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 EOF
 printf '. "$HOME/.config/herdr-workstation/profile.sh"\n' > "$HOME/.profile"
-printf '. "$HOME/.profile"\n' > "$HOME/.bash_profile"
 
 checked_commands=(git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs)
 fixture_commands=("${checked_commands[@]}" systemctl)
@@ -30,7 +29,12 @@ cat > "$managed_bin/bash" <<'EOF'
 set -euo pipefail
 if [[ "${1:-}" == -lc ]]; then
   shift
-  . "$HOME/.bash_profile"
+  for startup_file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    if [[ -f "$startup_file" ]]; then
+      . "$startup_file"
+      break
+    fi
+  done
   exec /bin/bash --noprofile --norc -c "$1"
 fi
 exec /bin/bash "$@"
@@ -49,33 +53,47 @@ printf 'systemd\n'
 EOF
 chmod +x "$managed_bin/bash" "$managed_bin/uname" "$managed_bin/grep" "$managed_bin/ps"
 
-output="$test_root/verify-output.txt"
-set +e
-PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
-status=$?
-set -e
-if [[ "$status" -ne 0 ]]; then
-  cat "$output" >&2
-  echo "verify.sh exited non-zero in the production login-shell path (status=$status)." >&2
-  exit 1
-fi
-if grep -q '^FAIL command ' "$output"; then
-  cat "$output" >&2
-  echo 'verify.sh failed to discover a managed command from a fresh minimal PATH.' >&2
-  exit 1
-fi
-for command_name in "${checked_commands[@]}"; do
-  if ! grep -Eq "^PASS command[[:space:]]+${command_name}[[:space:]]+${managed_bin}/${command_name}$" "$output"; then
+run_verify_layout() {
+  local layout="$1"
+  local output="$test_root/verify-output-$layout.txt"
+  rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
+  case "$layout" in
+    profile) ;;
+    bash-profile) printf '. "$HOME/.profile"\n' > "$HOME/.bash_profile" ;;
+    bash-login) printf '. "$HOME/.profile"\n' > "$HOME/.bash_login" ;;
+    *) echo "Unknown fixture layout: $layout" >&2; exit 1 ;;
+  esac
+  set +e
+  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
     cat "$output" >&2
-    echo "Missing managed-PATH PASS evidence for $command_name." >&2
+    echo "verify.sh exited non-zero for login layout '$layout' (status=$status)." >&2
     exit 1
   fi
-done
-for command_name in rtk codex claude herdr; do
-  if ! grep -Eq "^PASS login command ${command_name}[[:space:]]+${managed_bin}/${command_name}$" "$output"; then
+  if grep -q '^FAIL command ' "$output"; then
     cat "$output" >&2
-    echo "Missing Bash-login PASS evidence for $command_name." >&2
+    echo "verify.sh failed to discover a managed command for login layout '$layout'." >&2
     exit 1
   fi
-done
+  for command_name in "${checked_commands[@]}"; do
+    if ! grep -Eq "^PASS command[[:space:]]+${command_name}[[:space:]]+${managed_bin}/${command_name}$" "$output"; then
+      cat "$output" >&2
+      echo "Missing managed-PATH PASS evidence for $command_name in layout '$layout'." >&2
+      exit 1
+    fi
+  done
+  for command_name in rtk codex claude herdr; do
+    if ! grep -Eq "^PASS login command ${command_name}[[:space:]]+${managed_bin}/${command_name}$" "$output"; then
+      cat "$output" >&2
+      echo "Missing Bash-login PASS evidence for $command_name in layout '$layout'." >&2
+      exit 1
+    fi
+  done
+}
+
+run_verify_layout profile
+run_verify_layout bash-profile
+run_verify_layout bash-login
 echo 'verify.sh managed-PATH regression test passed.'

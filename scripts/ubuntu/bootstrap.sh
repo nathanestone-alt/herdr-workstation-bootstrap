@@ -201,6 +201,9 @@ install_tools() {
   if [[ -e "$HOME/.bash_profile" ]]; then
     converge_profile_hook "$HOME/.bash_profile" true
   fi
+  if [[ -e "$HOME/.bash_login" ]]; then
+    converge_profile_hook "$HOME/.bash_login" true
+  fi
 
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
@@ -256,7 +259,7 @@ install_tools() {
   mkdir -p "$HOME/code"
   touch "$state_dir/tools-complete"
   echo "Tool installation complete. Resolved manifest: $manifest"
-  echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile chain, makes them available in new Bash login shells."
+  echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile or .bash_login chain, makes them available in new Bash login shells."
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 

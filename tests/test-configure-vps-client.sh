@@ -140,6 +140,44 @@ backup_count_after="$(find "$HOME/.ssh" -maxdepth 1 -type f -name 'config.*.bak'
   exit 1
 }
 
+safe_config="$test_root/config-before-tamper"
+cp "$HOME/.ssh/config" "$safe_config"
+sed -i '/# END herdr-bootstrap alpha-vps/i\  LocalForward 7777 127.0.0.1:22' "$HOME/.ssh/config"
+tampered_hash="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+tamper_output="$test_root/tamper-output.txt"
+if bash "$script" --alias beta-vps --host beta.example "${multi_common[@]}" >"$tamper_output" 2>&1; then
+  echo 'Expected a drifted carried managed block to fail.' >&2
+  exit 1
+fi
+grep -Fq "Managed block for 'alpha-vps'" "$tamper_output" || {
+  cat "$tamper_output" >&2
+  echo 'Managed-block drift failure did not name the carried alias.' >&2
+  exit 1
+}
+[[ "$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')" == "$tampered_hash" ]] || {
+  echo 'A failed carried-block validation modified the SSH client configuration.' >&2
+  exit 1
+}
+cp "$safe_config" "$HOME/.ssh/config"
+
+printf '\nHost *\n  DefinitelyNotAnSshOption yes\n' >> "$HOME/.ssh/config"
+invalid_hash="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+parse_output="$test_root/parse-output.txt"
+if bash "$script" --alias parser-vps --host parser.example "${multi_common[@]}" >"$parse_output" 2>&1; then
+  echo 'Expected an OpenSSH parser failure to be reported.' >&2
+  exit 1
+fi
+grep -Eq "OpenSSH could not resolve managed alias '[A-Za-z0-9._-]+'; the client configuration was not changed\." "$parse_output" || {
+  cat "$parse_output" >&2
+  echo 'OpenSSH parser failure did not provide the required diagnostic.' >&2
+  exit 1
+}
+[[ "$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')" == "$invalid_hash" ]] || {
+  echo 'A failed OpenSSH resolution modified the SSH client configuration.' >&2
+  exit 1
+}
+cp "$safe_config" "$HOME/.ssh/config"
+
 printf '\nHost *\n  SendEnv UNSAFE_TEST_VALUE\n' >> "$HOME/.ssh/config"
 if bash "$script" --alias sendenv-vps --host sendenv.example "${multi_common[@]}" >/dev/null 2>&1; then
   echo 'Expected an unmanaged accumulating SendEnv option to fail.' >&2

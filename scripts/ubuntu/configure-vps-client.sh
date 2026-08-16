@@ -51,8 +51,10 @@ desired_block="$(mktemp)"
 current_block="$(mktemp)"
 replacement="$(mktemp)"
 unmanaged_config="$(mktemp)"
+validation_config="$(mktemp)"
+ssh_error="$(mktemp)"
 managed_blocks_dir="$(mktemp -d)"
-trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement" "$unmanaged_config"; rm -rf "$managed_blocks_dir"' EXIT
+trap 'rm -f "$scan_file" "$desired_block" "$current_block" "$replacement" "$unmanaged_config" "$validation_config" "$ssh_error"; rm -rf "$managed_blocks_dir"' EXIT
 ssh-keyscan -T 10 -p "$port" -t ed25519 "$host_name" > "$scan_file" 2>/dev/null || {
   echo "Could not retrieve the ED25519 host key from $host_name:$port." >&2; exit 25;
 }
@@ -175,6 +177,48 @@ while IFS= read -r config_line || [[ -n "$config_line" ]]; do
 done < "$unmanaged_config"
 
 mapfile -t managed_block_files < <(find "$managed_blocks_dir" -maxdepth 1 -type f -name '*.block' -print | LC_ALL=C sort)
+validate_managed_block_shape() {
+  local block_file="$1"
+  local block_alias="$2"
+  local block_line=""
+  local -a required_patterns=(
+    "HostName " "User " "Port " "IdentityFile " "IdentitiesOnly yes" "StrictHostKeyChecking yes"
+    "UserKnownHostsFile ~/.ssh/known_hosts" "GlobalKnownHostsFile none" "UpdateHostKeys no"
+    "ProxyCommand none" "ProxyJump none" "CanonicalizeHostname no" "PermitLocalCommand no"
+    "RemoteCommand none" "KnownHostsCommand none" "ClearAllForwardings yes"
+    "ServerAliveInterval 30" "ServerAliveCountMax 3"
+  )
+  [[ "$(head -n 1 "$block_file")" == "# BEGIN herdr-bootstrap $block_alias" &&
+      "$(tail -n 1 "$block_file")" == "# END herdr-bootstrap $block_alias" &&
+      "$(sed -n '2p' "$block_file")" == "Host $block_alias" &&
+      "$(tail -n 2 "$block_file" | head -n 1)" == 'Host *' ]] || {
+    echo "Managed block for '$block_alias' does not match the required marker/Host template; the client configuration was not changed." >&2
+    exit 26
+  }
+  while IFS= read -r block_line || [[ -n "$block_line" ]]; do
+    case "$block_line" in
+      "# BEGIN herdr-bootstrap $block_alias"|"# END herdr-bootstrap $block_alias"|"Host $block_alias"|'Host *') ;;
+      '  HostName '*|'  User '*|'  Port '*|'  IdentityFile '*|'  IdentitiesOnly yes'|'  StrictHostKeyChecking yes'|'  UserKnownHostsFile ~/.ssh/known_hosts'|'  GlobalKnownHostsFile none'|'  UpdateHostKeys no'|'  ProxyCommand none'|'  ProxyJump none'|'  CanonicalizeHostname no'|'  PermitLocalCommand no'|'  RemoteCommand none'|'  KnownHostsCommand none'|'  ClearAllForwardings yes'|'  ServerAliveInterval 30'|'  ServerAliveCountMax 3') ;;
+      *) echo "Managed block for '$block_alias' contains unexpected content '$block_line'; the client configuration was not changed." >&2; exit 26 ;;
+    esac
+  done < "$block_file"
+  for required_pattern in "${required_patterns[@]}"; do
+    if [[ "$required_pattern" == *' ' ]]; then
+      required_regex="${required_pattern% }"
+      required_count="$(grep -Ec "^[[:space:]]+${required_regex//./\\.}[[:space:]]+[^[:space:]].*$" "$block_file")"
+    else
+      required_count="$(grep -Ec "^[[:space:]]+${required_pattern//./\\.}$" "$block_file")"
+    fi
+    [[ "$required_count" == 1 ]] || {
+      echo "Managed block for '$block_alias' must contain exactly one '$required_pattern' directive; the client configuration was not changed." >&2
+      exit 26
+    }
+  done
+}
+for managed_block_file in "${managed_block_files[@]}"; do
+  managed_block_alias="$(basename "$managed_block_file" .block)"
+  validate_managed_block_shape "$managed_block_file" "$managed_block_alias"
+done
 : > "$replacement"
 for block_index in "${!managed_block_files[@]}"; do
   (( block_index == 0 )) || printf '\n' >> "$replacement"
@@ -185,33 +229,69 @@ if [[ -s "$unmanaged_config" ]]; then
   cat "$unmanaged_config" >> "$replacement"
 fi
 
-effective_config="$(ssh -G -F "$replacement" "$alias_name" 2>/dev/null)"
-effective_value() { awk -v key="$1" '$1 == key { $1=""; sub(/^ /, ""); print; exit }' <<< "$effective_config"; }
-[[ "$(effective_value hostname)" == "$host_name" ]] || { echo 'Effective SSH HostName does not match the verified target.' >&2; exit 26; }
-[[ "$(effective_value user)" == "$user_name" ]] || { echo 'Effective SSH User does not match the requested account.' >&2; exit 26; }
-[[ "$(effective_value port)" == "$port" ]] || { echo 'Effective SSH Port does not match the requested port.' >&2; exit 26; }
-mapfile -t effective_identity_files < <(awk '$1 == "identityfile" { $1=""; sub(/^ /, ""); print }' <<< "$effective_config")
-(( ${#effective_identity_files[@]} == 1 )) && [[ "${effective_identity_files[0]}" == "$key_path" ]] || {
-  echo 'Effective SSH configuration must contain exactly the one managed IdentityFile.' >&2
-  exit 26
-}
-[[ "$(effective_value identitiesonly)" == yes ]] || { echo 'Effective SSH IdentitiesOnly is not yes.' >&2; exit 26; }
-[[ "$(effective_value clearallforwardings)" == yes ]] || { echo 'Effective SSH ClearAllForwardings is not yes.' >&2; exit 26; }
-effective_strict="$(effective_value stricthostkeychecking)"
-[[ "$effective_strict" == yes || "$effective_strict" == true ]] || { echo 'Effective SSH StrictHostKeyChecking is not enabled.' >&2; exit 26; }
-for unsafe_option in proxycommand proxyjump hostkeyalias; do
-  unsafe_value="$(effective_value "$unsafe_option")"
-  [[ -z "$unsafe_value" || "$unsafe_value" == none ]] || {
-    echo "Effective SSH $unsafe_option is '$unsafe_value'; refusing unmanaged redirection." >&2
-    exit 26
-  }
-done
-for accumulating_option in certificatefile localforward remoteforward dynamicforward sendenv setenv; do
-  accumulating_values="$(awk -v key="$accumulating_option" '$1 == key { print }' <<< "$effective_config")"
-  if [[ -n "$accumulating_values" && "$accumulating_values" != "$accumulating_option none" ]]; then
-    echo "Effective SSH $accumulating_option contains unmanaged accumulating values; refusing the alias." >&2
+cp "$replacement" "$validation_config"
+if [[ -r /etc/ssh/ssh_config ]]; then
+  printf '\nHost *\nMatch all\nInclude /etc/ssh/ssh_config\n' >> "$validation_config"
+fi
+
+validate_effective_alias() {
+  local checked_alias="$1"
+  local block_file="$2"
+  local expected_host expected_user expected_port expected_key effective_config effective_strict
+  local unsafe_option unsafe_value accumulating_option accumulating_values sendenv_line sendenv_value
+  local -a effective_identity_files
+  expected_host="$(awk '$1 == "HostName" { print $2; exit }' "$block_file")"
+  expected_user="$(awk '$1 == "User" { print $2; exit }' "$block_file")"
+  expected_port="$(awk '$1 == "Port" { print $2; exit }' "$block_file")"
+  expected_key="$(awk '$1 == "IdentityFile" { $1=""; sub(/^[[:space:]]+/, ""); print; exit }' "$block_file")"
+  : > "$ssh_error"
+  if ! effective_config="$(ssh -G -F "$validation_config" "$checked_alias" 2>"$ssh_error")"; then
+    echo "OpenSSH could not resolve managed alias '$checked_alias'; the client configuration was not changed." >&2
+    sed 's/^/ssh: /' "$ssh_error" >&2
     exit 26
   fi
+  effective_value() { awk -v key="$1" '$1 == key { $1=""; sub(/^ /, ""); print; exit }' <<< "$effective_config"; }
+  [[ "$(effective_value hostname)" == "$expected_host" ]] || { echo "Effective SSH HostName for '$checked_alias' does not match its managed block." >&2; exit 26; }
+  [[ "$(effective_value user)" == "$expected_user" ]] || { echo "Effective SSH User for '$checked_alias' does not match its managed block." >&2; exit 26; }
+  [[ "$(effective_value port)" == "$expected_port" ]] || { echo "Effective SSH Port for '$checked_alias' does not match its managed block." >&2; exit 26; }
+  mapfile -t effective_identity_files < <(awk '$1 == "identityfile" { $1=""; sub(/^ /, ""); print }' <<< "$effective_config")
+  (( ${#effective_identity_files[@]} == 1 )) && [[ "${effective_identity_files[0]}" == "$expected_key" ]] || {
+    echo "Effective SSH configuration for '$checked_alias' must contain exactly its one managed IdentityFile." >&2
+    exit 26
+  }
+  [[ "$(effective_value identitiesonly)" == yes ]] || { echo "Effective SSH IdentitiesOnly for '$checked_alias' is not yes." >&2; exit 26; }
+  [[ "$(effective_value clearallforwardings)" == yes ]] || { echo "Effective SSH ClearAllForwardings for '$checked_alias' is not yes." >&2; exit 26; }
+  effective_strict="$(effective_value stricthostkeychecking)"
+  [[ "$effective_strict" == yes || "$effective_strict" == true ]] || { echo "Effective SSH StrictHostKeyChecking for '$checked_alias' is not enabled." >&2; exit 26; }
+  for unsafe_option in proxycommand proxyjump hostkeyalias; do
+    unsafe_value="$(effective_value "$unsafe_option")"
+    [[ -z "$unsafe_value" || "$unsafe_value" == none ]] || {
+      echo "Effective SSH $unsafe_option for '$checked_alias' is '$unsafe_value'; refusing unmanaged redirection." >&2
+      exit 26
+    }
+  done
+  for accumulating_option in certificatefile localforward remoteforward dynamicforward setenv; do
+    accumulating_values="$(awk -v key="$accumulating_option" '$1 == key { print }' <<< "$effective_config")"
+    if [[ -n "$accumulating_values" && "$accumulating_values" != "$accumulating_option none" ]]; then
+      echo "Effective SSH $accumulating_option for '$checked_alias' contains unmanaged accumulating values; refusing the alias." >&2
+      exit 26
+    fi
+  done
+  while IFS= read -r sendenv_line; do
+    [[ -z "$sendenv_line" || "$sendenv_line" == 'sendenv none' ]] && continue
+    read -r -a sendenv_values <<< "${sendenv_line#sendenv }"
+    for sendenv_value in "${sendenv_values[@]}"; do
+      [[ "$sendenv_value" == 'LANG' || "$sendenv_value" == 'LC_*' ]] || {
+        echo "Effective SSH SendEnv for '$checked_alias' contains nonstandard value '$sendenv_value'; refusing the alias." >&2
+        exit 26
+      }
+    done
+  done < <(awk '$1 == "sendenv" { print }' <<< "$effective_config")
+}
+
+for managed_block_file in "${managed_block_files[@]}"; do
+  managed_block_alias="$(basename "$managed_block_file" .block)"
+  validate_effective_alias "$managed_block_alias" "$managed_block_file"
 done
 
 if ! cmp -s "$config" "$replacement"; then

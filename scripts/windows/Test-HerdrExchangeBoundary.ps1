@@ -6,6 +6,7 @@ param(
     [string]$SharePath = 'C:\HerdrExchange',
     [string]$ToolsPath = 'C:\HerdrTools',
     [string]$ReviewJobsPath = 'C:\HerdrReviewJobs',
+    [string[]]$AcceptedFirewallRule = @(),
     [SecureString]$Password
 )
 
@@ -125,7 +126,7 @@ function Test-RuleExposesSmb([object]$FirewallRule) {
     $programs = @($FirewallRule | Get-NetFirewallApplicationFilter | ForEach-Object { [string]$_.Program })
     $services = @($FirewallRule | Get-NetFirewallServiceFilter | ForEach-Object { [string]$_.Service })
     foreach ($portFilter in @($FirewallRule | Get-NetFirewallPortFilter)) {
-        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services) {
+        if (Test-HerdrFirewallFilterExposesSmb -Protocol $portFilter.Protocol -LocalPort @($portFilter.LocalPort) -Program $programs -Service $services -Owner @([string]$FirewallRule.Owner)) {
             return $true
         }
     }
@@ -141,20 +142,38 @@ $conflictingRules = foreach ($firewallRule in @(Get-NetFirewallRule -Enabled Tru
     if (Test-RuleExposesSmb -FirewallRule $firewallRule) {
         $program = @($firewallRule | Get-NetFirewallApplicationFilter | Select-Object -ExpandProperty Program) -join ','
         $service = @($firewallRule | Get-NetFirewallServiceFilter | Select-Object -ExpandProperty Service) -join ','
-        $remote = @($firewallRule | Get-NetFirewallAddressFilter | Select-Object -ExpandProperty RemoteAddress) -join ','
+        $addressFilters = @($firewallRule | Get-NetFirewallAddressFilter)
+        $localAddresses = @($addressFilters | Select-Object -ExpandProperty LocalAddress)
+        $remoteAddresses = @($addressFilters | Select-Object -ExpandProperty RemoteAddress)
+        if ((Test-HerdrFirewallAddressScopeIsTailnetOnly -Address $localAddresses) -or
+            (Test-HerdrFirewallAddressScopeIsTailnetOnly -Address $remoteAddresses)) {
+            Write-Host "Tailnet-confined inbound rule is compatible: '$($firewallRule.DisplayName)' (name=$($firewallRule.Name))."
+            continue
+        }
         [pscustomobject]@{
+            Name = [string]$firewallRule.Name
             DisplayName = $firewallRule.DisplayName
             Program = $program
             Service = $service
             Profile = [string]$firewallRule.Profile
-            RemoteAddress = $remote
+            LocalAddress = $localAddresses -join ','
+            RemoteAddress = $remoteAddresses -join ','
         }
     }
 }
-if (@($conflictingRules).Count -gt 0) {
-    $details = @($conflictingRules | ForEach-Object {
-        "'$($_.DisplayName)' (program=$($_.Program); service=$($_.Service); profile=$($_.Profile); remote=$($_.RemoteAddress))"
-    }) -join '; '
-    throw "Boundary failure: other enabled inbound allow rules expose TCP 445: $details."
+$acceptedNames = @($AcceptedFirewallRule | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+foreach ($acceptedName in $acceptedNames) {
+    if (@($conflictingRules | Where-Object { $_.Name -ieq $acceptedName }).Count -eq 0) {
+        throw "Boundary failure: accepted firewall rule '$acceptedName' is not an active conflicting SMB exposure."
+    }
+    Write-Warning "Boundary test explicitly accepted firewall exposure '$acceptedName'; confirm it is recorded in the commissioning log."
 }
-Write-Host 'Boundary test passed: no other enabled inbound allow rule exposes TCP 445.'
+$unacceptedConflicts = @($conflictingRules | Where-Object { $_.Name -notin $acceptedNames })
+if ($unacceptedConflicts.Count -gt 0) {
+    $details = @($unacceptedConflicts | ForEach-Object {
+        $escapedName = $_.Name.Replace("'", "''")
+        "'$($_.DisplayName)' (name=$($_.Name); program=$($_.Program); service=$($_.Service); profile=$($_.Profile); local=$($_.LocalAddress); remote=$($_.RemoteAddress)); remediate: Disable-NetFirewallRule -Name '$escapedName'"
+    }) -join '; '
+    throw "Boundary failure: other enabled inbound allow rules expose TCP 445: $details. Disable each after review, or document the exception and rerun with -AcceptedFirewallRule '<exact-name>'."
+}
+Write-Host 'Boundary test passed: no unscoped, unaccepted inbound allow rule exposes TCP 445.'
