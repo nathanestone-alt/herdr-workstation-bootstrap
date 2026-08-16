@@ -28,6 +28,7 @@ Once an agent is running in this repository, give it this exact instruction:
 - [Manual runway](MANUAL-START.md)
 - [Agent runbook](AGENT-HANDOFF.md)
 - [Remote access](REMOTE-ACCESS.md)
+- [Hostinger VPS management](VPS-ACCESS.md)
 - [Full dependency plan](HERDR_WORKSTATION_DEPENDENCY_SETUP_PLAN.md)
 - [Architecture and purchase record](HERDR_WINDOWS_WORKSTATION_ARCHITECTURE.md)
 

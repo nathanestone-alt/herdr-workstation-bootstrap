@@ -17,6 +17,7 @@ On the current Surface:
 3. Save recovery codes for accounts using two-factor authentication.
 4. Do not retire or erase the Surface. It remains the known-good reference until the MS-A2 passes every validation gate.
 5. Have the Windows 11 Pro USB/product key available, but first check whether the MS-A2 already has an activated Windows Pro license.
+6. Confirm the Surface can still access the Hostinger VPS and that Hostinger hPanel recovery is available.
 
 The custom-skill export is intentionally not automatic. After the repository exists, an agent on the Surface can run:
 
@@ -125,6 +126,7 @@ Remain available for these interactive steps:
 7. Logging back into Windows after a reboot so Excel COM and the WSL startup task can run.
 8. Installing and signing into Tailscale on the laptop and phone.
 9. Creating a separate SSH key in the laptop and phone clients.
+10. Authenticating the Hostinger VPS to Tailscale and approving its new workstation public key.
 
 ## Manual runway completion gate
 

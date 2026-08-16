@@ -130,3 +130,4 @@ Use the current Tailscale policy editor and tests rather than copying a stale po
 
 Record the exact MagicDNS names and working usernames in the uncommitted commissioning log.
 
+The Hostinger VPS is a separate endpoint named 'hostinger-vps'; follow [VPS-ACCESS.md](VPS-ACCESS.md) before changing its SSH or firewall configuration.

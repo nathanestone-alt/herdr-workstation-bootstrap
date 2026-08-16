@@ -22,7 +22,7 @@ install_base() {
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential ca-certificates curl git git-lfs gh gnupg jq mosh \
-    openssh-client openssh-server pkg-config ripgrep unzip zip
+    openssh-client openssh-server pkg-config ripgrep rsync unzip zip
   git lfs install
 
   if ! grep -Eq '^systemd=true$' /etc/wsl.conf 2>/dev/null; then

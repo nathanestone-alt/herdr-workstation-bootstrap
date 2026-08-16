@@ -9,6 +9,7 @@ logs/
 *.tmp
 .bootstrap-state/
 LOCAL-COMMISSIONING-LOG.md
+LOCAL-VPS-INVENTORY.md
 
 # Credentials must never be committed
 *.key
@@ -24,4 +25,3 @@ id_rsa
 Thumbs.db
 .vscode/
 .idea/
-

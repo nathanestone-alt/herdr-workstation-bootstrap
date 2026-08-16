@@ -109,6 +109,10 @@ herdr integration install codex
 6. Copy custom skills only from a reviewed payload.
 7. Validate all Herdr command-sensitive skills against the installed Herdr version.
 
+## Phase G1 — Hostinger VPS
+
+Follow [VPS-ACCESS.md](VPS-ACCESS.md). Inventory without secrets, confirm hPanel recovery, create a fresh Hostinger snapshot, generate a dedicated MS-A2 key, and add only its public half. Test public SSH before installing Tailscale on the VPS. Test Tailscale before changing root/password/public-firewall access. Keep the Surface key and a working session until all acceptance tests pass.
+
 ## Phase H — Excel automation
 
 From the interactive Windows PowerShell session:
@@ -135,4 +139,3 @@ bash scripts/ubuntu/verify.sh
 ~~~
 
 Also validate Windows RDP, Ubuntu SSH/Mosh from another network, Herdr detach/reattach, reboot/login/service recovery, Comet KVM, Fingerbot, Excel COM, and backup after the deferred drive arrives.
-

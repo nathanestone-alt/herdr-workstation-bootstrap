@@ -18,6 +18,7 @@ The executable sequence is split across:
 - `MANUAL-START.md` — everything the user must do before an agent can safely take over.
 - `AGENT-HANDOFF.md` — the phase-by-phase agent runbook.
 - `REMOTE-ACCESS.md` — Tailscale, OpenSSH, phone/laptop keys, Mosh, and off-LAN tests.
+- `VPS-ACCESS.md` — safe onboarding and management of the existing Hostinger VPS.
 - `bootstrap.ps1` and `scripts/ubuntu/bootstrap.sh` — deterministic installation entry points.
 
 ## Key migration rule
@@ -109,6 +110,7 @@ openssh-server
 mosh
 pkg-config
 ripgrep
+rsync
 unzip
 zip
 ~~~
@@ -314,6 +316,27 @@ Mosh starts through SSH and then uses encrypted UDP. It improves interactive roa
 - [ ] Keep Excel workbook handoffs in `C:\HerdrExchange`; do not put the live workbook solely inside WSL.
 - [ ] Create missing dependency manifests, especially the Windows Excel requirements file.
 - [ ] Run repository tests separately for Linux-only work and Windows COM work.
+
+### Phase 5A — Hostinger VPS management
+
+- [ ] Confirm the Surface still has working VPS access.
+- [ ] Confirm Hostinger hPanel access and identify console/Emergency Mode recovery.
+- [ ] Record a secret-free local VPS inventory in the ignored `LOCAL-VPS-INVENTORY.md`.
+- [ ] Confirm current Hostinger backups and create a fresh manual snapshot before access/firewall changes.
+- [ ] Generate a passphrase-protected, MS-A2-specific Ed25519 key inside Ubuntu.
+- [ ] Add only the public key through hPanel or the existing trusted session.
+- [ ] Test a second public-IP SSH session using the new key.
+- [ ] Install Tailscale on the VPS and enroll it as `hostinger-vps`.
+- [ ] Test `tailscale ping` and ordinary OpenSSH over the Tailscale MagicDNS name.
+- [ ] Verify the administrative user can run `sudo`.
+- [ ] Harden root/password login only after a second key-authenticated session succeeds.
+- [ ] Run `sshd -t` before reloading SSH and keep the working session open.
+- [ ] Restrict Tailscale policy to intended administration devices/identities.
+- [ ] Decide whether public SSH remains a restricted fallback or is closed.
+- [ ] Keep the Surface key until the MS-A2 path has been stable and recovery is proven.
+- [ ] Validate hosted services externally after every material change.
+
+The Hostinger VPS remains independently recoverable through hPanel; it must not depend on the home workstation for boot, routing, credentials, or backups.
 
 ### Phase 6 — Persistence and recovery validation
 
