@@ -80,12 +80,13 @@ converge_profile_hook() {
   {
     printf '%s\n' "$marker"
     if [[ "$chain_profile" == true ]]; then
-      printf '%s\n' 'if [[ "${HERDR_PROFILE_CHAIN_ACTIVE:-0}" != 1 ]]; then'
+      printf '%s\n' 'if [[ "${HERDR_PROFILE_SOURCED_PID:-}" != "$$" && "${HERDR_PROFILE_CHAIN_ACTIVE:-0}" != 1 ]]; then'
       printf '%s\n' '  export HERDR_PROFILE_CHAIN_ACTIVE=1'
       printf '%s\n' '  [[ -f "$HOME/.profile" ]] && . "$HOME/.profile"'
       printf '%s\n' '  unset HERDR_PROFILE_CHAIN_ACTIVE'
       printf '%s\n' 'fi'
     else
+      printf '%s\n' 'export HERDR_PROFILE_SOURCED_PID="$$"'
       printf '. "$HOME/.config/herdr-workstation/profile.sh"\n'
     fi
     printf '%s\n' "$end_marker"

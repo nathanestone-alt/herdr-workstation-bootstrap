@@ -178,6 +178,24 @@ grep -Eq "OpenSSH could not resolve managed alias '[A-Za-z0-9._-]+'; the client 
 }
 cp "$safe_config" "$HOME/.ssh/config"
 
+system_config="$test_root/system-ssh-config"
+printf 'Host *\n  IdentityFile %s\n  SetEnv SYSTEM_UNSAFE=1\n' "$HOME/.ssh/system-attacker-key" > "$system_config"
+system_hash="$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')"
+system_output="$test_root/system-output.txt"
+if HERDR_SYSTEM_SSH_CONFIG="$system_config" bash "$script" --alias system-vps --host system.example "${multi_common[@]}" >"$system_output" 2>&1; then
+  echo 'Expected a system-config-only identity/SetEnv value to fail.' >&2
+  exit 1
+fi
+grep -Eq "Effective SSH (configuration for '[A-Za-z0-9._-]+' must contain exactly its one managed IdentityFile|setenv for '[A-Za-z0-9._-]+' contains unmanaged accumulating values)" "$system_output" || {
+  cat "$system_output" >&2
+  echo 'System SSH configuration was not included in effective-alias validation.' >&2
+  exit 1
+}
+[[ "$(sha256sum "$HOME/.ssh/config" | awk '{print $1}')" == "$system_hash" ]] || {
+  echo 'A failed system SSH configuration validation modified the user config.' >&2
+  exit 1
+}
+
 printf '\nHost *\n  SendEnv UNSAFE_TEST_VALUE\n' >> "$HOME/.ssh/config"
 if bash "$script" --alias sendenv-vps --host sendenv.example "${multi_common[@]}" >/dev/null 2>&1; then
   echo 'Expected an unmanaged accumulating SendEnv option to fail.' >&2

@@ -8,6 +8,7 @@ port="22"
 key_path="$HOME/.ssh/hostinger_vps_ed25519"
 existing_key=""
 host_key_fingerprint=""
+system_ssh_config="${HERDR_SYSTEM_SSH_CONFIG:-/etc/ssh/ssh_config}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +33,11 @@ fi
 [[ "$host_key_fingerprint" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || {
   echo 'Host-key fingerprint must be an independently verified SHA256: value.' >&2; exit 2;
 }
+[[ "$system_ssh_config" == /* ]] || { echo 'System SSH configuration path must be absolute.' >&2; exit 2; }
+if [[ -n "${HERDR_SYSTEM_SSH_CONFIG:-}" && ! -r "$system_ssh_config" ]]; then
+  echo "Requested system SSH configuration '$system_ssh_config' is not readable." >&2
+  exit 2
+fi
 if [[ -n "$existing_key" ]]; then
   key_path="${existing_key/#\~/$HOME}"
 fi
@@ -230,8 +236,8 @@ if [[ -s "$unmanaged_config" ]]; then
 fi
 
 cp "$replacement" "$validation_config"
-if [[ -r /etc/ssh/ssh_config ]]; then
-  printf '\nHost *\nMatch all\nInclude /etc/ssh/ssh_config\n' >> "$validation_config"
+if [[ -r "$system_ssh_config" ]]; then
+  printf '\nHost *\nMatch all\nInclude "%s"\n' "$system_ssh_config" >> "$validation_config"
 fi
 
 validate_effective_alias() {

@@ -15,6 +15,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'HerdrFirewallPolicy.ps1')
+. (Join-Path $PSScriptRoot 'HerdrHostOwnedAclPolicy.ps1')
 $requiredUser = 'HerdrBridge'
 function Assert-DedicatedBridgeMembership([object]$User) {
     $ordinaryUsersSid = 'S-1-5-32-545'
@@ -39,57 +40,6 @@ function Assert-DedicatedBridgeMembership([object]$User) {
     }
     if (-not $isOrdinaryUser) {
         throw "Bridge account '$($User.Name)' is not a member of the built-in Users group."
-    }
-}
-
-function Protect-HostOwnedTree([string]$TargetPath, [Security.Principal.SecurityIdentifier]$OperatorSid) {
-    New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
-    & icacls.exe $TargetPath /deny '*S-1-5-11:(OI)(CI)M' /T /C | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to place the fail-safe Authenticated Users deny ACE on '$TargetPath'."
-    }
-    $allowedSids = @('S-1-5-18', 'S-1-5-32-544', $OperatorSid.Value)
-    $allow = [Security.AccessControl.AccessControlType]::Allow
-    $propagation = [Security.AccessControl.PropagationFlags]::None
-    $items = @((Get-Item -LiteralPath $TargetPath)) + @(Get-ChildItem -LiteralPath $TargetPath -Force -Recurse)
-    foreach ($item in $items) {
-        $acl = Get-Acl -LiteralPath $item.FullName
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($existingRule in @($acl.Access)) {
-            $acl.RemoveAccessRuleSpecific($existingRule)
-        }
-        $inheritance = if ($item.PSIsContainer) {
-            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        }
-        else {
-            [Security.AccessControl.InheritanceFlags]::None
-        }
-        foreach ($sidText in $allowedSids) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
-                [Security.Principal.SecurityIdentifier]::new($sidText),
-                [Security.AccessControl.FileSystemRights]::FullControl,
-                $inheritance,
-                $propagation,
-                $allow))
-        }
-        Set-Acl -LiteralPath $item.FullName -AclObject $acl
-    }
-    foreach ($item in $items) {
-        $acl = Get-Acl -LiteralPath $item.FullName
-        if (-not $acl.AreAccessRulesProtected) {
-            throw "Host-owned path '$($item.FullName)' still inherits access rules."
-        }
-        foreach ($accessRule in @($acl.Access)) {
-            try {
-                $sid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-            }
-            catch {
-                throw "Could not resolve ACL identity '$($accessRule.IdentityReference)' on '$($item.FullName)'."
-            }
-            if ($sid -notin $allowedSids -or $accessRule.AccessControlType -ne $allow) {
-                throw "Unexpected ACL entry '$($accessRule.IdentityReference):$($accessRule.FileSystemRights)' on '$($item.FullName)'."
-            }
-        }
     }
 }
 

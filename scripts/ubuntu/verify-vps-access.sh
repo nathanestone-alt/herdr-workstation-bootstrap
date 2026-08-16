@@ -2,7 +2,15 @@
 set -euo pipefail
 
 alias_name="${1:-hostinger-vps}"
-identity_file="$(ssh -G "$alias_name" 2>/dev/null | awk '$1 == "identityfile" { print $2; exit }')"
+ssh_error="$(mktemp)"
+trap 'rm -f "$ssh_error"' EXIT
+if ! effective_config="$(ssh -G "$alias_name" 2>"$ssh_error")"; then
+  echo "OpenSSH could not resolve alias '$alias_name'; VPS access was not attempted." >&2
+  sed 's/^/ssh: /' "$ssh_error" >&2
+  exit 20
+fi
+identity_file="$(awk '$1 == "identityfile" { $1=""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective_config")"
+[[ -n "$identity_file" ]] || { echo "Alias '$alias_name' has no effective IdentityFile; rerun configure-vps-client.sh." >&2; exit 20; }
 identity_file="${identity_file/#\~/$HOME}"
 if [[ -z "${SSH_AUTH_SOCK:-}" ]] || ! ssh-add -l >/dev/null 2>&1; then
   echo "No usable ssh-agent identity is loaded. Run: eval \"\$(ssh-agent -s)\"; ssh-add '$identity_file'" >&2
