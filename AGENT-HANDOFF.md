@@ -122,6 +122,8 @@ $acceptedFirewallRules = @() # Populate only after reviewing and recording an ex
 
 The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only in a coordinated maintenance window: run the Windows script with `-RotatePassword` (it securely prompts for the new password), then immediately run the Ubuntu command below with that same password. The Ubuntu script unmounts any existing SMB session before replacing the credential, converges its managed `/etc/fstab` block, creates a fresh encrypted SMB session, and must pass the write test before the window ends.
 
+The share script rejects drive roots, Windows system trees, reparse points, and any existing directory that is neither the already-marked path of the matching `HerdrExchange` SMB share nor explicitly approved. If a reviewed first-run or interrupted setup must adopt an existing ordinary directory, inspect the path and its contents, record that decision, and pass `-AllowExistingSharePath` once. The switch never overrides protected-system-path checks.
+
 ~~~bash
 bash scripts/ubuntu/configure-excel-share.sh --host herdr-win --owner HERDR_UBUNTU_USER
 ~~~

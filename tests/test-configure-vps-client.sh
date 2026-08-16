@@ -251,4 +251,29 @@ if bash "$script" --alias accumulating-vps --host accumulating.example "${multi_
   exit 1
 fi
 
+cp "$safe_config" "$HOME/.ssh/config"
+cat >> "$HOME/.ssh/config" <<'EOF'
+
+Host *
+  ForwardAgent yes
+  ForwardX11 yes
+  ForwardX11Trusted yes
+  ControlMaster auto
+  ControlPath /tmp/herdr-cm-%r@%h:%p
+EOF
+bash "$script" --alias isolation-vps --host isolation.example "${multi_common[@]}" >/dev/null
+effective_isolation="$(ssh -G -F "$HOME/.ssh/config" isolation-vps 2>/dev/null)"
+for disabled_setting in forwardagent forwardx11 forwardx11trusted controlmaster; do
+  disabled_value="$(awk -v key="$disabled_setting" '$1 == key { print $2; exit }' <<< "$effective_isolation")"
+  [[ "$disabled_value" == no || "$disabled_value" == false ]] || {
+    echo "Managed alias did not disable inherited SSH setting '$disabled_setting' (effective value '$disabled_value')." >&2
+    exit 1
+  }
+done
+control_path_value="$(awk '$1 == "controlpath" { print $2; exit }' <<< "$effective_isolation")"
+[[ -z "$control_path_value" || "$control_path_value" == none ]] || {
+  echo "Managed alias did not disable inherited ControlPath (effective value '$control_path_value')." >&2
+  exit 1
+}
+
 echo 'configure-vps-client convergence tests passed.'

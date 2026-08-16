@@ -121,6 +121,11 @@ end_marker="# END herdr-bootstrap $alias_name"
   printf '  RemoteCommand none\n'
   printf '  KnownHostsCommand none\n'
   printf '  ClearAllForwardings yes\n'
+  printf '  ForwardAgent no\n'
+  printf '  ForwardX11 no\n'
+  printf '  ForwardX11Trusted no\n'
+  printf '  ControlMaster no\n'
+  printf '  ControlPath none\n'
   printf '  ServerAliveInterval 30\n'
   printf '  ServerAliveCountMax 3\n'
   printf 'Host *\n'
@@ -198,6 +203,7 @@ validate_managed_block_shape() {
     "UserKnownHostsFile ~/.ssh/known_hosts" "GlobalKnownHostsFile none" "UpdateHostKeys no"
     "ProxyCommand none" "ProxyJump none" "CanonicalizeHostname no" "PermitLocalCommand no"
     "RemoteCommand none" "KnownHostsCommand none" "ClearAllForwardings yes"
+    "ForwardAgent no" "ForwardX11 no" "ForwardX11Trusted no" "ControlMaster no" "ControlPath none"
     "ServerAliveInterval 30" "ServerAliveCountMax 3"
   )
   [[ "$(head -n 1 "$block_file")" == "# BEGIN herdr-bootstrap $block_alias" &&
@@ -210,7 +216,7 @@ validate_managed_block_shape() {
   while IFS= read -r block_line || [[ -n "$block_line" ]]; do
     case "$block_line" in
       "# BEGIN herdr-bootstrap $block_alias"|"# END herdr-bootstrap $block_alias"|"Host $block_alias"|'Host *') ;;
-      '  HostName '*|'  User '*|'  Port '*|'  IdentityFile '*|'  IdentitiesOnly yes'|'  StrictHostKeyChecking yes'|'  UserKnownHostsFile ~/.ssh/known_hosts'|'  GlobalKnownHostsFile none'|'  UpdateHostKeys no'|'  ProxyCommand none'|'  ProxyJump none'|'  CanonicalizeHostname no'|'  PermitLocalCommand no'|'  RemoteCommand none'|'  KnownHostsCommand none'|'  ClearAllForwardings yes'|'  ServerAliveInterval 30'|'  ServerAliveCountMax 3') ;;
+      '  HostName '*|'  User '*|'  Port '*|'  IdentityFile '*|'  IdentitiesOnly yes'|'  StrictHostKeyChecking yes'|'  UserKnownHostsFile ~/.ssh/known_hosts'|'  GlobalKnownHostsFile none'|'  UpdateHostKeys no'|'  ProxyCommand none'|'  ProxyJump none'|'  CanonicalizeHostname no'|'  PermitLocalCommand no'|'  RemoteCommand none'|'  KnownHostsCommand none'|'  ClearAllForwardings yes'|'  ForwardAgent no'|'  ForwardX11 no'|'  ForwardX11Trusted no'|'  ControlMaster no'|'  ControlPath none'|'  ServerAliveInterval 30'|'  ServerAliveCountMax 3') ;;
       *) echo "Managed block for '$block_alias' contains unexpected content '$block_line'; the client configuration was not changed." >&2; exit 26 ;;
     esac
   done < "$block_file"
@@ -276,6 +282,18 @@ validate_effective_alias() {
   }
   [[ "$(effective_value identitiesonly)" == yes ]] || { echo "Effective SSH IdentitiesOnly for '$checked_alias' is not yes." >&2; exit 26; }
   [[ "$(effective_value clearallforwardings)" == yes ]] || { echo "Effective SSH ClearAllForwardings for '$checked_alias' is not yes." >&2; exit 26; }
+  for unsafe_option in forwardagent forwardx11 forwardx11trusted controlmaster; do
+    unsafe_value="$(effective_value "$unsafe_option")"
+    [[ "$unsafe_value" == no || "$unsafe_value" == false ]] || {
+      echo "Effective SSH $unsafe_option for '$checked_alias' is '$unsafe_value'; refusing inherited forwarding or multiplexing." >&2
+      exit 26
+    }
+  done
+  unsafe_value="$(effective_value controlpath)"
+  [[ -z "$unsafe_value" || "$unsafe_value" == none ]] || {
+    echo "Effective SSH controlpath for '$checked_alias' is '$unsafe_value'; refusing inherited multiplexing." >&2
+    exit 26
+  }
   effective_strict="$(effective_value stricthostkeychecking)"
   [[ "$effective_strict" == yes || "$effective_strict" == true ]] || { echo "Effective SSH StrictHostKeyChecking for '$checked_alias' is not enabled." >&2; exit 26; }
   for unsafe_option in proxycommand proxyjump hostkeyalias; do

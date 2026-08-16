@@ -69,6 +69,12 @@ catch {
     $failures.Add("Behavioral regression test failed: tests\Test-HostOwnedAclPolicy.ps1 ($($_.Exception.Message))")
 }
 try {
+    & (Join-Path $RepoRoot 'tests\Test-ExchangePathPolicy.ps1')
+}
+catch {
+    $failures.Add("Behavioral regression test failed: tests\Test-ExchangePathPolicy.ps1 ($($_.Exception.Message))")
+}
+try {
     & (Join-Path $RepoRoot 'tests\Test-BootstrapVmDispatcher.ps1')
 }
 catch {
@@ -78,6 +84,7 @@ catch {
 $requiredFiles = @(
     'scripts\windows\HerdrFirewallPolicy.ps1',
     'scripts\windows\HerdrHostOwnedAclPolicy.ps1',
+    'scripts\windows\HerdrExchangePathPolicy.ps1',
     'scripts\windows\New-HerdrUbuntuVM.ps1',
     'scripts\windows\New-HerdrExchangeShare.ps1',
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
@@ -88,6 +95,7 @@ $requiredFiles = @(
     'tests\test-verify-vps-access.sh',
     'tests\test-verify-path.sh',
     'tests\Test-FirewallPolicy.ps1',
+    'tests\Test-ExchangePathPolicy.ps1',
     'tests\Test-BootstrapVmDispatcher.ps1',
     'tests\Test-HostOwnedAclPolicy.ps1',
     'config\ubuntu-toolchain.lock',
@@ -133,13 +141,13 @@ foreach ($relativePath in $primaryFiles) {
 $contentAssertions = @(
     @{ Path = 'bootstrap.ps1'; Required = @("'VmComplete'", 'function Complete-UbuntuVm', '$vmParameters.InstallationComplete = $true', "'VmComplete'   { Complete-UbuntuVm }"); Forbidden = @() },
     @{ Path = 'scripts\windows\HerdrHostOwnedAclPolicy.ps1'; Required = @('Snapshot descendants before protecting the root', "'/inheritance:r'", "'/grant:r'", "'/remove'", 'S-1-5-18', 'S-1-5-32-544', '$OperatorSid.Value', 'Unexpected ACL entry'); Forbidden = @('AccessControlType]::Deny', 'S-1-5-11', "'/T'", "'/C'") },
-    @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'C:\HerdrReviewJobs', 'Protect-HostOwnedTree -TargetPath $toolsPathResolved', 'S-1-5-32-545', 'Add-LocalGroupMember', 'Get-NetConnectionProfile', 'Preflight found', 'AcceptedFirewallRule', 'LocalAddress', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false', '$toolsPathResolved /remove:g', '$toolsPathResolved /inheritance:r') },
+    @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'C:\HerdrReviewJobs', 'Resolve-HerdrExchangePath', '$AllowExistingSharePath', '.herdr-exchange-root', 'Protect-HostOwnedTree -TargetPath $toolsPathResolved', 'S-1-5-32-545', 'Add-LocalGroupMember', 'Get-NetConnectionProfile', 'Preflight found', 'AcceptedFirewallRule', 'LocalAddress', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false', '$toolsPathResolved /remove:g', '$toolsPathResolved /inheritance:r') },
     @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', '-WorkingDirectory "$env:SystemRoot\Temp"', 'C:\HerdrReviewJobs', 'AcceptedFirewallRule', 'LocalAddress', 'exit 41', 'exit 43', 'exit 44', 'exit 45', 'exit 46', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @() },
     @{ Path = 'scripts\windows\Install-ExcelAutomation.ps1'; Required = @('C:\HerdrTools\excel-automation'); Forbidden = @('C:\HerdrExchange\scripts') },
     @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
     @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', 'command -v "$executable"', 'cargo_install_root', '--prefix "$node_dir"', '$node_dir/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
     @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry', 'Mount point must be an absolute path', 'protected system path', 'direct /srv/herdr-* child', 'Refusing to change it', '$mount_point_exists', 'Windows host contains unsupported characters', 'SMB share name contains unsupported characters'); Forbidden = @() },
-    @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
+    @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'ForwardAgent no', 'ForwardX11 no', 'ForwardX11Trusted no', 'ControlMaster no', 'ControlPath none', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
     @{ Path = 'scripts\ubuntu\verify-vps-access.sh'; Required = @('OpenSSH could not resolve alias', 'VPS access was not attempted', '$1=""', 'effective IdentityFile'); Forbidden = @('ssh -G "$alias_name" 2>/dev/null') },
     @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE') }
 )

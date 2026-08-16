@@ -9,6 +9,7 @@ param(
     [string]$ToolsPath = 'C:\HerdrTools',
     [string]$ReviewJobsPath = 'C:\HerdrReviewJobs',
     [string[]]$AcceptedFirewallRule = @(),
+    [switch]$AllowExistingSharePath,
     [SecureString]$Password,
     [switch]$RotatePassword
 )
@@ -16,6 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'HerdrFirewallPolicy.ps1')
 . (Join-Path $PSScriptRoot 'HerdrHostOwnedAclPolicy.ps1')
+. (Join-Path $PSScriptRoot 'HerdrExchangePathPolicy.ps1')
 $requiredUser = 'HerdrBridge'
 function Assert-DedicatedBridgeMembership([object]$User) {
     $ordinaryUsersSid = 'S-1-5-32-545'
@@ -96,7 +98,13 @@ if ($LocalUser -cne $requiredUser) {
     throw "The SMB bridge must use the dedicated '$requiredUser' account."
 }
 
-$sharePath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+$requestedSharePath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+$share = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
+if ($share -and -not ([IO.Path]::GetFullPath($share.Path).TrimEnd('\')).Equals($requestedSharePath, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Existing share '$ShareName' points to '$($share.Path)', not '$requestedSharePath'. Remove or rename it manually, then retry."
+}
+$sharePath = Resolve-HerdrExchangePath -Path $requestedSharePath `
+    -AllowExistingUnmanagedPath:$AllowExistingSharePath -ExistingManagedShare:($null -ne $share)
 $toolsPathResolved = [IO.Path]::GetFullPath($ToolsPath).TrimEnd('\')
 $reviewJobsPathResolved = [IO.Path]::GetFullPath($ReviewJobsPath).TrimEnd('\')
 if ($toolsPathResolved.Equals($reviewJobsPathResolved, [StringComparison]::OrdinalIgnoreCase)) {
@@ -211,10 +219,6 @@ foreach ($writableDirectory in @("$sharePath\in", "$sharePath\out", "$sharePath\
 }
 Protect-HostOwnedTree -TargetPath $toolsPathResolved -OperatorSid $operatorSid
 
-$share = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
-if ($share -and -not ([IO.Path]::GetFullPath($share.Path).TrimEnd('\')).Equals($sharePath, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Existing share '$ShareName' points to '$($share.Path)', not '$sharePath'. Remove or rename it manually, then retry."
-}
 if (-not $share) {
     New-SmbShare -Name $ShareName -Path $sharePath -ChangeAccess $identity `
         -FolderEnumerationMode AccessBased -CachingMode None -EncryptData $true | Out-Null
@@ -236,6 +240,7 @@ Grant-SmbShareAccess -Name $ShareName -AccountName $identity -AccessRight Change
 Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP `
     -LocalPort 445 -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48') -Profile Any | Out-Null
+[IO.File]::WriteAllText((Join-Path $sharePath '.herdr-exchange-root'), 'herdr-exchange-root-v1')
 
 Write-Host "Converged \\$env:COMPUTERNAME\$ShareName for $identity."
 Write-Host "Writable bridge directories: '$sharePath\in', '$sharePath\out', and '$sharePath\logs'."

@@ -19,7 +19,7 @@ Once an agent is running in this repository, give it this exact instruction:
 
 - `bootstrap.ps1` — Windows status, base packages, Hyper-V enablement, VM creation, and Excel environment.
 - `scripts/windows/New-HerdrUbuntuVM.ps1` — convergent Generation 2 VM provisioning with invariant checks, partial-create cleanup, bounded resources, and host-level autostart.
-- `scripts/windows/New-HerdrExchangeShare.ps1` — convergent Windows SMB exchange with a fixed non-admin identity, allowlisted writable directories, encrypted SMB, and a Tailscale-only firewall rule.
+- `scripts/windows/New-HerdrExchangeShare.ps1` — convergent Windows SMB exchange with a fixed non-admin identity, fail-closed share-path adoption, allowlisted writable directories, encrypted SMB, and a Tailscale-only firewall rule.
 - `scripts/ubuntu/bootstrap.sh` — Ubuntu packages plus the checksum-verified, version-locked toolchain in `config/ubuntu-toolchain.lock`.
 - `scripts/ubuntu/configure-excel-share.sh` — credential-protected SMB mount at `/srv/herdr-exchange`.
 - `scripts/ubuntu/verify.sh` — non-destructive Ubuntu verification.
