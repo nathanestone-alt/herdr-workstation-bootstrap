@@ -9,7 +9,7 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 
-OUTPUT_DIR = Path(r"C:\HerdrExchange\out")
+OUTPUT_DIR = Path(r"C:\HerdrTools\excel-automation\smoke")
 OUTPUT_FILE = OUTPUT_DIR / "excel-com-smoke-test.xlsx"
 
 
