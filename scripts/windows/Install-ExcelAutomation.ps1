@@ -18,11 +18,6 @@ if (-not (Test-Path -LiteralPath $Venv)) {
 }
 uv pip install --python (Join-Path $Venv 'Scripts\python.exe') --requirement $Requirements
 
-foreach ($directory in @('C:\HerdrExchange\in', 'C:\HerdrExchange\out', 'C:\HerdrExchange\logs', 'C:\HerdrExchange\scripts')) {
-    New-Item -ItemType Directory -Path $directory -Force | Out-Null
-}
-
 & (Join-Path $Venv 'Scripts\python.exe') $SmokeTest
 if ($LASTEXITCODE -ne 0) { throw "Excel COM smoke test failed with exit code $LASTEXITCODE" }
 Write-Host "Excel automation environment ready: $Venv"
-

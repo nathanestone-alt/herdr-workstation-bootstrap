@@ -18,7 +18,14 @@ copy_tree() {
   fi
 }
 
+if [[ -d "$payload/agents-skills/herdr-coordination" ]]; then
+  if grep -RqsE 'C:\\|USERPROFILE|-WindowStyle|@echo off|\.cmd\b' "$payload/agents-skills/herdr-coordination"; then
+    echo 'BLOCKED: herdr-coordination still contains Windows-specific behavior.' >&2
+    echo 'Port it and run its regression suite under native Ubuntu pwsh before installing the agents skill payload.' >&2
+    exit 30
+  fi
+fi
+
 copy_tree "$payload/agents-skills" "$HOME/.agents/skills"
 copy_tree "$payload/claude-skills" "$HOME/.claude/skills"
-echo 'Skill payload copied. Review Windows paths and validate each skill before enabling it.'
-
+echo 'Skill payload copied after Linux portability preflight. Run every included regression suite before enabling coordination.'

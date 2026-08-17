@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 failures=0
 check_command() {
@@ -12,12 +13,37 @@ check_command() {
   fi
 }
 
-printf 'WSL kernel: %s\n' "$(uname -r)"
+printf 'Kernel: %s\n' "$(uname -r)"
+if grep -qi microsoft /proc/sys/kernel/osrelease; then
+  echo 'FAIL environment is WSL; the primary architecture requires an Ubuntu Hyper-V VM'
+  failures=$((failures + 1))
+else
+  echo 'PASS environment is a standalone Linux VM'
+fi
 printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
 [[ "$(ps -p 1 -o comm=)" == "systemd" ]] || failures=$((failures + 1))
 
-for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun; do
+for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs; do
   check_command "$command"
+done
+login_shell="$(command -v bash)"
+login_path="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc 'printf "%s" "$PATH"')"
+for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+  if [[ ":$login_path:" == *":$required_path:"* ]]; then
+    echo "PASS login PATH includes $required_path"
+  else
+    echo "FAIL login PATH omits $required_path"
+    failures=$((failures + 1))
+  fi
+done
+for command in rtk codex claude herdr; do
+  login_command="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc "command -v $command" 2>/dev/null || true)"
+  if [[ -n "$login_command" ]]; then
+    echo "PASS login command $command $login_command"
+  else
+    echo "FAIL login command $command missing"
+    failures=$((failures + 1))
+  fi
 done
 if command -v systemctl >/dev/null 2>&1; then
   for service in ssh tailscaled; do
@@ -38,10 +64,10 @@ herdr --version 2>/dev/null || true
 git --version 2>/dev/null || true
 gh --version 2>/dev/null | head -n 1 || true
 mosh --version 2>/dev/null | head -n 1 || true
+pwsh --version 2>/dev/null || true
 
 if [[ "$failures" -ne 0 ]]; then
   echo "Verification failed: $failures check(s)" >&2
   exit 1
 fi
 echo 'Ubuntu bootstrap verification passed.'
-

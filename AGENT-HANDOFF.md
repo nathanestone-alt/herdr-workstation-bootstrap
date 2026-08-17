@@ -2,20 +2,20 @@
 
 ## Mission
 
-Commission the MS-A2 without losing the known-good Surface workflow. Automate deterministic steps, stop for human authentication/security decisions, and record evidence for every phase.
+Commission the MS-A2 without losing the known-good Surface workflow. Windows 11 Pro remains the Excel/COM host. Ubuntu 24.04 LTS in Hyper-V is the durable Herdr and AI CLI environment.
 
-## Rules
+## Non-negotiable rules
 
-1. Read the architecture and dependency plan completely before mutating the machine.
+1. Read the architecture and dependency plan before mutating the machine.
 2. Run `bootstrap.ps1 -Stage Status` first.
-3. Never overwrite an existing configuration without making a timestamped backup.
-4. Never copy or commit authentication files, tokens, browser profiles, private SSH keys, Office documents, or plugin caches.
-5. Never delete or alter the Surface source environment.
-6. Treat reboots as phase boundaries. Record state, tell the user exactly why a reboot is needed, and stop.
-7. Ask the user to perform browser/device-code authentication. Do not attempt to extract existing credentials.
+3. Back up existing configuration before replacement.
+4. Never copy or commit authentication files, tokens, browser profiles, private SSH keys, Office documents, SMB credentials or plugin caches.
+5. Never alter the Surface source environment.
+6. Treat reboots as phase boundaries and stop for the user.
+7. Require human participation for browser/device authentication and recovery-key handling.
 8. Run Excel COM only in the interactive Windows user session.
-9. Keep Linux repositories under `~/code`; exchange Excel files through `C:\HerdrExchange`.
-10. Update `LOCAL-COMMISSIONING-LOG.md` after every phase. This file is local-only and must not be committed.
+9. Keep repositories in `~/code`; exchange workbooks through `/srv/herdr-exchange`.
+10. Record evidence in uncommitted `LOCAL-COMMISSIONING-LOG.md`.
 
 ## Phase A — Assess
 
@@ -23,9 +23,9 @@ Commission the MS-A2 without losing the known-good Surface workflow. Automate de
 pwsh -File .\bootstrap.ps1 -Stage Status
 ~~~
 
-Confirm Windows Pro/activation, AMD64, 64 GB memory, expected CPU count, 2 TB storage, Office, WSL, elevation, and existing tools. Stop if the hardware, storage, Windows edition, or activation state is materially wrong.
+Confirm Windows 11 Pro activation, AMD64, 64 GB memory, 32 logical processors, 2 TB storage, virtualization, Office, elevation and tools. Stop for materially wrong hardware, storage, edition or activation.
 
-## Phase B — Windows base
+## Phase B — Windows base and recovery
 
 Run elevated:
 
@@ -33,41 +33,60 @@ Run elevated:
 pwsh -File .\bootstrap.ps1 -Stage WindowsBase
 ~~~
 
-This installs approved base tools. Office activation, BitLocker recovery-key storage, Tailscale authentication, and UPS policy remain manual.
+Then have the user complete Office activation, BitLocker recovery-key verification, Windows Tailscale login as `herdr-win`, UPS policy and Comet access.
 
-## Phase C — WSL installation
+## Phase C — Enable Hyper-V
 
 Run elevated:
 
 ~~~powershell
-pwsh -File .\bootstrap.ps1 -Stage WslInstall
+pwsh -File .\bootstrap.ps1 -Stage HyperVEnable
 ~~~
 
-If a reboot or first Ubuntu launch is required, stop. After the user creates the Ubuntu username/password:
+If newly enabled, document the checkpoint and stop for reboot. Do not combine the reboot with unattended follow-on work.
+
+## Phase D — Create and install Ubuntu
+
+Verify the Ubuntu Server 24.04 LTS AMD64 ISO checksum. Then run elevated:
 
 ~~~powershell
-pwsh -File .\bootstrap.ps1 -Stage WslConfigure
+pwsh -File .\bootstrap.ps1 -Stage VmCreate -UbuntuIsoPath C:\InstallMedia\ubuntu-24.04-live-server-amd64.iso
+Start-VM -Name herdr-ubuntu
+vmconnect.exe localhost herdr-ubuntu
 ~~~
 
-The WSL ceiling is 36 GB RAM, 24 logical processors, and 8 GB swap.
+The VM defaults are 16 vCPUs, dynamic 8–32 GB RAM and a dynamically expanding 500 GB VHDX. Default safety reserves require at least 20 logical processors and a 64 GB-or-larger host; the preflight compares the requested 48 GiB total against memory visible to Windows, which is slightly below the installed amount. On other hardware, pass reviewed `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` overrides through `bootstrap.ps1 -Stage VmCreate`. The VM uses the Default Switch and starts 30 seconds after Hyper-V, before Windows user login.
 
-## Phase D — Ubuntu base and systemd
+If VM creation used any reviewed resource or host-reserve override, record the exact `-Vm*` arguments in the commissioning record and repeat every one of them on the later `bootstrap.ps1 -Stage VmComplete` command. A bare completion command re-applies the script defaults.
+
+Have the user install Ubuntu with OpenSSH enabled. After installation:
+
+~~~powershell
+Stop-VM -Name herdr-ubuntu
+pwsh -File .\bootstrap.ps1 -Stage VmComplete
+Start-VM -Name herdr-ubuntu
+~~~
+
+The bare completion command above is only for a VM created with the defaults. Otherwise append the identical `-VmProcessorCount`, `-VmMinimumMemoryBytes`, `-VmStartupMemoryBytes`, `-VmMaximumMemoryBytes`, `-VmHostProcessorReserve`, and `-VmHostMemoryReserveBytes` arguments used for `VmCreate`; `bootstrap.ps1` translates and forwards them to the lower-level completion script.
+
+The convergence pass verifies the system VHD, Generation 2, switch, CPU and dynamic-memory bounds, Secure Boot, and automatic start/stop settings before detaching the ISO. It fails closed on incompatible pre-existing state.
+
+## Phase E — Ubuntu bootstrap
+
+Clone this repository fresh inside Ubuntu rather than using a Windows-mounted checkout:
 
 ~~~bash
-cd /mnt/c/dev/herdr-workstation-bootstrap
+mkdir -p ~/code
+cd ~/code
+git clone https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git
+cd herdr-workstation-bootstrap
 bash scripts/ubuntu/bootstrap.sh --phase base
-~~~
-
-If `/etc/wsl.conf` changes, return to Windows, run `wsl --shutdown`, reopen Ubuntu, and rerun. Verify PID 1 is `systemd`.
-
-## Phase E — Ubuntu agent toolchain
-
-~~~bash
-cd /mnt/c/dev/herdr-workstation-bootstrap
 bash scripts/ubuntu/bootstrap.sh --phase tools
 ~~~
 
-Then ask the user to authenticate:
+This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
+
+Have the user authenticate:
 
 ~~~bash
 gh auth login --web
@@ -76,63 +95,74 @@ claude
 sudo tailscale up --hostname=herdr-ubuntu
 ~~~
 
-Never record device codes or tokens in the commissioning log.
+Never record device codes or tokens.
 
 ## Phase F — Remote access
 
-Follow [REMOTE-ACCESS.md](REMOTE-ACCESS.md). Use Tailscale as the private network layer and ordinary OpenSSH for compatibility with laptops, Termius, and Mosh clients. Do not expose TCP 22 or UDP 60000–61000 on the home router.
+Follow [REMOTE-ACCESS.md](REMOTE-ACCESS.md). Required gates:
 
-Required gates:
+1. Windows and Ubuntu appear separately as `herdr-win` and `herdr-ubuntu`.
+2. Laptop and phone use separate SSH keys.
+3. Key login succeeds before passwords are disabled.
+4. SSH and Mosh work from cellular/off-LAN.
+5. Herdr detaches and reattaches through both transports.
+6. A cold Windows boot with no user login still produces a reachable Ubuntu node.
+7. No router port forwards exist for SSH, Mosh, SMB, RDP or KVM.
 
-1. Tailscale is installed and authenticated on Windows, Ubuntu, the laptop, and phone.
-2. Ubuntu appears as `herdr-ubuntu` in MagicDNS.
-3. Laptop and phone each have their own SSH key.
-4. Both keys are installed in Ubuntu `authorized_keys`.
-5. Key login works before password login is disabled.
-6. SSH works from cellular with home Wi-Fi disabled.
-7. Mosh works over Tailscale and reconnects across Wi-Fi/cellular changes.
-8. Herdr can detach and reattach through both SSH and Mosh.
+## Phase G — Excel exchange
 
-## Phase G — Herdr and plugins
-
-1. Record `herdr --version`.
-2. Install official integrations supported by that exact version:
-
-~~~bash
-herdr integration install claude
-herdr integration install codex
-~~~
-
-3. Install Codex plugins through the supported marketplace flow, not by copying caches.
-4. Reconnect GitHub, Google Calendar, and Slack only with user approval.
-5. Install context-mode through its supported plugin path and verify Bun/Node prerequisites.
-6. Copy custom skills only from a reviewed payload.
-7. Validate all Herdr command-sensitive skills against the installed Herdr version.
-
-## Phase H — Excel automation
-
-From the interactive Windows PowerShell session:
+From elevated interactive Windows PowerShell:
 
 ~~~powershell
-pwsh -File .\bootstrap.ps1 -Stage Excel
+$acceptedFirewallRules = @() # Populate only after reviewing and recording an exception reported by preflight.
+& .\scripts\windows\New-HerdrExchangeShare.ps1 -AcceptedFirewallRule $acceptedFirewallRules
+& .\scripts\windows\Test-HerdrExchangeBoundary.ps1 -AcceptedFirewallRule $acceptedFirewallRules
+& .\bootstrap.ps1 -Stage Excel
 ~~~
 
-The disposable test must create a workbook under `C:\HerdrExchange\out`, close Excel, and leave no test-related orphaned process. Do not use the production workbook until it passes.
+The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only in a coordinated maintenance window: run the Windows script with `-RotatePassword` (it securely prompts for the new password), then immediately run the Ubuntu command below with that same password. The Ubuntu script unmounts any existing SMB session before replacing the credential, converges its managed `/etc/fstab` block, creates a fresh encrypted SMB session, and must pass the write test before the window ends.
 
-## Phase I — Repository migration
+The share script requires a normal path on a local fixed drive; it rejects UNC paths, Windows device namespaces, drive roots, Windows system trees, reparse points, and any existing directory that is neither the already-marked path of the matching `HerdrExchange` SMB share nor explicitly approved. If a reviewed first-run or interrupted setup must adopt an existing ordinary directory, inspect the path and its contents, record that decision, and pass `-AllowExistingSharePath` once. The switch never overrides local-path, protected-system-path, or reparse-point checks.
 
-1. Create `~/code` in Ubuntu.
-2. Clone repositories fresh with `gh repo clone`.
-3. Inspect dependency manifests and automation instructions.
-4. Create a Windows-only requirements lock for COM scripts if missing.
-5. Replace absolute ARM64/Windows paths in user-level agent configuration.
-6. Keep source in Ubuntu and workbook handoffs in `C:\HerdrExchange` unless tests prove another design is required.
+~~~bash
+bash scripts/ubuntu/configure-excel-share.sh --host herdr-win --owner HERDR_UBUNTU_USER
+~~~
 
-## Phase J — Verify and hand off
+The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and covers explicit port 445/ranges plus unscoped TCP-capable rules, including `Protocol=Any`; owner-scoped AppContainer rules are excluded. Tailscale rules whose local or remote addresses are confined to `100.64.0.0/10` or `fd7a:115c:a1e0::/48` are compatible by scope. On stock Windows 11, Network Discovery for Teredo and WFD Driver-only rules may be reported. Review each exact rule name: disable an unnecessary rule with the printed `Disable-NetFirewallRule -Name '<name>'` command, or record the reason for retaining it and pass that exact name through `-AcceptedFirewallRule` to both commands above. Never accept a rule by display name or merely to make the gate pass. The script also creates and recursively protects host-owned `C:\HerdrReviewJobs`, then reads its DACL back. The boundary test runs as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including `scripts`), cannot write `C:\HerdrTools` or `C:\HerdrReviewJobs`, and that no unconfined, unaccepted inbound allow rule exposes TCP 445.
+
+Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
+
+Configure the Windows OneDrive client with `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, all marked Always keep on this device. GitHub remains authoritative for repositories. The reviewed staging helper must reject Offline/Recall attributes, require stable size/time/hash across two exclusive reads, preserve and hash the Inbox original, copy and re-hash it under `C:\HerdrExchange\in\<job-id>`, then copy and re-hash it again into non-shared `C:\HerdrReviewJobs\<job-id>` immediately before Excel/COM opens it. Return results and the complete provenance manifest through OneDrive Outbox. Never automate inside OneDrive or a bridge-writable directory, mount OneDrive in Ubuntu, or make OneDrive, `C:\HerdrExchange`, or `C:\HerdrReviewJobs` an Excel Trusted Location.
+
+## Phase H — Herdr, skills and plugins
+
+1. Record `herdr --version`.
+2. Install Codex and Claude integrations compatible with the locked CLI versions; review and update the lock before upgrading.
+3. Reinstall plugins through supported marketplaces; do not copy caches.
+4. Reconnect external apps only with user approval.
+5. Run `bash scripts/ubuntu/install-payload.sh`.
+
+The payload installer intentionally blocks while `herdr-coordination` contains Windows-specific paths/options. Installing native `pwsh` is necessary but not sufficient. Port the coordination skill to Linux, replace Windows-only paths and process options, and run its regression suite under Ubuntu before enabling it.
+
+## Phase I — Hostinger VPS
+
+Follow [VPS-ACCESS.md](VPS-ACCESS.md). Preserve hPanel recovery and the Surface key, make a fresh Hostinger snapshot, add a dedicated MS-A2 public key, prove public SSH, then add Tailscale without prematurely removing existing recovery paths.
+
+## Phase J — Repository migration
+
+1. Clone repositories fresh under `~/code`.
+2. Inspect their manifests and automation instructions.
+3. Recreate AMD64 dependencies; never copy ARM64 binaries or virtual environments.
+4. Keep Windows-only Python/COM dependencies on Windows.
+5. Replace absolute Surface and Windows paths in Linux configuration.
+6. Use the SMB exchange only for workbook inputs, outputs and logs—not as the Git working tree.
+
+## Phase K — Verify and hand off
 
 ~~~bash
 bash scripts/ubuntu/verify.sh
 ~~~
 
-Also validate Windows RDP, Ubuntu SSH/Mosh from another network, Herdr detach/reattach, reboot/login/service recovery, Comet KVM, Fingerbot, Excel COM, and backup after the deferred drive arrives.
+Bootstrap installs a convergent hook in `~/.profile` and updates `~/.bash_profile` only when that file already exists, preserving Ubuntu's normal `.profile` to `.bashrc` login chain. The verification script checks both its controlled PATH and a separate real Bash login shell; Phase K fails if `rtk`, `codex`, `claude`, or `herdr` is not discoverable through the login profile.
 
+Also validate repository checks, Windows RDP, off-LAN SSH/Mosh, Herdr detach/reattach, cold-boot/no-login VM recovery, Comet/Fingerbot recovery, Excel COM, SMB permissions, VPS access and backup restoration once the deferred drive arrives.

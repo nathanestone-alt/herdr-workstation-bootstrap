@@ -98,4 +98,3 @@ if ($Action -eq "install" -and -not $isCurrent) {
     installed_commit = $targetHead
     current = $isCurrent
 } | ConvertTo-Json -Depth 5
-

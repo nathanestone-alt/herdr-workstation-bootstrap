@@ -4,183 +4,133 @@ Last updated: 2026-08-16
 
 ## Objective
 
-Build the MINISFORUM MS-A2 as a reliable, remotely accessible workstation with:
+Build the MINISFORUM MS-A2 as a recoverable, remotely accessible workstation with:
 
-- Windows 11 Pro on bare metal for native Microsoft Excel and COM automation.
-- Ubuntu on WSL2 for Herdr, Codex CLI, Claude Code, Git repositories, and general development.
-- A controlled bridge between Linux agent sessions and Windows Excel automation.
-- Reproducible dependencies so the workstation can be restored onto replacement hardware.
+- Windows 11 Pro on bare metal for native desktop Excel and COM automation.
+- Ubuntu Server 24.04 LTS in an auto-starting Hyper-V VM for Herdr, Codex, Claude, Git and general development.
+- Independent Tailscale nodes for Windows and Ubuntu.
+- A restricted SMB bridge between Ubuntu agents and the interactive Windows Excel session.
+- Reproducible dependencies that can be rebuilt on replacement hardware.
 
-This document is the dependency/install companion to `HERDR_WINDOWS_WORKSTATION_ARCHITECTURE.md`.
+The prior WSL2 architecture is no longer primary because WSL lifecycle depends on user/session behavior, systemd services do not keep an instance alive, and simultaneous Windows/WSL Tailscale is discouraged. See `legacy/WSL2-FALLBACK.md` only if Hyper-V proves unsuitable.
 
-The executable sequence is split across:
+## Runbook map
 
-- `MANUAL-START.md` — everything the user must do before an agent can safely take over.
-- `AGENT-HANDOFF.md` — the phase-by-phase agent runbook.
-- `REMOTE-ACCESS.md` — Tailscale, OpenSSH, phone/laptop keys, Mosh, and off-LAN tests.
-- `bootstrap.ps1` and `scripts/ubuntu/bootstrap.sh` — deterministic installation entry points.
+- `MANUAL-START.md` — physical/OOBE steps through the first Windows agent.
+- `AGENT-HANDOFF.md` — authoritative commissioning sequence.
+- `REMOTE-ACCESS.md` — Tailscale, SSH, Mosh and cold-boot testing.
+- `VPS-ACCESS.md` — Hostinger onboarding and recovery gates.
+- `bootstrap.ps1` — Windows packages, Hyper-V and VM entry points.
+- `scripts/ubuntu/bootstrap.sh` — Linux dependencies and tools.
+- `scripts/ubuntu/verify.sh` — non-destructive Linux verification.
 
-## Key migration rule
+## Migration rules
 
-Do not copy installed programs or package directories from the ARM64 Surface. The Surface is ARM64 and the MS-A2 is x86-64/AMD64. Reinstall the AMD64 version of every executable.
+1. Do not copy ARM64 programs, Rust binaries, Python environments, Node modules or package caches from the Surface.
+2. Reinstall AMD64/x86-64 executables from the reviewed official artifacts pinned in `config/ubuntu-toolchain.lock`.
+3. Clone repositories fresh under `~/code` in Ubuntu.
+4. Migrate only reviewed source, configuration, public keys and personal skills.
+5. Re-authenticate every service. Never copy token/authentication files or browser profiles.
+6. Keep the Surface unchanged until all restore and remote-access gates pass.
 
-Migrate only reviewed configuration, source files, personal skills, and data. Re-authenticate accounts on the new machine.
+## Current Surface reference inventory
 
-## Current Surface inventory
+Collected 2026-08-16. Surface versions are reference evidence; Ubuntu recovery pins live in `config/ubuntu-toolchain.lock` and change only through a reviewed lock update.
 
-This inventory was collected on 2026-08-16 and is a reference baseline, not a requirement to pin every tool forever.
-
-| Component | Current Surface state | MS-A2 treatment |
+| Component | Surface | MS-A2 treatment |
 |---|---|---|
-| Windows | Windows 11 Home, ARM64 | Clean Windows 11 Pro x86-64 install/activation |
-| PowerShell | 7.6.4 | Install current x64 PowerShell 7 |
-| WSL | WSL 2.7.8, Ubuntu default distro | Install current WSL2 and a fresh Ubuntu LTS distro |
-| RTK | 0.42.4, ARM64 Windows; Cargo source from `rtk-ai/rtk` | Build/install AMD64 Linux version inside Ubuntu |
-| Codex CLI | 0.147.0, Windows | Fresh install inside Ubuntu; do not copy the executable |
-| Claude Code | 2.1.233, Windows | Fresh native install inside Ubuntu |
-| Herdr | 0.8.0 preview build, Windows | Fresh Linux AMD64 install inside Ubuntu, then validate integrations |
-| Git | 2.53.0.windows.3 | Install Linux Git in Ubuntu; optionally Git for Windows for Windows-only tasks |
-| GitHub CLI | 2.92.0 | Install Linux `gh` in Ubuntu and authenticate again |
-| Node.js/npm | 24.15.0 / 11.12.1 | Install in Ubuntu only if required by plugins or repositories |
-| Bun | 1.3.13 npm global | Install in Ubuntu because the current context-mode/plugin workflow uses it |
-| Python | 3.12.10 and 3.13.12 ARM64 | Install x64 Python 3.13 on Windows; use Ubuntu Python only for Linux-only tools |
-| uv | 0.11.19 ARM64 Windows | Fresh x64 Windows install; optionally install separately in Ubuntu |
-| Docker | Not present | Do not install unless a cloned repository actually requires it |
-| VS Code | CLI not present | Optional; not required for the SSH/Herdr workflow |
+| Windows | Windows 11 Home ARM64 | Windows 11 Pro x86-64 |
+| PowerShell | 7.6.4 | Current x64 Windows build plus native Ubuntu build |
+| WSL | 2.7.8 | Not primary; use Ubuntu Hyper-V |
+| RTK | 0.42.4 ARM64 Windows | Build AMD64 Linux from the reviewed fork/ref |
+| Codex CLI | 0.147.0 Windows | Fresh native Ubuntu install |
+| Claude Code | 2.1.233 Windows | Fresh native Ubuntu install |
+| Herdr | 0.8.0 preview Windows | Fresh stable Linux install and exact-version validation |
+| Git / GitHub CLI | 2.53.0 / 2.92.0 | Fresh Ubuntu installs; Windows copies retained for bootstrap |
+| Node / npm | 24.15.0 / 11.12.1 | Ubuntu only when a plugin or repository needs them |
+| Bun | 1.3.13 | Fresh Ubuntu install for plugin workflows |
+| Python | 3.12/3.13 ARM64 | Windows x64 3.13 for COM; Ubuntu Python for Linux projects |
+| uv | 0.11.19 ARM64 | Fresh x64 Windows install and optional Ubuntu install |
+| Docker | Absent | Do not install without a repository requirement |
 
-### Current Windows Python compatibility set
+## Resource boundary
 
-The Surface's Python 3.13 environment contains the packages needed by the Excel workflow:
+### Windows host
 
-- `pywin32==311`
-- `openpyxl==3.1.5`
-- `xlwings==0.34.0`
-- `numpy==2.4.6`
-- `xlsxwriter==3.2.9`
-- `pytest` is imported by the current STModel tests; capture its exact version before final migration.
-
-The inspected STModel scripts directly import `pythoncom`, `win32com.client`, `openpyxl`, and `pytest`. That makes Windows x64 Python plus `pywin32` a required dependency, not an optional convenience.
-
-The current repository does not contain a `requirements.txt`, `pyproject.toml`, or lock file. Creating a reviewed Windows requirements file is therefore a required migration task.
-
-## Target dependency boundary
-
-### Install on Windows 11 Pro
-
-Windows owns hardware, remote recovery, backups, and anything that controls desktop Excel.
+Windows owns hardware, Hyper-V, backup, remote recovery and desktop Excel.
 
 Required:
 
-- Windows 11 Pro x86-64 and all Windows Update patches.
-- Current MINISFORUM/AMD chipset, networking, and graphics drivers.
-- Microsoft 365 desktop apps, 64-bit, including Excel.
+- Windows 11 Pro x86-64, current updates and current MINISFORUM/AMD drivers.
+- Hyper-V with the `herdr-ubuntu` Generation 2 VM.
+- Microsoft 365 desktop applications, 64-bit.
 - PowerShell 7 x64.
-- Python 3.13 x64 from Python.org.
-- `uv` for isolated Windows Python environments.
-- The Excel Python environment: `pywin32`, `openpyxl`, `xlwings`, `numpy`, `xlsxwriter`, and `pytest`, pinned after validation.
-- Tailscale for remote Windows/RDP access.
-- CyberPower monitoring software only if it adds useful graceful-shutdown support for the UPS model.
-- Backup clients when backup storage is added: Veeam Agent and/or Backblaze according to the final backup design.
+- Python 3.13 x64 and `uv`.
+- Windows Excel environment: `pywin32==311`, `openpyxl==3.1.5`, `xlwings==0.34.0`, `numpy==2.4.6`, `xlsxwriter==3.2.9`, plus a validated `pytest` version.
+- Tailscale node `herdr-win`.
+- Restricted `HerdrExchange` SMB share and non-admin `HerdrBridge` account.
+- UPS monitoring if it demonstrably provides graceful shutdown.
+- Veeam and Backblaze when backup commissioning begins.
 
-Optional:
+A temporary Windows Codex or Claude install may bootstrap the VM. Do not duplicate the durable Linux toolchain on Windows without a demonstrated need.
 
-- Git for Windows and GitHub CLI if Windows-native scripts need them.
-- Windows OpenSSH Server as an emergency management path. Routine CLI work should SSH directly into Ubuntu.
-- VS Code plus the WSL extension if graphical editing becomes useful.
+### Ubuntu Hyper-V VM
 
-Do not install Docker Desktop, a Windows Node stack, or duplicate Windows copies of Codex/Claude/Herdr unless a demonstrated need appears.
+Initial VM resources:
 
-### Install inside Ubuntu WSL2
+- 16 virtual processors.
+- Dynamic memory: 8 GB minimum, 16 GB startup, 32 GB maximum.
+- 500 GB dynamically expanding VHDX.
+- Hyper-V Default Switch.
+- Automatic start `Start`, 30-second delay; automatic stop `Save`.
 
-Ubuntu owns the persistent agent workspace.
-
-Base packages:
+Base packages installed by the bootstrap include:
 
 ~~~text
-build-essential
-ca-certificates
-curl
-git
-git-lfs
-gnupg
-jq
-openssh-client
-openssh-server
-mosh
-pkg-config
-ripgrep
-unzip
-zip
+apt-transport-https build-essential ca-certificates cifs-utils curl
+git git-lfs gh gnupg jq mosh openssh-client openssh-server
+pkg-config ripgrep rsync unzip zip
 ~~~
 
-Runtime/tooling layer:
+Tooling layer:
 
-- Rust via `rustup`, using the x86_64 Linux stable toolchain, to build the current RTK source.
-- RTK from the user's [RTK fork](https://github.com/nathanestone-alt/rtk), pinned to commit `c1819ceff1ab8d75b88c1ff7a63f497914e8fe99` until an upstream/released build is proven equivalent.
-- Codex CLI using the current [official Codex WSL installation](https://learn.chatgpt.com/docs/windows/wsl.md).
-- Claude Code using the current [official Claude Code setup](https://docs.anthropic.com/en/docs/claude-code/getting-started).
-- Herdr using the [official Linux installer](https://github.com/herdrdev/herdr), followed by its Claude and Codex integration installers.
-- GitHub CLI from GitHub's official Linux packages.
-- Bun, because the current plugin/context-mode setup uses it.
-- Node.js 24 only if required by a selected plugin or repository. Use a version manager so Node can be changed without disturbing the OS.
-- `uv` plus Ubuntu Python for Linux-only project tooling. Do not try to use Linux Python for Excel COM.
-- Tailscale inside Ubuntu for a stable, direct SSH endpoint.
-- Mosh inside Ubuntu for a more resilient phone terminal over Tailscale.
+- Native PowerShell 7 from Microsoft's Ubuntu package repository.
+- Rust stable x86-64 via `rustup`.
+- RTK from `https://github.com/nathanestone-alt/rtk.git`, initially pinned to `c1819ceff1ab8d75b88c1ff7a63f497914e8fe99` until a newer reviewed revision is selected.
+- Codex CLI, Claude Code and stable Linux Herdr from their official installers.
+- Bun; Node 24 through `fnm` when required.
+- Tailscale node `herdr-ubuntu`.
+- OpenSSH and Mosh.
+- Repositories under `~/code`.
+- Windows exchange mounted at `/srv/herdr-exchange`.
 
-Recommended host names:
+## Codex, Claude, skills and plugins
 
-- Windows Tailscale node: `herdr-win`
-- Ubuntu Tailscale node: `herdr-ubuntu`
+Reinstall rather than copy Codex, Claude, Herdr, plugin caches, marketplace staging, runtimes and authentication state.
 
-This gives Windows/RDP and Ubuntu/SSH separate, unambiguous remote targets.
+Selectively migrate:
 
-## Codex, Claude, skills, and plugins
+- `AGENTS.md`, rewritten for Linux paths.
+- `RTK.md`, preserving the required `rtk` command prefix.
+- Reviewed non-secret Codex and Claude settings.
+- Git identity and public-key configuration.
+- Repository-controlled `AGENTS.md` and `CLAUDE.md`.
 
-### Reinstall, do not copy
-
-- Codex CLI and Claude Code binaries.
-- Herdr binary and its official Claude/Codex integrations.
-- Codex plugin cache under `.codex/plugins/cache`.
-- Claude plugin cache.
-- Marketplace staging folders.
-- ARM64 Rust/Cargo binaries, Python virtual environments, Node modules, and npm global package directories.
-- Authentication/session/token files.
-
-### Selectively migrate
-
-- The user-level `AGENTS.md`, after replacing Windows-only paths and commands.
-- `RTK.md`, rewritten for Linux paths while preserving the rule that shell commands are prefixed with `rtk`.
-- Reviewed, non-secret portions of Codex `config.toml`.
-- Reviewed, non-secret portions of Claude `settings.json`.
-- Git user name/email and Git LFS settings.
-- Repository-specific `AGENTS.md`/`CLAUDE.md` files through Git.
-
-Do not copy the current Codex configuration wholesale. It contains Windows GUI paths, executable paths, trusted hashes, plugin cache paths, and local hook commands that will not be valid in Ubuntu.
-
-### Personal/shared skills to migrate and validate
-
-Shared agent skills currently present:
+Shared skills recorded in the Surface payload:
 
 - `herdr`
 - `herdr-coordination`
 - `st-herdr-dispatch`
 
-Claude-only personal skills currently present:
+Claude-only personal skills:
 
 - `grill-with-docs-stmodel`
 - `tier1`
 - `wait-what`
 
-Migration procedure:
+The exported `herdr-coordination` payload currently contains Windows paths, `USERPROFILE`, `-WindowStyle`, Windows mutex naming and CMD-based test fixtures. Native Ubuntu `pwsh` is required but does not make those constructs portable. `install-payload.sh` deliberately fails until those hazards are removed. Port and run the complete regression suite under Ubuntu before enabling coordination.
 
-1. Install the official Herdr skill/integrations from the new Herdr binary.
-2. Copy the source-controlled personal/shared skills, not cached copies.
-3. Convert PowerShell and `C:\...` assumptions where Linux execution is intended.
-4. Keep Windows-only helper scripts clearly marked and invoke them through `powershell.exe` when needed.
-5. Run each skill's validation or smoke test.
-6. Review all Herdr command-sensitive skills against the exact Herdr version before enabling coordination automation.
-
-### Codex plugins currently in use or installed
+Recorded Codex plugins:
 
 - Browser
 - Sites
@@ -192,166 +142,151 @@ Migration procedure:
 - Slack
 - context-mode 1.0.169
 
-Plugin migration procedure:
+Install through the supported marketplace flow, reconnect accounts individually and never copy `.codex/plugins/cache`.
 
-1. Install plugins through Codex/plugin management on the new machine.
-2. Reconnect GitHub, Google Calendar, and Slack accounts rather than copying credentials.
-3. Install context-mode through its supported marketplace/install path.
-4. Confirm Bun/Node prerequisites after plugin installation.
-5. Verify plugin permissions one at a time.
-6. Do not copy the current `plugins/cache` directory; it is versioned generated state.
+## Excel bridge
 
-## Windows-to-Ubuntu Excel bridge
-
-Use the existing architecture boundary:
-
-- Source repositories live under `~/code` inside Ubuntu for Linux filesystem performance and predictable permissions.
-- Excel input/output files use `C:\HerdrExchange`.
-- Excel and COM execute in the interactive Windows user session.
-- Ubuntu agents invoke a small reviewed Windows launcher using `powershell.exe`, passing Windows paths under `C:\HerdrExchange`.
-
-Create these Windows folders:
+Windows paths:
 
 ~~~text
 C:\HerdrExchange\in
 C:\HerdrExchange\out
 C:\HerdrExchange\logs
-C:\HerdrExchange\scripts
 ~~~
 
-Do not run Excel workbooks directly from `\\wsl.localhost\...` until that path has been tested for Office Trust Center, Protected View, locking, and COM behavior. The exchange directory keeps that risk out of the critical path.
+Reviewed Windows executables and job-runner code live only under host-owned `C:\HerdrTools`; that directory is not exported by SMB.
 
-## Installation sequence
+Ubuntu path:
 
-### Phase 0 — Manual runway to the first agent
+~~~text
+/srv/herdr-exchange
+~~~
 
-- [ ] Physically connect the MS-A2, monitor, keyboard/mouse, Ethernet, and UPS.
-- [ ] Complete Windows OOBE with the long-term interactive user.
-- [ ] Confirm/activate Windows 11 Pro; return the unopened retail USB only if the included license is valid.
-- [ ] Rename the host `HERDR-WIN`, reboot, and finish Windows/driver updates.
-- [ ] Enable BitLocker and store the recovery key somewhere off the MS-A2.
-- [ ] Install and activate Microsoft 365 64-bit; manually create/save/reopen a disposable Excel workbook.
-- [ ] Install PowerShell 7, Git, and GitHub CLI with WinGet.
-- [ ] Authenticate `gh` and clone this private repository into `C:\dev\herdr-workstation-bootstrap`.
-- [ ] Install and sign into either Codex on Windows (preferred bootstrap operator) or Claude Code on Windows.
-- [ ] Start the agent in this repository with the prompt in `README.md`.
-- [ ] Keep the Surface intact until the new workstation passes every validation gate.
+Boundary:
 
-The Windows agent can perform the remaining deterministic setup. It must stop for reboots, the first Ubuntu username/password prompt, `sudo`, browser/device-code authentication, Office prompts, recovery-key handling, and destructive choices.
+1. `New-HerdrExchangeShare.ps1` creates or verifies the fixed non-admin local `HerdrBridge` account, grants NTFS/SMB Change only to `in`, `out`, and `logs`, removes non-allowlisted share access, enables SMB encryption, and recreates a TCP 445 rule restricted to Tailscale addresses.
+2. `configure-excel-share.sh` validates fstab and the explicit Ubuntu owner before mutation, proves a candidate password through a separate `nosharesock` mount/write test, installs the proven root-only credential before converging fstab, and reports the exact recovery state if a busy live mount cannot be replaced. Ownership changes require `--reassign-owner`.
+3. Repositories remain in `~/code`; only workbook inputs/outputs/logs cross SMB.
+4. Excel and COM run only in the designated interactive Windows user session.
+5. A reviewed Windows-side job runner under `C:\HerdrTools` accepts narrow operations over files under `C:\HerdrExchange`. It must reject arbitrary code/payloads, and the bridge account must not be able to modify it.
+6. A Windows reboot can restore Ubuntu before login, but Excel jobs wait until the Windows automation user signs in.
+7. The bridge password is long, strong, non-expiring, and stored in the password manager plus Ubuntu's root-only credential file. Rotation is an explicit coordinated maintenance operation followed by a write test.
 
-### Phase 1 — Hardware and Windows baseline
+### OneDrive one-off file and workbook review lane
 
-- [ ] Confirm the Amazon MS-A2 configuration is 64 GB RAM and 2 TB SSD.
-- [ ] Confirm whether Windows is already licensed; return the unopened retail USB if the included license is valid and transferable enough for the intended use.
-- [ ] Install/activate Windows 11 Pro.
-- [ ] Apply BIOS/firmware, Windows, chipset, GPU, and network updates.
-- [ ] Create the normal interactive user account that will own Excel COM sessions.
-- [ ] Enable BitLocker and save the recovery key somewhere off the MS-A2.
-- [ ] Configure UPS behavior and test a graceful shutdown.
-- [ ] Install Microsoft 365 64-bit and run Excel once interactively.
-- [ ] Install Tailscale and validate remote RDP.
+GitHub remains authoritative for repositories. Use the Windows OneDrive client only for one-off files and workbook review handoffs that do not justify a Git branch or full project transfer.
 
-### Phase 2 — Windows Excel automation
+- Create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive` under the signed-in Windows OneDrive root and mark them Always keep on this device.
+- Keep OneDrive off Ubuntu; Ubuntu reaches only the restricted `/srv/herdr-exchange` staging area.
+- Require a hydration/stability gate: reject Offline/Recall attributes and require two exclusive reads with stable size, last-write time and SHA-256 across a settle interval.
+- Preserve each Inbox original, stage a copied workbook under `C:\HerdrExchange\in\<job-id>`, and verify its hash again after the copy.
+- Before Excel/COM opens a workbook, copy the accepted bridge file into non-shared, host-owned `C:\HerdrReviewJobs\<job-id>` and re-verify the accepted hash. `New-HerdrExchangeShare.ps1` protects that root DACL and `Test-HerdrExchangeBoundary.ps1` proves the bridge identity cannot write there.
+- Return the result through Outbox with a manifest containing source, bridge-stage, last-mile and result paths/hashes, timestamps, and repository/branch/commit provenance when the workbook came from STModel work.
+- Never operate Excel automation directly in OneDrive or a bridge-writable directory, and never store repositories, VM disks, secrets, logs, or databases there.
+- Treat macros, external links, and data connections as executable content requiring an explicit trust decision.
+- Never configure OneDrive, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or their children as Excel Trusted Locations.
 
-- [ ] Install PowerShell 7 x64, Python 3.13 x64, and x64 `uv`.
-- [ ] Create a dedicated virtual environment for STModel/Excel automation.
-- [ ] Create a pinned `requirements-windows.txt` from the validated package set.
-- [ ] Install the Excel packages and run `pywin32` post-install steps if the selected release requires them.
-- [ ] Create `C:\HerdrExchange` and the Windows launcher.
-- [ ] Run an Excel COM smoke test: launch Excel, create/open a workbook, write a cell, save, close, and confirm no orphaned Excel process remains.
-- [ ] Run the current STModel COM harness against a disposable workbook.
+Add and validate the reviewed Windows staging helper before the round-trip commissioning checkbox can pass. It owns hydration/stability checks, path and extension validation, collision-resistant job IDs, bridge and last-mile copies, all hash comparisons, the provenance manifest, and cleanup; it never accepts arbitrary commands.
 
-### Phase 3 — WSL2 and Ubuntu
+## Installation and validation sequence
 
-- [ ] Install WSL2 and a current Ubuntu LTS distribution.
-- [ ] Enable systemd in Ubuntu.
-- [ ] Apply the agreed `.wslconfig`: 36 GB memory, 24 logical processors, 8 GB swap.
-- [ ] Install the Ubuntu base packages listed above.
-- [ ] Enable and test `sshd`.
-- [ ] Install Tailscale inside Ubuntu and name the node `herdr-ubuntu`.
-- [ ] Create `~/code`; keep active repositories there rather than under `/mnt/c`.
-- [ ] Add a Windows scheduled task that starts the Ubuntu distro after Windows boots so SSH/systemd services become available without manual launch.
+### Phase 0 — Manual runway
 
-### Phase 4 — Agent toolchain
+- [ ] Verify hardware, Windows 11 Pro, Office, BitLocker recovery and virtualization.
+- [ ] Keep the Surface as the known-good reference.
+- [ ] Install PowerShell, Git and GitHub CLI.
+- [ ] Clone this private repository.
+- [ ] Download and checksum the official Ubuntu Server 24.04 LTS AMD64 ISO.
+- [ ] Start one temporary Windows Codex or Claude session.
 
-- [ ] Install Rust and build/install the validated AMD64 RTK revision.
-- [ ] Confirm `rtk --version` and the mandatory command-prefix behavior.
-- [ ] Install Git LFS and GitHub CLI; configure Git identity.
-- [ ] Generate a new server-specific SSH key or securely migrate the existing key; register it with GitHub.
-- [ ] Authenticate `gh` again.
-- [ ] Install Codex CLI and authenticate again.
-- [ ] Install Claude Code and authenticate again.
-- [ ] Install Herdr and its Codex/Claude integrations.
-- [ ] Install Bun; install Node 24 only if a plugin/repository requires it.
-- [ ] Install and validate the selected skills and plugins.
+### Phase 1 — Windows baseline
 
-### Phase 4A — Tailscale, SSH, and mobile shell
+- [ ] Run `bootstrap.ps1 -Stage Status`.
+- [ ] Run `bootstrap.ps1 -Stage WindowsBase`.
+- [ ] Authenticate `herdr-win` in Tailscale and validate RDP.
+- [ ] Configure UPS and Comet/Fingerbot recovery paths.
+- [ ] Run Excel manually once using a disposable workbook in `%USERPROFILE%\Documents`; do not create `C:\HerdrExchange` before the guarded share step.
 
-- [ ] Install/sign into Tailscale on Windows as `herdr-win`.
-- [ ] Install/sign into Tailscale inside Ubuntu as `herdr-ubuntu`.
-- [ ] Install/sign into Tailscale on the laptop and phone.
-- [ ] Enable Ubuntu `sshd` under systemd.
-- [ ] Generate a unique Ed25519 SSH key on the laptop.
-- [ ] Generate a separate SSH key in the phone client; do not reuse the laptop private key.
-- [ ] Add both labeled public keys to Ubuntu `~/.ssh/authorized_keys`.
-- [ ] Test both key logins before disabling password and keyboard-interactive SSH authentication.
-- [ ] Keep TCP 22 private to Tailscale; do not port-forward it on the home router.
-- [ ] Install Mosh on Ubuntu and a compatible phone client.
-- [ ] For iPhone/iPad, use Blink Shell; for Android, use JuiceSSH or Termux.
-- [ ] Permit Mosh UDP 60000–61000 only inside the tailnet, or select a single port such as UDP 60001.
-- [ ] Test SSH and Mosh with phone Wi-Fi disabled so the connection truly crosses the cellular network.
-- [ ] Switch the phone between cellular and Wi-Fi and verify Mosh resumes.
-- [ ] Start/reconnect Herdr from both a laptop SSH session and phone Mosh session.
-- [ ] Restrict the Tailscale policy to the intended laptop/phone identities or devices.
+### Phase 2 — Hyper-V and Ubuntu
 
-Mosh starts through SSH and then uses encrypted UDP. It improves interactive roaming but does not replace SSH for file transfer, port forwarding, or universal fallback. See the [Tailscale WSL2 guide](https://tailscale.com/docs/install/windows/wsl2), [Tailscale SSH comparison](https://tailscale.com/kb/1193/tailscale-ssh), and [Mosh documentation](https://mosh.org/).
+- [ ] Run `bootstrap.ps1 -Stage HyperVEnable`; reboot if required.
+- [ ] Run `bootstrap.ps1 -Stage VmCreate -UbuntuIsoPath <verified ISO>`.
+- [ ] Install Ubuntu Server with OpenSSH.
+- [ ] Stop the VM, run `bootstrap.ps1 -Stage VmComplete` with the exact same `-Vm*` resource and host-reserve overrides used for `VmCreate` (omit them only when creation used defaults), and restart it.
+- [ ] Confirm the VM resource limits and autostart/stop actions.
+- [ ] Clone this repository under `~/code`.
+- [ ] Run Ubuntu bootstrap base and tools phases and archive `~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` with the commissioning record.
+- [ ] Authenticate GitHub, Codex, Claude and `herdr-ubuntu`.
 
-### Phase 5 — Repository migration
+### Phase 3 — Remote access
 
-- [ ] Clone each repository fresh into `~/code`.
-- [ ] Inventory `pyproject.toml`, requirements files, lockfiles, `package.json`, Cargo files, shell scripts, and CI definitions.
-- [ ] Replace machine-specific absolute paths.
-- [ ] Keep Excel workbook handoffs in `C:\HerdrExchange`; do not put the live workbook solely inside WSL.
-- [ ] Create missing dependency manifests, especially the Windows Excel requirements file.
-- [ ] Run repository tests separately for Linux-only work and Windows COM work.
+- [ ] Add separate laptop and phone SSH public keys.
+- [ ] Prove a second key session before disabling password authentication.
+- [ ] Test SSH and Mosh over cellular.
+- [ ] Test Herdr detach/reattach.
+- [ ] Cold-boot Windows without login and prove Ubuntu becomes reachable.
+- [ ] Confirm no home-router port forwarding.
 
-### Phase 6 — Persistence and recovery validation
+### Phase 4 — Excel bridge
 
-- [ ] Start Codex and Claude panes in Herdr, detach, SSH back in, and reattach.
-- [ ] Reboot Windows and confirm the Ubuntu distro, systemd, Tailscale, and SSH return automatically.
-- [ ] Confirm Herdr session restore behavior after a host reboot; do not confuse detach persistence with power-loss persistence.
-- [ ] Confirm Comet KVM console access when Windows networking is unavailable.
-- [ ] Confirm Fingerbot power control while the MS-A2 is off.
-- [ ] Test a remote Excel COM run while the interactive Windows user is logged in.
-- [ ] From the laptop, test Ubuntu SSH over Tailscale from outside the home LAN.
-- [ ] From the phone on cellular, test both SSH and Mosh over Tailscale.
-- [ ] Confirm no router port-forward exists for SSH or Mosh.
-- [ ] Add the deferred local backup drive and perform a bare-metal recovery test or at least recovery-media boot plus backup verification.
+- [ ] Create the restricted Windows SMB share and store its password.
+- [ ] Run `Test-HerdrExchangeBoundary.ps1` with the same recorded `-AcceptedFirewallRule` names used during share setup; prove the bridge account can write only the exchange subdirectories, cannot modify the exchange root, `C:\HerdrTools`, or `C:\HerdrReviewJobs`, and has no unconfined, unaccepted inbound TCP 445 exposure.
+- [ ] Mount and write-test it from Ubuntu.
+- [ ] Run the disposable Excel COM test.
+- [ ] Build and validate the narrow interactive Windows job runner.
+- [ ] Configure the OneDrive `Herdr Review Exchange` tree as Always keep on this device.
+- [ ] After the staging helper is implemented and tested, round-trip an STModel workbook through Inbox, hashed bridge staging, host-owned last-mile Excel review, and Outbox without using GitHub for the workbook handoff.
+- [ ] Confirm Excel remains unavailable before Windows login while Ubuntu remains available.
 
-## Dependency records to create
+### Phase 5 — Skills, plugins and projects
 
-The finished build should contain these small, restorable records in a private configuration repository or encrypted backup:
+- [ ] Record exact tool versions.
+- [ ] Port and test `herdr-coordination` on native Ubuntu PowerShell.
+- [ ] Install reviewed skill payload.
+- [ ] Install plugins through marketplaces and reconnect accounts.
+- [ ] Clone project repositories under `~/code`.
+- [ ] Rebuild project dependencies separately on Linux and Windows.
 
-- `windows-packages.md` or a reviewed WinGet export.
-- `requirements-windows.txt` for Excel automation.
-- `ubuntu-packages.txt` for explicitly installed APT packages.
-- `tool-versions.md` for Codex, Claude, Herdr, RTK, Rust, Bun, Node, Python, uv, Git, and GitHub CLI.
-- Sanitized Codex and Claude configuration templates with no tokens.
-- The source-controlled personal skills.
-- A plugin list and reconnection checklist, not the plugin caches.
-- Git configuration and the public SSH key fingerprint.
-- `.wslconfig`, `/etc/wsl.conf`, and service/autostart notes.
-- The Windows Excel launcher and a disposable COM smoke test.
+### Phase 6 — Hostinger VPS
 
-## Decisions still open
+- [ ] Follow `VPS-ACCESS.md`.
+- [ ] Preserve hPanel and Surface recovery.
+- [ ] Create a fresh snapshot.
+- [ ] Add an MS-A2-specific public key and prove SSH.
+- [ ] Add Tailscale only after public SSH works.
+- [ ] Avoid removing existing recovery access until sustained validation passes.
 
-- Which exact Ubuntu LTS release is installed by WSL at commissioning time.
-- Whether Node 24 is needed beyond context-mode/plugin requirements.
-- Whether the current RTK development branch is still required or a released build now contains the needed behavior.
-- Whether to generate a new GitHub SSH key for the MS-A2 (recommended) or securely migrate the Surface key.
-- Whether the Windows-side Excel environment should stay on Python 3.13 or use a repository-pinned alternative after full test execution.
-- The final backup client combination after the deferred local drive is purchased.
+### Phase 7 — Recovery
 
-## Immediate next artifact
+- [ ] Reboot and cold-boot with no Windows login.
+- [ ] Prove VM/Tailscale/SSH/Herdr availability.
+- [ ] Prove RDP and interactive Excel after login.
+- [ ] Prove Comet and Fingerbot recovery.
+- [ ] Add the deferred 20 TB drive.
+- [ ] Configure Veeam entire-computer images and Backblaze user-data backup.
+- [ ] Store and boot-test Veeam recovery media through Comet.
+- [ ] Perform a file restore and document a full replacement-hardware recovery drill.
 
-After the MS-A2 arrives, create a single commissioning script/checklist that performs only deterministic installs and checks. Keep login, Office activation, Tailscale enrollment, plugin connections, and other interactive authentication as explicit manual steps.
+## Rebuild records
+
+Keep these source-controlled and secret-free:
+
+- Windows and Ubuntu package manifests/versions.
+- Public SSH fingerprints and hostnames, never private keys.
+- VM resource settings and virtual-switch choice.
+- Skills source and Linux regression results.
+- Plugin list and reconnection checklist.
+- Windows Excel requirements and smoke test.
+- SMB/share configuration templates without credentials.
+- Backup schedule and restore-test dates.
+
+Keep passwords, tokens, recovery keys, SMB credentials, private SSH keys and Office workbooks outside Git.
+
+## Remaining commissioning decisions
+
+- Whether Node 24 is needed beyond plugin requirements.
+- Whether the pinned RTK revision remains necessary.
+- The validated `pytest` and Windows Python dependency lock.
+- The narrow command schema for the Windows Excel job runner.
+- The retention period and exact provenance-manifest schema for the OneDrive review exchange.
+- The exact deferred 20 TB backup-drive model and final Veeam/Backblaze schedule.

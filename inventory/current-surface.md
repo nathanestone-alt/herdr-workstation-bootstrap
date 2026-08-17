@@ -41,4 +41,3 @@ The Ubuntu bootstrap pins this exact commit by default. Change it only after ver
 - context-mode 1.0.169
 
 Reinstall through supported marketplaces and reconnect accounts. Do not copy caches.
-
