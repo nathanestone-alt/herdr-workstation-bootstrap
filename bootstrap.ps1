@@ -110,7 +110,9 @@ function Install-WindowsBase {
         'astral-sh.uv'
     ) | ForEach-Object { Install-WingetPackage $_ }
 
-    foreach ($directory in @('C:\dev', 'C:\HerdrExchange\in', 'C:\HerdrExchange\out', 'C:\HerdrExchange\logs', 'C:\HerdrTools')) {
+    # New-HerdrExchangeShare.ps1 owns creation and marking of C:\HerdrExchange.
+    # Pre-creating it here would make the later adoption guard reject a clean install.
+    foreach ($directory in @('C:\dev', 'C:\HerdrTools')) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
     Write-Host 'Windows base complete. Office activation, BitLocker recovery storage, Tailscale login, and UPS policy remain manual.'

@@ -21,10 +21,26 @@ Assert-Rejected -Path $env:ProgramData -Expected 'protected system path'
 Assert-Rejected -Path (Join-Path $env:SystemDrive 'Users') -Expected 'protected system path'
 Assert-Rejected -Path $env:SystemRoot -Expected 'protected system path' -AllowExisting
 Assert-Rejected -Path '\\?\C:\Windows' -Expected 'device namespace' -AllowExisting
-Assert-Rejected -Path '\\host\share\sub' -Expected 'local fixed drive'
+Assert-Rejected -Path '\\host\share\sub' -Expected 'UNC path'
 
 $fixture = Join-Path $PSScriptRoot "herdr-exchange-policy-$([Guid]::NewGuid().ToString('N'))"
 $fixtureProtectedPath = @(Join-Path $PSScriptRoot 'synthetic-protected-root')
+$bootstrapText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\bootstrap.ps1')
+$windowsBaseBody = ($bootstrapText -split 'function Enable-HyperV', 2)[0]
+if ($windowsBaseBody -match '[''"]C:\\HerdrExchange(?:\\|[''"])') {
+    throw 'WindowsBase must not pre-create C:\HerdrExchange; the share script owns its creation and marker.'
+}
+
+$nonFixedPath = 'Z:\HerdrExchange'
+try {
+    Resolve-HerdrExchangePath -Path $nonFixedPath -ProtectedRoots $fixtureProtectedPath `
+        -DriveTypeResolver { param($Root) [IO.DriveType]::Network } | Out-Null
+    throw 'Expected a synthetically non-fixed local drive to be rejected.'
+}
+catch {
+    if (-not $_.Exception.Message.Contains('local fixed drive', [StringComparison]::OrdinalIgnoreCase)) { throw }
+}
+
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
     try {
@@ -36,7 +52,18 @@ try {
     }
     $resolved = Resolve-HerdrExchangePath -Path $fixture -AllowExistingUnmanagedPath -ProtectedRoots $fixtureProtectedPath
     if (-not $resolved.Equals($fixture, [StringComparison]::OrdinalIgnoreCase)) { throw 'Explicit authorization returned the wrong path.' }
-    [IO.File]::WriteAllText((Join-Path $fixture '.herdr-exchange-root'), 'herdr-exchange-root-v1')
+    $markerPath = Join-Path $fixture '.herdr-exchange-root'
+    foreach ($invalidMarker in @('', 'herdr-exchange-root-v0', "herdr-exchange-root-v1`n")) {
+        [IO.File]::WriteAllText($markerPath, $invalidMarker)
+        try {
+            Resolve-HerdrExchangePath -Path $fixture -ExistingManagedShare -ProtectedRoots $fixtureProtectedPath | Out-Null
+            throw "Expected invalid marker content '$invalidMarker' to be rejected."
+        }
+        catch {
+            if (-not $_.Exception.Message.Contains('not marked as Herdr-managed', [StringComparison]::OrdinalIgnoreCase)) { throw }
+        }
+    }
+    [IO.File]::WriteAllText($markerPath, 'herdr-exchange-root-v1')
     try {
         Resolve-HerdrExchangePath -Path $fixture -ProtectedRoots $fixtureProtectedPath | Out-Null
         throw 'Expected a marker without a matching share to be rejected.'

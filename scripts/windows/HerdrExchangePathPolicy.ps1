@@ -14,7 +14,11 @@ function Resolve-HerdrExchangePath {
         [Parameter(Mandatory)][string]$Path,
         [switch]$AllowExistingUnmanagedPath,
         [switch]$ExistingManagedShare,
-        [AllowNull()][string[]]$ProtectedRoots
+        [AllowNull()][string[]]$ProtectedRoots,
+        [scriptblock]$DriveTypeResolver = {
+            param([string]$Root)
+            ([IO.DriveInfo]::new($Root)).DriveType
+        }
     )
 
     if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal) -or
@@ -23,7 +27,7 @@ function Resolve-HerdrExchangePath {
         throw "The SMB share path must not use a Windows device namespace: '$Path'."
     }
     if ($Path.StartsWith('\\', [StringComparison]::Ordinal)) {
-        throw "The SMB share path must be on a local fixed drive, not a UNC path: '$Path'."
+        throw "The SMB share path must not be a UNC path: '$Path'."
     }
     if (-not [IO.Path]::IsPathFullyQualified($Path)) {
         throw "The SMB share path must be absolute: '$Path'."
@@ -32,8 +36,9 @@ function Resolve-HerdrExchangePath {
     $driveRoot = [IO.Path]::GetPathRoot($fullPath)
     $resolved = $fullPath.TrimEnd('\')
     $pathRoot = $driveRoot.TrimEnd('\')
+    $driveType = & $DriveTypeResolver $driveRoot
     if ($driveRoot -notmatch '^[A-Za-z]:\\$' -or
-        [IO.DriveInfo]::new($driveRoot).DriveType -ne [IO.DriveType]::Fixed) {
+        $driveType -ne [IO.DriveType]::Fixed) {
         throw "The SMB share path must be on a local fixed drive: '$resolved'."
     }
     if ($resolved.Equals($pathRoot, [StringComparison]::OrdinalIgnoreCase)) {
