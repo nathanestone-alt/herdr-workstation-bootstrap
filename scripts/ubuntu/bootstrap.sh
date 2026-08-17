@@ -144,7 +144,7 @@ install_tools() {
 
   installed_rustup="$(rustup --version 2>/dev/null | awk 'NR == 1 { print $1 " " $2 }' || true)"
   if [[ "$installed_rustup" != "rustup $RUSTUP_VERSION" ]]; then
-    rustup_init="$(mktemp)"
+    rustup_init="$state_dir/rustup-init"
     download_verified "$RUSTUP_INIT_URL" "$RUSTUP_INIT_SHA256" "$rustup_init"
     chmod 0700 "$rustup_init"
     "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
