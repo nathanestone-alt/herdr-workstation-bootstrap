@@ -42,7 +42,7 @@ On the current Surface:
 4. Configure the CyberPower UPS for an orderly host shutdown.
 5. Do not enable automatic Windows sign-in.
 6. Install and activate 64-bit Microsoft 365 desktop Excel.
-7. Create, save, reopen and close a disposable workbook in `C:\HerdrExchange`.
+7. Create, save, reopen and close a disposable workbook in `%USERPROFILE%\Documents`.
 8. Resolve Excel Trust Center, add-in, activation and Protected View prompts.
 9. Sign in to the native Windows OneDrive client, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the full tree Always keep on this device.
 10. Do not make OneDrive, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or any child an Excel Trusted Location; trust macros, links and data connections only for a specifically verified workbook.

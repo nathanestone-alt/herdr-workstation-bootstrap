@@ -27,18 +27,66 @@ $fixture = Join-Path $PSScriptRoot "herdr-exchange-policy-$([Guid]::NewGuid().To
 $fixtureProtectedPath = @(Join-Path $PSScriptRoot 'synthetic-protected-root')
 $bootstrapText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\bootstrap.ps1')
 $windowsBaseBody = ($bootstrapText -split 'function Enable-HyperV', 2)[0]
+$expectedWindowsBaseDirectoryLoop = "foreach (`$directory in @('C:\dev', 'C:\HerdrTools')) {"
+if (-not $windowsBaseBody.Contains($expectedWindowsBaseDirectoryLoop, [StringComparison]::Ordinal)) {
+    throw 'WindowsBase directory allowlist changed; review it before allowing any additional host path.'
+}
 if ($windowsBaseBody -match '[''"]C:\\HerdrExchange(?:\\|[''"])') {
     throw 'WindowsBase must not pre-create C:\HerdrExchange; the share script owns its creation and marker.'
 }
 
 $nonFixedPath = 'Z:\HerdrExchange'
+foreach ($driveTypeUnderTest in [Enum]::GetValues([IO.DriveType]) | Where-Object { $_ -ne [IO.DriveType]::Fixed }) {
+    $resolver = { param($Root) $driveTypeUnderTest }.GetNewClosure()
+    try {
+        Resolve-HerdrExchangePath -Path $nonFixedPath -ProtectedRoots $fixtureProtectedPath `
+            -DriveTypeResolver $resolver | Out-Null
+        throw "Expected synthetic drive type '$driveTypeUnderTest' to be rejected."
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains('local fixed drive', [StringComparison]::OrdinalIgnoreCase)) { throw }
+    }
+}
+$fixedResolver = { param($Root) [IO.DriveType]::Fixed }
+$resolvedFixed = Resolve-HerdrExchangePath -Path $nonFixedPath -ProtectedRoots $fixtureProtectedPath -DriveTypeResolver $fixedResolver
+if (-not $resolvedFixed.Equals($nonFixedPath, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Synthetic fixed-drive validation returned the wrong path.'
+}
+
+$assignedRoots = @([IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name })
+$unassignedRoot = @(68..90 | ForEach-Object { "$([char]$_):\" } | Where-Object { $_ -notin $assignedRoots })[0]
+if ([string]::IsNullOrWhiteSpace($unassignedRoot)) { throw 'Could not find an unassigned drive letter for the default-resolver test.' }
+$unassignedPath = $unassignedRoot + 'HerdrExchange'
 try {
-    Resolve-HerdrExchangePath -Path $nonFixedPath -ProtectedRoots $fixtureProtectedPath `
-        -DriveTypeResolver { param($Root) [IO.DriveType]::Network } | Out-Null
-    throw 'Expected a synthetically non-fixed local drive to be rejected.'
+    Resolve-HerdrExchangePath -Path $unassignedPath -ProtectedRoots $fixtureProtectedPath | Out-Null
+    throw 'Expected the production drive-type resolver to reject an unassigned drive.'
 }
 catch {
     if (-not $_.Exception.Message.Contains('local fixed drive', [StringComparison]::OrdinalIgnoreCase)) { throw }
+}
+
+try {
+    Resolve-HerdrExchangePath -Path $env:SystemRoot -AllowExistingUnmanagedPath -ProtectedRoots $null | Out-Null
+    throw 'Expected an explicitly null protected-root set to be rejected.'
+}
+catch {
+    if (-not $_.Exception.Message.Contains('ProtectedRoots', [StringComparison]::OrdinalIgnoreCase)) { throw }
+}
+try {
+    Resolve-HerdrExchangePath -Path $nonFixedPath -ProtectedRoots $fixtureProtectedPath -DriveTypeResolver $null | Out-Null
+    throw 'Expected an explicitly null drive-type resolver to be rejected.'
+}
+catch {
+    if (-not $_.Exception.Message.Contains('DriveTypeResolver', [StringComparison]::OrdinalIgnoreCase)) { throw }
+}
+
+try {
+    Resolve-HerdrExchangePath -Path $PSScriptRoot -AllowExistingUnmanagedPath -ProtectedRoots $fixtureProtectedPath `
+        -DriveTypeResolver $fixedResolver | Out-Null
+    throw 'Expected a candidate ancestor of a protected root to be rejected.'
+}
+catch {
+    if (-not $_.Exception.Message.Contains('protected system path', [StringComparison]::OrdinalIgnoreCase)) { throw }
 }
 
 try {

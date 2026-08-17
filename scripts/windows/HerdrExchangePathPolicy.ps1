@@ -14,8 +14,8 @@ function Resolve-HerdrExchangePath {
         [Parameter(Mandatory)][string]$Path,
         [switch]$AllowExistingUnmanagedPath,
         [switch]$ExistingManagedShare,
-        [AllowNull()][string[]]$ProtectedRoots,
-        [scriptblock]$DriveTypeResolver = {
+        [ValidateNotNull()][string[]]$ProtectedRoots,
+        [ValidateNotNull()][scriptblock]$DriveTypeResolver = {
             param([string]$Root)
             ([IO.DriveInfo]::new($Root)).DriveType
         }

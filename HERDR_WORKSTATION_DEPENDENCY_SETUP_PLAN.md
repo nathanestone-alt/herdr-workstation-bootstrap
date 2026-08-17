@@ -205,7 +205,7 @@ Add and validate the reviewed Windows staging helper before the round-trip commi
 - [ ] Run `bootstrap.ps1 -Stage WindowsBase`.
 - [ ] Authenticate `herdr-win` in Tailscale and validate RDP.
 - [ ] Configure UPS and Comet/Fingerbot recovery paths.
-- [ ] Run Excel manually once.
+- [ ] Run Excel manually once using a disposable workbook in `%USERPROFILE%\Documents`; do not create `C:\HerdrExchange` before the guarded share step.
 
 ### Phase 2 — Hyper-V and Ubuntu
 
