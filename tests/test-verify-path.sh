@@ -14,12 +14,39 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 EOF
 printf '. "$HOME/.config/herdr-workstation/profile.sh"\n' > "$HOME/.profile"
 
-checked_commands=(git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs)
+checked_commands=(git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs uv python3.13 py)
 fixture_commands=("${checked_commands[@]}" systemctl)
 for command_name in "${fixture_commands[@]}"; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$managed_bin/$command_name"
   chmod +x "$managed_bin/$command_name"
 done
+cat > "$managed_bin/uv" <<'EOF'
+#!/usr/bin/env bash
+printf 'uv 0.12.5 (x86_64-unknown-linux-gnu)\n'
+EOF
+cat > "$managed_bin/python3.13" <<'EOF'
+#!/usr/bin/env bash
+printf 'Python 3.13.15\n'
+EOF
+cat > "$managed_bin/py" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == '-3.13' ]] || exit 2
+shift
+case "${1:-}" in
+  --version) printf 'Python 3.13.15\n' ;;
+  -c) printf '3.13.15|x86_64|linux\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$managed_bin/uv" "$managed_bin/python3.13" "$managed_bin/py"
+mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
+cat > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt" <<'EOF'
+uv_version=uv 0.12.5 (x86_64-unknown-linux-gnu)
+python3.13_version=Python 3.13.15
+py_3.13_version=Python 3.13.15
+py_3.13_probe=3.13.15|x86_64|linux
+EOF
 
 # Exercise verify.sh's real bash -lc branch without allowing Git Bash's
 # machine-wide /etc/profile to replace the fixture HOME. The wrapper still
@@ -46,7 +73,10 @@ printf '6.8.0-test\n'
 EOF
 cat > "$managed_bin/grep" <<'EOF'
 #!/bin/bash
-exit 1
+if [[ "${1:-}" == '-qi' && "${2:-}" == 'microsoft' ]]; then
+  exit 1
+fi
+exec /usr/bin/grep "$@"
 EOF
 cat > "$managed_bin/ps" <<'EOF'
 #!/bin/bash

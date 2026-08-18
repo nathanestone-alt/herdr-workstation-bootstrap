@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+lock_file="$repo_root/config/ubuntu-toolchain.lock"
+[[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
+# shellcheck disable=SC1091
+source "$repo_root/scripts/ubuntu/bootstrap.sh"
+validate_toolchain_lock || { echo 'Toolchain lock validation failed.' >&2; exit 22; }
 
 failures=0
 check_command() {
@@ -23,8 +30,69 @@ fi
 printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
 [[ "$(ps -p 1 -o comm=)" == "systemd" ]] || failures=$((failures + 1))
 
-for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs; do
+for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs uv python3.13 py; do
   check_command "$command"
+done
+
+check_exact_version() {
+  local name="$1"
+  local expected="$2"
+  local actual
+  if ! command -v "$name" >/dev/null 2>&1; then return; fi
+  if actual="$("$name" --version 2>&1)" && [[ "$actual" == "$expected" ]]; then
+    printf 'PASS exact version %-10s %s\n' "$name" "$actual"
+  else
+    printf 'FAIL exact version %-10s expected %s (got %s)\n' "$name" "$expected" "${actual:-unavailable}"
+    failures=$((failures + 1))
+  fi
+}
+
+check_exact_version uv "uv $UV_VERSION ($UV_PLATFORM)"
+check_exact_version python3.13 "Python $PYTHON_VERSION"
+
+if command -v uv >/dev/null 2>&1; then
+  uv_path="$(command -v uv)"
+  [[ "$uv_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL uv is not managed: $uv_path"; failures=$((failures + 1)); }
+fi
+if command -v python3.13 >/dev/null 2>&1; then
+  python_path="$(command -v python3.13)"
+  [[ "$python_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL python3.13 is not managed: $python_path"; failures=$((failures + 1)); }
+fi
+if command -v py >/dev/null 2>&1; then
+  py_path="$(command -v py)"
+  [[ "$py_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL py is not managed: $py_path"; failures=$((failures + 1)); }
+  if py_probe="$(py -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")' 2>&1)" && [[ "$py_probe" == "$PYTHON_VERSION|x86_64|linux" ]]; then
+    echo "PASS py -3.13 selects $py_probe"
+  else
+    echo "FAIL py -3.13 selected '${py_probe:-unavailable}'"
+    failures=$((failures + 1))
+  fi
+  if py --list >/dev/null 2>&1; then
+    echo 'FAIL py accepted unsupported --list option'
+    failures=$((failures + 1))
+  else
+    py_status=$?
+    if [[ "$py_status" -eq 2 ]]; then
+      echo 'PASS py rejects unsupported --list option'
+    else
+      echo "FAIL py rejected --list with unexpected status $py_status"
+      failures=$((failures + 1))
+    fi
+  fi
+fi
+
+toolchain_receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+for receipt_line in \
+  "uv_version=uv $UV_VERSION ($UV_PLATFORM)" \
+  "python3.13_version=Python $PYTHON_VERSION" \
+  "py_3.13_version=Python $PYTHON_VERSION" \
+  "py_3.13_probe=$PYTHON_VERSION|x86_64|linux"; do
+  if [[ -f "$toolchain_receipt" ]] && grep -Fqx -- "$receipt_line" "$toolchain_receipt"; then
+    echo "PASS receipt $receipt_line"
+  else
+    echo "FAIL receipt missing $receipt_line"
+    failures=$((failures + 1))
+  fi
 done
 login_shell="$(command -v bash)"
 login_path="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc 'printf "%s" "$PATH"')"

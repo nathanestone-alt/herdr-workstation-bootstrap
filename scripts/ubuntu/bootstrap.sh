@@ -15,12 +15,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
 state_dir="${HOME}/.local/state/herdr-workstation-bootstrap"
 bin_dir="${HOME}/.local/bin"
-mkdir -p "$state_dir" "$bin_dir"
 
 [[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
 # shellcheck disable=SC1090
 source "$lock_file"
 required_lock_keys=(
+  UV_VERSION UV_PLATFORM UV_URL UV_SHA256
+  PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256
   RTK_REPO_URL RTK_REF
   POWERSHELL_VERSION POWERSHELL_URL POWERSHELL_SHA256
   TAILSCALE_VERSION TAILSCALE_INSTALLER_URL TAILSCALE_INSTALLER_SHA256
@@ -31,9 +32,97 @@ required_lock_keys=(
 for key in "${required_lock_keys[@]}"; do
   [[ -n "${!key:-}" ]] || { echo "Lock key '$key' is empty." >&2; exit 22; }
 done
-for key in POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
+for key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
   [[ "${!key}" =~ ^[0-9a-f]{64}$ ]] || { echo "Lock key '$key' is not a lowercase SHA-256 value." >&2; exit 22; }
 done
+
+validate_toolchain_lock() {
+  for lock_hash_key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
+    [[ "${!lock_hash_key:-}" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "Lock key '$lock_hash_key' is not a lowercase SHA-256 value." >&2
+      return 1
+    }
+  done
+  [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'UV_VERSION is not a pinned semantic version.' >&2; return 1;
+  }
+  [[ "$UV_PLATFORM" == 'x86_64-unknown-linux-gnu' ]] || {
+    echo 'UV_PLATFORM is not the supported Ubuntu x86-64 target.' >&2; return 1;
+  }
+  [[ "$UV_URL" == "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$UV_PLATFORM.tar.gz" ]] || {
+    echo 'UV_URL does not identify the pinned official uv artifact.' >&2; return 1;
+  }
+  [[ "$PYTHON_VERSION" =~ ^3\.13\.[0-9]+$ ]] || {
+    echo 'PYTHON_VERSION is not a pinned Python 3.13 release.' >&2; return 1;
+  }
+  [[ "$PYTHON_RELEASE" =~ ^[0-9]{8}$ ]] || {
+    echo 'PYTHON_RELEASE is not a pinned python-build-standalone release.' >&2; return 1;
+  }
+  [[ "$PYTHON_PLATFORM" == 'x86_64-unknown-linux-gnu' ]] || {
+    echo 'PYTHON_PLATFORM is not the supported Ubuntu x86-64 target.' >&2; return 1;
+  }
+  expected_python_archive="cpython-$PYTHON_VERSION+$PYTHON_RELEASE-$PYTHON_PLATFORM-install_only_stripped.tar.gz"
+  [[ "$PYTHON_ARCHIVE" == "$expected_python_archive" ]] || {
+    echo 'PYTHON_ARCHIVE does not match the pinned Python release inputs.' >&2; return 1;
+  }
+  expected_python_url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/${PYTHON_ARCHIVE//+/%2B}"
+  [[ "$PYTHON_URL" == "$expected_python_url" ]] || {
+    echo 'PYTHON_URL does not identify the pinned official CPython artifact.' >&2; return 1;
+  }
+  return 0
+}
+
+validate_platform() {
+  [[ "$(uname -s)" == 'Linux' && "$(uname -m)" == 'x86_64' && "$(getconf LONG_BIT)" == '64' ]] || {
+    echo 'This bootstrap lock supports only 64-bit x86 Linux.' >&2
+    return 1
+  }
+}
+
+check_uv_version() {
+  local executable="$1"
+  local expected="uv $UV_VERSION ($UV_PLATFORM)"
+  local actual
+  actual="$("$executable" --version 2>&1)" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+check_python_version() {
+  local executable="$1"
+  local actual
+  actual="$("$executable" --version 2>&1)" || return 1
+  [[ "$actual" == "Python $PYTHON_VERSION" ]]
+}
+
+check_python_platform() {
+  local executable="$1"
+  local actual
+  actual="$("$executable" -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")')" || return 1
+  [[ "$actual" == "$PYTHON_VERSION|x86_64|linux" ]]
+}
+
+write_py_compat() {
+  local wrapper="$bin_dir/py"
+  local replacement
+  replacement="$(mktemp)"
+  cat > "$replacement" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 || "$1" != '-3.13' ]]; then
+  echo 'This managed py command supports only the -3.13 selector.' >&2
+  exit 2
+fi
+shift
+wrapper_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$wrapper_dir/python3.13" "$@"
+EOF
+  chmod 0755 "$replacement"
+  if ! cmp -s "$replacement" "$wrapper" 2>/dev/null; then
+    install -m 0755 "$replacement" "$wrapper"
+  fi
+  rm -f "$replacement"
+}
 
 download_verified() {
   local url="$1"
@@ -45,6 +134,90 @@ download_verified() {
     echo "SHA-256 verification failed for $url" >&2
     rm -f "$destination"
     exit 23
+  }
+}
+
+install_python_toolchain() {
+  validate_toolchain_lock || exit 22
+  validate_platform || exit 20
+  mkdir -p "$state_dir" "$bin_dir"
+
+  managed_root="$HOME/.local/lib/herdr-workstation"
+  uv_parent="$managed_root/uv"
+  python_parent="$managed_root/python"
+  uv_dir="$uv_parent/$UV_VERSION/$UV_PLATFORM"
+  python_dir="$python_parent/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+  mkdir -p "$uv_parent/$UV_VERSION" "$python_parent"
+
+  if [[ ! -x "$uv_dir/uv" ]] || ! check_uv_version "$uv_dir/uv"; then
+    uv_archive="$(mktemp --suffix=.tar.gz)"
+    uv_stage="$(mktemp -d)"
+    download_verified "$UV_URL" "$UV_SHA256" "$uv_archive"
+    tar -xzf "$uv_archive" -C "$uv_stage"
+    mapfile -t uv_candidates < <(find "$uv_stage" -type f -name uv -perm -u+x -print)
+    if (( ${#uv_candidates[@]} != 1 )); then
+      echo 'The pinned uv archive did not contain exactly one executable uv.' >&2
+      exit 24
+    fi
+    check_uv_version "${uv_candidates[0]}" || {
+      echo "uv artifact version does not match the lock ($UV_VERSION)." >&2
+      exit 24
+    }
+    uv_install_stage="$(mktemp -d "$uv_parent/.install.XXXXXX")"
+    install -m 0755 "${uv_candidates[0]}" "$uv_install_stage/uv"
+    [[ "$uv_dir" == "$managed_root/"* ]] || { echo 'Unsafe uv managed path.' >&2; exit 24; }
+    if [[ -e "$uv_dir" || -L "$uv_dir" ]]; then rm -rf -- "$uv_dir"; fi
+    mv -- "$uv_install_stage" "$uv_dir"
+    rm -rf -- "$uv_stage"
+    rm -f -- "$uv_archive"
+  fi
+
+  if [[ ! -x "$python_dir/bin/python3.13" ]] || ! check_python_version "$python_dir/bin/python3.13" || ! check_python_platform "$python_dir/bin/python3.13"; then
+    python_archive="$(mktemp --suffix=.tar.gz)"
+    python_stage="$(mktemp -d)"
+    download_verified "$PYTHON_URL" "$PYTHON_SHA256" "$python_archive"
+    tar -xzf "$python_archive" -C "$python_stage"
+    mapfile -t python_candidates < <(find "$python_stage" -type f -path '*/bin/python3.13' -perm -u+x -print)
+    if (( ${#python_candidates[@]} != 1 )); then
+      echo 'The pinned CPython archive did not contain exactly one executable python3.13.' >&2
+      exit 24
+    fi
+    check_python_version "${python_candidates[0]}" && check_python_platform "${python_candidates[0]}" || {
+      echo "CPython artifact does not match the lock ($PYTHON_VERSION, $PYTHON_PLATFORM)." >&2
+      exit 24
+    }
+    python_source_root="$(cd "$(dirname "${python_candidates[0]}")/.." && pwd)"
+    python_install_stage="$(mktemp -d "$python_parent/.install.XXXXXX")"
+    cp -a "$python_source_root"/. "$python_install_stage"/
+    check_python_version "$python_install_stage/bin/python3.13" && check_python_platform "$python_install_stage/bin/python3.13" || {
+      echo 'Staged CPython runtime failed its exact version/platform check.' >&2
+      exit 24
+    }
+    [[ "$python_dir" == "$managed_root/"* ]] || { echo 'Unsafe Python managed path.' >&2; exit 24; }
+    if [[ -e "$python_dir" || -L "$python_dir" ]]; then rm -rf -- "$python_dir"; fi
+    mv -- "$python_install_stage" "$python_dir"
+    rm -rf -- "$python_stage"
+    rm -f -- "$python_archive"
+  fi
+
+  for managed_link in "$bin_dir/uv" "$bin_dir/python3.13"; do
+    if [[ -e "$managed_link" && ! -L "$managed_link" ]]; then
+      echo "Refusing to replace non-managed path: $managed_link" >&2
+      exit 24
+    fi
+  done
+  ln -sfn "$uv_dir/uv" "$bin_dir/uv"
+  ln -sfn "$python_dir/bin/python3.13" "$bin_dir/python3.13"
+  write_py_compat
+  check_uv_version "$bin_dir/uv" || { echo 'Managed uv failed its final version check.' >&2; exit 24; }
+  check_python_version "$bin_dir/python3.13" && check_python_platform "$bin_dir/python3.13" || {
+    echo 'Managed python3.13 failed its final version/platform check.' >&2
+    exit 24
+  }
+  py_probe="$("$bin_dir/py" -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")')"
+  [[ "$py_probe" == "$PYTHON_VERSION|x86_64|linux" ]] || {
+    echo 'Managed py -3.13 did not select the pinned CPython runtime.' >&2
+    exit 24
   }
 }
 
@@ -99,6 +272,7 @@ converge_profile_hook() {
 }
 
 install_base() {
+  mkdir -p "$state_dir" "$bin_dir"
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     apt-transport-https build-essential ca-certificates cifs-utils curl git git-lfs gh gnupg jq mosh \
@@ -137,6 +311,7 @@ install_base() {
 }
 
 install_tools() {
+  mkdir -p "$state_dir" "$bin_dir"
   if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
     echo 'systemd is required before the tools phase.' >&2
     exit 21
@@ -212,6 +387,8 @@ install_tools() {
     converge_profile_hook "$HOME/.bash_login" true
   fi
 
+  install_python_toolchain
+
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
     archive="$(mktemp --suffix=.tar.gz)"
@@ -254,6 +431,13 @@ install_tools() {
   manifest="$state_dir/toolchain-manifest.txt"
   {
     printf 'lock_sha256=%s\n' "$(sha256sum "$lock_file" | awk '{print $1}')"
+    printf 'uv_version=%s\n' "$("$bin_dir/uv" --version)"
+    printf 'python3.13_version=%s\n' "$("$bin_dir/python3.13" --version 2>&1)"
+    printf 'py_3.13_version=%s\n' "$("$bin_dir/py" -3.13 --version 2>&1)"
+    printf 'py_3.13_probe=%s\n' "$("$bin_dir/py" -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")')"
+    printf 'uv_platform=%s\n' "$UV_PLATFORM"
+    printf 'python_platform=%s\n' "$PYTHON_PLATFORM"
+    printf 'python_release=%s\n' "$PYTHON_RELEASE"
     printf 'tailscale=%s\n' "$(tailscale version | head -n 1)"
     printf 'rustup=%s\n' "$(rustup --version | head -n 1)"
     printf 'rustc=%s\n' "$(rustc --version)"
@@ -279,6 +463,7 @@ install_tools() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "$phase" in
     base) install_base ;;
+    validate-lock) validate_toolchain_lock; echo 'Ubuntu toolchain lock validation passed.' ;;
     tools) install_tools ;;
     all) install_base; install_tools ;;
     *) echo "Unsupported phase: $phase" >&2; exit 2 ;;

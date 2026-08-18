@@ -1,4 +1,16 @@
 # Reviewed x86-64 Ubuntu toolchain inputs. Update versions and checksums together.
+# Provenance: https://api.github.com/repos/astral-sh/uv/releases/assets/514851093
+# Provenance: https://api.github.com/repos/astral-sh/python-build-standalone/releases/assets/505154447
+UV_VERSION=0.12.5
+UV_PLATFORM=x86_64-unknown-linux-gnu
+UV_URL=https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-unknown-linux-gnu.tar.gz
+UV_SHA256=68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2
+PYTHON_VERSION=3.13.15
+PYTHON_RELEASE=20260807
+PYTHON_PLATFORM=x86_64-unknown-linux-gnu
+PYTHON_ARCHIVE=cpython-3.13.15+20260807-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+PYTHON_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.13.15%2B20260807-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+PYTHON_SHA256=faae10a9faa9bec06da009ac69326cc1d9691dc138fec6a1b69159dff1781f35
 RTK_REPO_URL=https://github.com/nathanestone-alt/rtk.git
 RTK_REF=c1819ceff1ab8d75b88c1ff7a63f497914e8fe99
 POWERSHELL_VERSION=7.6.4

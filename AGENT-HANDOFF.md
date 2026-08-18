@@ -85,6 +85,11 @@ bash scripts/ubuntu/bootstrap.sh --phase tools
 ~~~
 
 This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
+The tools phase also installs the pinned x86-64 uv/CPython 3.13 runtime under
+user-owned managed paths, exposes `python3.13`, and provides the narrow
+fail-closed `py -3.13` compatibility command. Archive
+`~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` after
+verification.
 
 Have the user authenticate:
 
@@ -142,7 +147,14 @@ Configure the Windows OneDrive client with `Herdr Review Exchange\Inbox`, `Outbo
 4. Reconnect external apps only with user approval.
 5. Run `bash scripts/ubuntu/install-payload.sh`.
 
-The payload installer intentionally blocks while `herdr-coordination` contains Windows-specific paths/options. Installing native `pwsh` is necessary but not sufficient. Port the coordination skill to Linux, replace Windows-only paths and process options, and run its regression suite under Ubuntu before enabling it.
+The payload installer first requires a clean identified Git commit whose
+tracked installable files exactly match `config/payload-manifest.sha256`, then
+stages and verifies both managed destinations before committing the copy. It
+records `~/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt`.
+It intentionally blocks while `herdr-coordination` contains Windows-specific
+paths/options. Installing native `pwsh` is necessary but not sufficient. Port
+the coordination skill to Linux, replace Windows-only paths and process
+options, and run its regression suite under Ubuntu before enabling it.
 
 ## Phase I — Hostinger VPS
 

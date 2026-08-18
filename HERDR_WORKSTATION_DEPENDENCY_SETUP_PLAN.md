@@ -95,6 +95,9 @@ pkg-config ripgrep rsync unzip zip
 Tooling layer:
 
 - Native PowerShell 7 from Microsoft's Ubuntu package repository.
+- uv `0.12.5` and CPython `3.13.15` x86-64 from the exact official artifacts
+  pinned in `config/ubuntu-toolchain.lock`, converged under user-owned managed
+  paths and exposed as `python3.13` plus the fail-closed `py -3.13` command.
 - Rust stable x86-64 via `rustup`.
 - RTK from `https://github.com/nathanestone-alt/rtk.git`, initially pinned to `c1819ceff1ab8d75b88c1ff7a63f497914e8fe99` until a newer reviewed revision is selected.
 - Codex CLI, Claude Code and stable Linux Herdr from their official installers.
@@ -215,7 +218,10 @@ Add and validate the reviewed Windows staging helper before the round-trip commi
 - [ ] Stop the VM, run `bootstrap.ps1 -Stage VmComplete` with the exact same `-Vm*` resource and host-reserve overrides used for `VmCreate` (omit them only when creation used defaults), and restart it.
 - [ ] Confirm the VM resource limits and autostart/stop actions.
 - [ ] Clone this repository under `~/code`.
-- [ ] Run Ubuntu bootstrap base and tools phases and archive `~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` with the commissioning record.
+- [ ] Run Ubuntu bootstrap base and tools phases, prove `uv`, CPython 3.13,
+  `python3.13` and `py -3.13`, and archive
+  `~/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt` with the
+  commissioning record.
 - [ ] Authenticate GitHub, Codex, Claude and `herdr-ubuntu`.
 
 ### Phase 3 — Remote access
@@ -242,7 +248,8 @@ Add and validate the reviewed Windows staging helper before the round-trip commi
 
 - [ ] Record exact tool versions.
 - [ ] Port and test `herdr-coordination` on native Ubuntu PowerShell.
-- [ ] Install reviewed skill payload.
+- [ ] Confirm `config/payload-manifest.sha256`, run the clean-commit-gated
+  payload installer, and archive its deterministic runtime receipt.
 - [ ] Install plugins through marketplaces and reconnect accounts.
 - [ ] Clone project repositories under `~/code`.
 - [ ] Rebuild project dependencies separately on Linux and Windows.
