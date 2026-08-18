@@ -1,6 +1,8 @@
 #Requires -Version 7.0
 [CmdletBinding()]
-param()
+param(
+    [switch]$RunPayloadRegression
+)
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -79,6 +81,39 @@ try {
 }
 catch {
     $failures.Add("Behavioral regression test failed: tests\Test-BootstrapVmDispatcher.ps1 ($($_.Exception.Message))")
+}
+
+$payloadRegressionTests = @(
+    'payload\agents-skills\herdr-coordination\scripts\test_claude_session_refresh.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_codex_session_refresh.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_coordination.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_naming_lifecycle.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_pane_registry.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_pane_registry_cli.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_skill_compatibility.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_workflow.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_workflow_stress.ps1',
+    'payload\agents-skills\st-herdr-dispatch\scripts\test_st_herdr_dispatch.ps1'
+)
+foreach ($relativeTest in $payloadRegressionTests) {
+    if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $relativeTest))) {
+        $failures.Add("Reconciled payload regression test missing: $relativeTest")
+    }
+}
+if ($RunPayloadRegression) {
+    if (-not $IsWindows) {
+        $failures.Add('Payload behavioral regression suites require their Windows-only fixture runtime; use the static validator on Ubuntu and run -RunPayloadRegression on Windows.')
+    }
+    else {
+        foreach ($relativeTest in $payloadRegressionTests) {
+            try {
+                & (Join-Path $RepoRoot $relativeTest)
+            }
+            catch {
+                $failures.Add("Payload behavioral regression test failed: $relativeTest ($($_.Exception.Message))")
+            }
+        }
+    }
 }
 
 $requiredFiles = @(

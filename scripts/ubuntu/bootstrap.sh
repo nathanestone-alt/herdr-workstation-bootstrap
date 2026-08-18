@@ -144,11 +144,13 @@ install_tools() {
 
   installed_rustup="$(rustup --version 2>/dev/null | awk 'NR == 1 { print $1 " " $2 }' || true)"
   if [[ "$installed_rustup" != "rustup $RUSTUP_VERSION" ]]; then
-    rustup_init="$(mktemp)"
+    rustup_temp_dir="$(mktemp -d)"
+    # rustup-init dispatches by argv[0], so its executable basename must remain exact.
+    rustup_init="$rustup_temp_dir/rustup-init"
     download_verified "$RUSTUP_INIT_URL" "$RUSTUP_INIT_SHA256" "$rustup_init"
     chmod 0700 "$rustup_init"
     "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
-    rm -f "$rustup_init"
+    rm -rf "$rustup_temp_dir"
   fi
   if [[ -f "$HOME/.cargo/env" ]]; then
     # shellcheck disable=SC1091
@@ -158,11 +160,15 @@ install_tools() {
     echo 'The locked rustup is present but rustup/cargo are not both discoverable. Use the default ~/.cargo layout or set CARGO_HOME before retrying.' >&2
     exit 24
   }
+  rustup set auto-self-update disable
   [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
     echo "rustup version does not match lock after reinstall ($RUSTUP_VERSION)." >&2; exit 24;
   }
   rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
   rustup default "$RUST_TOOLCHAIN"
+  [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
+    echo "rustup version changed after toolchain installation ($RUSTUP_VERSION)." >&2; exit 24;
+  }
 
   mkdir -p "$HOME/src"
   if [[ ! -d "$HOME/src/rtk/.git" ]]; then

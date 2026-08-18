@@ -31,6 +31,9 @@ param(
 
     [string]$PreviousWork,
 
+    [ValidateSet('assignment', 'retirement')]
+    [string]$NamingLifecycle = 'assignment',
+
     [string]$CanonicalName,
 
     [string]$Subtitle,
@@ -60,7 +63,7 @@ param(
 
     [string]$WorkflowRef,
 
-    [string]$WorkflowLedgerPath = "C:\tmp\herdr-workflow-ledger.jsonl",
+    [string]$WorkflowLedgerPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-workflow-ledger.jsonl"),
 
     [string]$ExpectedAgent,
 
@@ -70,7 +73,7 @@ param(
 
     [string]$ExpectedTabId,
 
-    [string]$PaneRegistryPath = "C:\tmp\herdr-pane-registry.jsonl",
+    [string]$PaneRegistryPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-pane-registry.jsonl"),
 
     [string]$ExpectedRegistryId,
 
@@ -94,14 +97,14 @@ param(
     [ValidateRange(1000, 3600000)]
     [int]$EarlyAlertMs = 60000,
 
-    [string]$WatchLogPath = "C:\tmp\herdr-coordination-watch.md",
+    [string]$WatchLogPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination-watch.md"),
 
     [string]$LogPath = $(
         if ($env:HERDR_COORDINATION_LOG) {
             $env:HERDR_COORDINATION_LOG
         }
         else {
-            "C:\tmp\herdr-coordination.md"
+            (Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination.md")
         }
     )
 )
@@ -239,6 +242,7 @@ function Get-AgentProcessLease {
             Where-Object { [string]$_.name -match $namePattern }
     )
     if ($agentProcesses.Count -ne 1 -and
+        $IsWindows -and
         (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
         try {
             $agentProcesses = @(
@@ -292,6 +296,7 @@ function Test-CurrentProcessDescendsFrom {
     param([Parameter(Mandatory)][int]$AncestorProcessId)
 
     if ($AncestorProcessId -le 0 -or
+        -not $IsWindows -or
         -not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
         return $false
     }
@@ -977,7 +982,15 @@ function Start-QueuedPaneWatcher {
             "-ExpectedAgentPid", "$($TargetProcessLease.agent_pid)"
         )
     }
-    $process = Start-Process -FilePath $pwsh -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $startParameters = @{
+        FilePath = $pwsh
+        ArgumentList = $arguments
+        PassThru = $true
+    }
+    if ($IsWindows) {
+        $startParameters['WindowStyle'] = 'Hidden'
+    }
+    $process = Start-Process @startParameters
     return [pscustomobject]@{
         started = $true
         completed = $false
@@ -1072,10 +1085,11 @@ function Add-PaneLabelsToMessage {
     param([Parameter(Mandatory)][string]$Text)
 
     $cache = @{}
-    # RECIPIENT-PANE, APPLIED-PANE, and APPLIED-COORDINATOR are machine-readable
-    # provenance; keep them free of the human-facing label enrichment applied to
-    # ordinary pane references.
-    $panePattern = "(?<!\[RECIPIENT-PANE )(?<!\[APPLIED-PANE )(?<!\[APPLIED-COORDINATOR )\bw[0-9A-Za-z]+:p[0-9A-Za-z]+\b"
+    # Protocol provenance fields are machine-readable; keep them free of the
+    # human-facing label enrichment applied to ordinary pane references.
+    $panePattern = "(?<!requester_pane=)(?<!\[RECIPIENT-PANE )(?<!\[APPLIED-PANE )(?<!\[APPLIED-COORDINATOR )" +
+        "(?<!\[DISPOSED-PANE )(?<!\[DISPOSED-COORDINATOR )" +
+        "(?<!\[APPLY-PANE )(?<!\[APPLY-COORDINATOR )\bw[0-9A-Za-z]+:p[0-9A-Za-z]+\b"
     return [regex]::Replace($Text, $panePattern, [Text.RegularExpressions.MatchEvaluator]{
             param($match)
 
@@ -1119,7 +1133,7 @@ function Add-CoordinationRouteAnnotation {
     $senderDisplay = Get-PaneRouteDisplay -RoutePaneId $Sender
     $recipientDisplay = Get-CoordinationRecipientDisplay -Recipient $Recipient
     $route = "[ROUTE $senderDisplay -> $recipientDisplay]"
-    if ($enrichedBody -match "^(?<reference>\[(?:HR|HA|HN|HC|WF|WE):[^\]]+\])(?:\s+(?<remainder>.*))?$") {
+    if ($enrichedBody -match "^(?<reference>\[(?:HR|HA|HN|HD|HI|HC|WF|WE):[^\]]+\])(?:\s+(?<remainder>.*))?$") {
         $remainder = [string]$Matches["remainder"]
         if ([string]::IsNullOrWhiteSpace($remainder)) {
             return "$($Matches['reference']) $route"
@@ -1939,7 +1953,7 @@ function ConvertTo-CoordinationMetadataBase64 {
 }
 
 function ConvertFrom-CoordinationMetadataBase64 {
-    param([Parameter(Mandatory)][string]$Text)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
 }
@@ -2462,6 +2476,20 @@ $NamingAppliedBodyPattern =
     '\s+\[APPLIED-COORDINATOR (?<coordinator>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
     '\s+applied; canonical_name=(?<name>[^;\s]+); subtitle_b64=(?<subtitle>[A-Za-z0-9+/=]*);' +
     ' coordinator_session=(?<coordsession>[^;\s]+); target_session=(?<targetsession>[^;\s]+)$'
+$NamingDispositionBodyPattern =
+    '^\[HD:(?<proof>[0-9a-fA-F]{8})\](?:\s+\[ROUTE[^\]]+\])?' +
+    '\s+\[DISPOSED re (?<relay>\[HR:[0-9a-fA-F]{8}\])\]' +
+    '\s+\[DISPOSITION (?<disposition>[a-z0-9_]+)\]' +
+    '\s+\[DISPOSED-PANE (?<pane>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
+    '\s+\[DISPOSED-COORDINATOR (?<coordinator>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
+    '\s+disposed; coordinator_session=(?<coordsession>[^;\s]+); requester_session=(?<requestersession>[^;\s]+); absence=(?<absence>[a-z0-9_]+)$'
+$NamingApplyIntentBodyPattern =
+    '^\[HI:(?<proof>[0-9a-fA-F]{8})\](?:\s+\[ROUTE[^\]]+\])?' +
+    '\s+\[APPLY-STARTED re (?<relay>\[HR:[0-9a-fA-F]{8}\])\]' +
+    '\s+\[APPLY-PANE (?<pane>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
+    '\s+\[APPLY-TAB (?<tab>w[0-9A-Za-z]+:t[0-9A-Za-z]+)\]' +
+    '\s+\[APPLY-COORDINATOR (?<coordinator>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
+    '\s+started; coordinator_session=(?<coordsession>[^;\s]+); target_session=(?<targetsession>[^;\s]+)$'
 
 function Assert-NamingAppliedReference {
     param([Parameter(Mandatory)][string]$Reference)
@@ -2477,6 +2505,12 @@ function ConvertTo-NamingAppliedProof {
     if ([string]$Record.body -notmatch $NamingAppliedBodyPattern) {
         return $null
     }
+    try {
+        $subtitle = ConvertFrom-CoordinationMetadataBase64 -Text ([string]$Matches['subtitle'])
+    }
+    catch {
+        return $null
+    }
     return [pscustomobject]@{
         proof_ref = "[HN:$($Matches['proof'])]"
         relay_ref = [string]$Matches['relay']
@@ -2484,7 +2518,7 @@ function ConvertTo-NamingAppliedProof {
         target_tab_id = [string]$Matches['tab']
         coordinator_pane_id = [string]$Matches['coordinator']
         canonical_name = [string]$Matches['name']
-        subtitle = ConvertFrom-CoordinationMetadataBase64 -Text ([string]$Matches['subtitle'])
+        subtitle = $subtitle
         coordinator_session = [string]$Matches['coordsession']
         target_session = [string]$Matches['targetsession']
         writer_pane_id = [string]$Record.from
@@ -2519,6 +2553,25 @@ function Test-NamingAppliedProof {
         [Parameter(Mandatory)][object]$Proof
     )
 
+    try {
+        $fields = Get-NamingRequestFields -Payload ([string]$Relay.payload)
+    }
+    catch {
+        return $false
+    }
+    $expectedTargetSession = if ($fields.ContainsKey('requester_session')) {
+        [string]$fields['requester_session']
+    }
+    else {
+        $null
+    }
+    $targetSessionMatches = if ([string]::IsNullOrWhiteSpace($expectedTargetSession)) {
+        -not [string]::IsNullOrWhiteSpace([string]$Proof.target_session)
+    }
+    else {
+        [string]$Proof.target_session -eq $expectedTargetSession
+    }
+
     # A proof only counts when the coordinator that the request was routed to is
     # both the author and the declared applier, and the pane it named is exactly
     # the pane that asked. Anything else is a forged or misdirected proof.
@@ -2528,7 +2581,7 @@ function Test-NamingAppliedProof {
         [string]$Proof.writer_pane_id -eq [string]$Relay.recipient_pane_id -and
         [string]$Proof.target_pane_id -eq [string]$Relay.sender -and
         [string]$Proof.returned_to -eq [string]$Relay.sender -and
-        -not [string]::IsNullOrWhiteSpace([string]$Proof.target_session) -and
+        $targetSessionMatches -and
         ([string]::IsNullOrWhiteSpace([string]$Relay.recipient_session) -or
             [string]$Proof.coordinator_session -eq [string]$Relay.recipient_session)
     )
@@ -2545,11 +2598,160 @@ function Get-ValidNamingAppliedProofs {
     return @($proofs | Where-Object { Test-NamingAppliedProof -Relay $Relay -Proof $_ })
 }
 
+function ConvertTo-NamingDispositionProof {
+    param([Parameter(Mandatory)][object]$Record)
+
+    if ([string]$Record.body -notmatch $NamingDispositionBodyPattern) {
+        return $null
+    }
+    return [pscustomobject]@{
+        proof_ref = ('[HD:{0}]' -f $Matches['proof'])
+        relay_ref = [string]$Matches['relay']
+        disposition = [string]$Matches['disposition']
+        target_pane_id = [string]$Matches['pane']
+        coordinator_pane_id = [string]$Matches['coordinator']
+        coordinator_session = [string]$Matches['coordsession']
+        requester_session = [string]$Matches['requestersession']
+        absence = [string]$Matches['absence']
+        writer_pane_id = [string]$Record.from
+        returned_to = [string]$Record.to
+        entry = [string]$Record.line
+        stamp = if ($Record.PSObject.Properties['stamp']) { [string]$Record.stamp } else { $null }
+    }
+}
+
+function Get-NamingDispositionProofs {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Reference,
+        [object[]]$Records
+    )
+
+    Assert-RelayReference -Reference $Reference
+    $candidateRecords = if ($null -ne $Records) { @($Records) } else { @(Get-CoordinationLogRecords -Path $Path) }
+    return @($candidateRecords | ForEach-Object {
+            $proof = ConvertTo-NamingDispositionProof -Record $_
+            if ($null -ne $proof -and [string]$proof.relay_ref -eq $Reference) { $proof }
+        })
+}
+
+function Test-NamingDispositionProof {
+    param(
+        [Parameter(Mandatory)][object]$Relay,
+        [Parameter(Mandatory)][object]$Proof
+    )
+
+    try {
+        $fields = Get-NamingRequestFields -Payload ([string]$Relay.payload)
+    }
+    catch {
+        return $false
+    }
+    if (-not (Test-NamingRetirementRequest -Fields $fields -Relay $Relay)) {
+        return $false
+    }
+    $expectedRequesterSession = if ($fields.ContainsKey('requester_session')) {
+        [string]$fields['requester_session']
+    }
+    else {
+        'legacy-unavailable'
+    }
+    return (
+        [string]$Proof.disposition -eq 'retirement_target_gone' -and
+        [string]$Proof.absence -eq 'pane_not_found' -and
+        [string]$Proof.coordinator_pane_id -eq [string]$Relay.recipient_pane_id -and
+        [string]$Proof.writer_pane_id -eq [string]$Relay.recipient_pane_id -and
+        [string]$Proof.target_pane_id -eq [string]$Relay.sender -and
+        [string]$Proof.returned_to -eq [string]$Relay.sender -and
+        [string]$Proof.requester_session -eq $expectedRequesterSession -and
+        -not [string]::IsNullOrWhiteSpace([string]$Proof.coordinator_session) -and
+        ([string]::IsNullOrWhiteSpace([string]$Relay.recipient_session) -or
+            [string]$Proof.coordinator_session -eq [string]$Relay.recipient_session)
+    )
+}
+
+function Get-ValidNamingDispositionProofs {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Relay,
+        [object[]]$Records
+    )
+
+    try {
+        $fields = Get-NamingRequestFields -Payload ([string]$Relay.payload)
+    }
+    catch {
+        return @()
+    }
+    if (-not (Test-NamingRetirementRequest -Fields $fields -Relay $Relay)) {
+        return @()
+    }
+    $validAcks = @(Get-ValidRelayReadAcks -Path $Path -Relay $Relay -Records $Records)
+    if ($validAcks.Count -ne 1) {
+        return @()
+    }
+    $proofs = @(Get-NamingDispositionProofs -Path $Path -Reference ([string]$Relay.relay_ref) -Records $Records)
+    return @($proofs | Where-Object { Test-NamingDispositionProof -Relay $Relay -Proof $_ })
+}
+
+function ConvertTo-NamingApplyIntent {
+    param([Parameter(Mandatory)][object]$Record)
+
+    if ([string]$Record.body -notmatch $NamingApplyIntentBodyPattern) {
+        return $null
+    }
+    return [pscustomobject]@{
+        proof_ref = ('[HI:{0}]' -f $Matches['proof'])
+        relay_ref = [string]$Matches['relay']
+        target_pane_id = [string]$Matches['pane']
+        target_tab_id = [string]$Matches['tab']
+        coordinator_pane_id = [string]$Matches['coordinator']
+        coordinator_session = [string]$Matches['coordsession']
+        target_session = [string]$Matches['targetsession']
+        writer_pane_id = [string]$Record.from
+        returned_to = [string]$Record.to
+        entry = [string]$Record.line
+        stamp = if ($Record.PSObject.Properties['stamp']) { [string]$Record.stamp } else { $null }
+    }
+}
+
+function Get-ValidNamingApplyIntents {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Relay,
+        [object[]]$Records
+    )
+
+    $candidateRecords = if ($null -ne $Records) { @($Records) } else { @(Get-CoordinationLogRecords -Path $Path) }
+    try {
+        $fields = Get-NamingRequestFields -Payload ([string]$Relay.payload)
+    }
+    catch {
+        return @()
+    }
+    $expectedTargetSession = if ($fields.ContainsKey('requester_session')) { [string]$fields['requester_session'] } else { $null }
+    return @($candidateRecords | ForEach-Object {
+            $intent = ConvertTo-NamingApplyIntent -Record $_
+            if ($null -eq $intent -or [string]$intent.relay_ref -ne [string]$Relay.relay_ref) { return }
+            if ([string]$intent.coordinator_pane_id -eq [string]$Relay.recipient_pane_id -and
+                [string]$intent.writer_pane_id -eq [string]$Relay.recipient_pane_id -and
+                [string]$intent.target_pane_id -eq [string]$Relay.sender -and
+                [string]$intent.returned_to -eq [string]$Relay.sender -and
+                ([string]::IsNullOrWhiteSpace([string]$Relay.recipient_session) -or
+                    [string]$intent.coordinator_session -eq [string]$Relay.recipient_session) -and
+                ([string]::IsNullOrWhiteSpace($expectedTargetSession) -or
+                    [string]$intent.target_session -eq $expectedTargetSession)) {
+                $intent
+            }
+        })
+}
+
 function Test-NamingRequestRelay {
     param([Parameter(Mandatory)][object]$Relay)
 
     $payload = [string]$Relay.payload
-    return $payload.StartsWith($NamingRequestMarker, [StringComparison]::Ordinal) -and
+    return -not [string]::IsNullOrWhiteSpace($payload) -and
+        $payload.StartsWith($NamingRequestMarker, [StringComparison]::Ordinal) -and
         $payload -match 'coordinator_action=apply-name-and-return-proof'
 }
 
@@ -2584,6 +2786,80 @@ function Get-NamingRequestField {
         return ""
     }
     return [string]$Fields[$Name]
+}
+
+function Test-NamingRetirementRequest {
+    param(
+        [Parameter(Mandatory)][hashtable]$Fields,
+        [Parameter(Mandatory)][object]$Relay
+    )
+
+    $lifecycle = Get-NamingRequestField -Fields $Fields -Name 'lifecycle'
+    if ($lifecycle -eq 'retirement') {
+        return (
+            (Get-NamingRequestField -Fields $Fields -Name 'requester_pane') -eq [string]$Relay.sender -and
+            (Get-NamingRequestField -Fields $Fields -Name 'requester_tab') -match '^w[0-9A-Za-z]+:t[0-9A-Za-z]+$' -and
+            -not [string]::IsNullOrWhiteSpace((Get-NamingRequestField -Fields $Fields -Name 'requester_agent')) -and
+            -not [string]::IsNullOrWhiteSpace((Get-NamingRequestField -Fields $Fields -Name 'requester_session')) -and
+            (Get-NamingRequestField -Fields $Fields -Name 'previous_name') -match '^(?:STM|AGT|Hdr|Buzz)-[A-Z][A-Z0-9]*-[A-Z][0-9]+$' -and
+            -not [string]::IsNullOrWhiteSpace((Get-NamingRequestField -Fields $Fields -Name 'previous_work'))
+        )
+    }
+    if (-not [string]::IsNullOrWhiteSpace($lifecycle)) {
+        return $false
+    }
+
+    # Narrow compatibility for pre-lifecycle retirement requests. Complete,
+    # hash-valid relay metadata and explicit previous identity are mandatory.
+    return (
+        (Get-NamingRequestField -Fields $Fields -Name 'work') -eq 'issue' -and
+        (Get-NamingRequestField -Fields $Fields -Name 'title') -ceq 'retired' -and
+        (Get-NamingRequestField -Fields $Fields -Name 'previous_name') -match '^(?:STM|AGT|Hdr|Buzz)-[A-Z][A-Z0-9]*-[A-Z][0-9]+$' -and
+        -not [string]::IsNullOrWhiteSpace((Get-NamingRequestField -Fields $Fields -Name 'previous_work')) -and
+        [bool]$Relay.metadata_complete -and
+        [bool]$Relay.payload_hash_valid
+    )
+}
+
+function Get-NamingRequesterProof {
+    param([Parameter(Mandatory)][string]$SenderPaneId)
+
+    $sessionHint = if (-not [string]::IsNullOrWhiteSpace([string]$env:HERDR_AGENT_SESSION_ID)) {
+        [string]$env:HERDR_AGENT_SESSION_ID
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_THREAD_ID)) {
+        [string]$env:CODEX_THREAD_ID
+    }
+    else {
+        $null
+    }
+    return Get-CurrentRelayReaderProof `
+        -TargetPaneId $SenderPaneId `
+        -CallerSession $sessionHint
+}
+
+function Test-HerdrPaneNotFoundException {
+    param(
+        [Parameter(Mandatory)][object]$ErrorRecord,
+        [Parameter(Mandatory)][string]$TargetPaneId
+    )
+
+    $prefix = 'herdr pane get {0} failed: ' -f $TargetPaneId
+    $message = [string]$ErrorRecord.Exception.Message
+    if (-not $message.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        return $false
+    }
+    $jsonText = $message.Substring($prefix.Length)
+    try {
+        $errorEnvelope = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    return (
+        $null -ne $errorEnvelope.error -and
+        [string]$errorEnvelope.error.code -ceq 'pane_not_found'
+    )
 }
 
 function Get-NamingWorkSubtitle {
@@ -2839,6 +3115,92 @@ function Add-NamingAppliedProof {
     }
 }
 
+function Get-CoordinatorNamingSession {
+    param(
+        [Parameter(Mandatory)][string]$CoordinatorPaneId,
+        [Parameter(Mandatory)][object]$Relay
+    )
+
+    $agent = (Invoke-HerdrJson -Arguments @('agent', 'get', $CoordinatorPaneId)).result.agent
+    $session = Get-AgentSessionId -AgentRecord $agent
+    if ([string]$agent.pane_id -ne $CoordinatorPaneId -or [string]::IsNullOrWhiteSpace($session)) {
+        throw 'Coordinator lacks stable native session proof for naming lifecycle evidence.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Relay.recipient_session) -and
+        $session -ne [string]$Relay.recipient_session) {
+        throw 'Coordinator native session no longer matches the naming relay recipient session.'
+    }
+    return $session
+}
+
+function Add-NamingDispositionProof {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RelayRef,
+        [Parameter(Mandatory)][object]$Relay,
+        [Parameter(Mandatory)][string]$CoordinatorPaneId
+    )
+
+    $fields = Get-NamingRequestFields -Payload ([string]$Relay.payload)
+    $requesterSession = if ($fields.ContainsKey('requester_session')) {
+        [string]$fields['requester_session']
+    }
+    else {
+        'legacy-unavailable'
+    }
+    $coordinatorSession = Get-CoordinatorNamingSession -CoordinatorPaneId $CoordinatorPaneId -Relay $Relay
+    $proofRef = '[HD:{0}]' -f [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $body = $proofRef +
+        (' [DISPOSED re {0}]' -f $RelayRef) +
+        ' [DISPOSITION retirement_target_gone]' +
+        (' [DISPOSED-PANE {0}]' -f [string]$Relay.sender) +
+        (' [DISPOSED-COORDINATOR {0}]' -f $CoordinatorPaneId) +
+        (' disposed; coordinator_session={0}; requester_session={1}; absence=pane_not_found' -f $coordinatorSession, $requesterSession)
+    $entry = Add-CoordinationEntry -Path $Path -Sender $CoordinatorPaneId -Recipient ([string]$Relay.sender) -Body $body
+    return [pscustomobject]@{
+        proof_ref = $proofRef
+        relay_ref = $RelayRef
+        disposition = 'retirement_target_gone'
+        target_pane_id = [string]$Relay.sender
+        coordinator_pane_id = $CoordinatorPaneId
+        coordinator_session = $coordinatorSession
+        requester_session = $requesterSession
+        absence = 'pane_not_found'
+        entry = $entry
+    }
+}
+
+function Add-NamingApplyIntent {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RelayRef,
+        [Parameter(Mandatory)][object]$Relay,
+        [Parameter(Mandatory)][string]$CoordinatorPaneId,
+        [Parameter(Mandatory)][object]$TargetPane,
+        [Parameter(Mandatory)][string]$TargetSession
+    )
+
+    $coordinatorSession = Get-CoordinatorNamingSession -CoordinatorPaneId $CoordinatorPaneId -Relay $Relay
+    $proofRef = '[HI:{0}]' -f [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $body = $proofRef +
+        (' [APPLY-STARTED re {0}]' -f $RelayRef) +
+        (' [APPLY-PANE {0}]' -f [string]$Relay.sender) +
+        (' [APPLY-TAB {0}]' -f [string]$TargetPane.tab_id) +
+        (' [APPLY-COORDINATOR {0}]' -f $CoordinatorPaneId) +
+        (' started; coordinator_session={0}; target_session={1}' -f $coordinatorSession, $TargetSession)
+    $entry = Add-CoordinationEntry -Path $Path -Sender $CoordinatorPaneId -Recipient ([string]$Relay.sender) -Body $body
+    return [pscustomobject]@{
+        proof_ref = $proofRef
+        relay_ref = $RelayRef
+        target_pane_id = [string]$Relay.sender
+        target_tab_id = [string]$TargetPane.tab_id
+        coordinator_pane_id = $CoordinatorPaneId
+        coordinator_session = $coordinatorSession
+        target_session = $TargetSession
+        entry = $entry
+    }
+}
+
 function Get-NamingRequestRelays {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records,
@@ -2891,11 +3253,23 @@ function Get-NamingRequestState {
 
     $validAcks = @(Get-ValidRelayReadAcks -Path $Path -Relay $Relay -Records $Records)
     $validProofs = @(Get-ValidNamingAppliedProofs -Path $Path -Relay $Relay -Records $Records)
+    $validDispositions = @(Get-ValidNamingDispositionProofs -Path $Path -Relay $Relay -Records $Records)
+    $validIntents = @(Get-ValidNamingApplyIntents -Path $Path -Relay $Relay -Records $Records)
     $ackStamp = if ($validAcks.Count -ge 1) { ConvertFrom-CoordinationStamp -Stamp ([string]$validAcks[0].stamp) } else { $null }
     $overdueSeconds = $null
     $state = "awaiting_read_ack"
-    if ($validProofs.Count -ge 1) {
+    if ($validProofs.Count -gt 1 -or $validDispositions.Count -gt 1 -or
+        ($validProofs.Count -ge 1 -and $validDispositions.Count -ge 1)) {
+        $state = 'reconciliation_required'
+    }
+    elseif ($validProofs.Count -eq 1) {
         $state = "applied"
+    }
+    elseif ($validDispositions.Count -eq 1) {
+        $state = 'retirement_target_gone'
+    }
+    elseif ($validIntents.Count -ge 1) {
+        $state = 'uncertain_apply'
     }
     elseif ($validAcks.Count -ge 1) {
         $state = "read_acked_unapplied"
@@ -2932,6 +3306,13 @@ function Get-NamingRequestState {
         applied_proof_ref = if ($validProofs.Count -ge 1) { [string]$validProofs[0].proof_ref } else { $null }
         applied_canonical_name = if ($validProofs.Count -ge 1) { [string]$validProofs[0].canonical_name } else { $null }
         applied_proof_count = $validProofs.Count
+        terminal = $validDispositions.Count -eq 1 -and $state -eq 'retirement_target_gone'
+        disposition_ref = if ($validDispositions.Count -eq 1) { [string]$validDispositions[0].proof_ref } else { $null }
+        disposition = if ($validDispositions.Count -eq 1) { [string]$validDispositions[0].disposition } else { $null }
+        disposition_count = $validDispositions.Count
+        apply_intent_ref = if ($validIntents.Count -ge 1) { [string]$validIntents[0].proof_ref } else { $null }
+        apply_intent_count = $validIntents.Count
+        uncertain = $state -eq 'uncertain_apply'
         overdue = $state -eq "overdue_unapplied"
         overdue_by_seconds = $overdueSeconds
         deadline_seconds = $DeadlineSeconds
@@ -2966,6 +3347,12 @@ function Invoke-NamingRequestConsumption {
     }
 
     $validProofs = @(Get-ValidNamingAppliedProofs -Path $LogPath -Relay $relayRecord -Records $Records)
+    $validDispositions = @(Get-ValidNamingDispositionProofs -Path $LogPath -Relay $relayRecord -Records $Records)
+    $validIntents = @(Get-ValidNamingApplyIntents -Path $LogPath -Relay $relayRecord -Records $Records)
+    if ($validProofs.Count -gt 1 -or $validDispositions.Count -gt 1 -or
+        ($validProofs.Count -ge 1 -and $validDispositions.Count -ge 1)) {
+        throw ('Relay {0} has conflicting or duplicate terminal naming evidence and requires reconciliation.' -f $RelayRef)
+    }
     if ($validProofs.Count -ge 1) {
         # Idempotent: a request that already carries a valid APPLIED proof is
         # never re-applied and never gains a second proof.
@@ -2985,6 +3372,28 @@ function Invoke-NamingRequestConsumption {
             title = [string]$existing.subtitle
             display_agent = [string]$existing.subtitle
         }
+    }
+    if ($validDispositions.Count -eq 1) {
+        $existingDisposition = $validDispositions[0]
+        return [pscustomobject]@{
+            relay_ref = $RelayRef
+            applied = $false
+            terminal = $true
+            duplicate = $true
+            state = 'retirement_target_gone'
+            proof = $existingDisposition
+            coordinator_pane_id = [string]$existingDisposition.coordinator_pane_id
+            coordinator_session = [string]$existingDisposition.coordinator_session
+            target_pane_id = [string]$existingDisposition.target_pane_id
+            target_session = [string]$existingDisposition.requester_session
+            tab_id = $null
+            tab_label = $null
+            title = $null
+            display_agent = $null
+        }
+    }
+    if ($validIntents.Count -ge 1) {
+        throw ('Relay {0} has an unfinished APPLY-STARTED intent; state is uncertain_apply and requires reconciliation.' -f $RelayRef)
     }
 
     $validAcks = @(Get-ValidRelayReadAcks -Path $LogPath -Relay $relayRecord -Records $Records)
@@ -3017,9 +3426,63 @@ function Invoke-NamingRequestConsumption {
         Get-NamingWorkSubtitle -Fields $fields
     }
 
-    $targetPane = (Invoke-HerdrJson -Arguments @("pane", "get", $targetPaneId)).result.pane
+    $targetPane = $null
+    try {
+        $targetPane = (Invoke-HerdrJson -Arguments @('pane', 'get', $targetPaneId)).result.pane
+    }
+    catch {
+        if (-not (Test-NamingRetirementRequest -Fields $fields -Relay $relayRecord) -or
+            -not (Test-HerdrPaneNotFoundException -ErrorRecord $_ -TargetPaneId $targetPaneId)) {
+            throw
+        }
+        try {
+            $targetPane = (Invoke-HerdrJson -Arguments @('pane', 'get', $targetPaneId)).result.pane
+        }
+        catch {
+            if (-not (Test-HerdrPaneNotFoundException -ErrorRecord $_ -TargetPaneId $targetPaneId)) {
+                throw
+            }
+            $disposition = Add-NamingDispositionProof -Path $LogPath -RelayRef $RelayRef -Relay $relayRecord -CoordinatorPaneId $CoordinatorPaneId
+            return [pscustomobject]@{
+                relay_ref = $RelayRef
+                applied = $false
+                terminal = $true
+                duplicate = $false
+                state = 'retirement_target_gone'
+                proof = $disposition
+                coordinator_pane_id = [string]$disposition.coordinator_pane_id
+                coordinator_session = [string]$disposition.coordinator_session
+                target_pane_id = $targetPaneId
+                target_session = [string]$disposition.requester_session
+                tab_id = $null
+                tab_label = $null
+                title = $null
+                display_agent = $null
+            }
+        }
+    }
     if ([string]$targetPane.pane_id -ne $targetPaneId) {
         throw "Requesting pane $targetPaneId could not be resolved for naming."
+    }
+    $requesterSession = Get-NamingRequestField -Fields $fields -Name 'requester_session'
+    $requesterTab = Get-NamingRequestField -Fields $fields -Name 'requester_tab'
+    $requesterAgent = Get-NamingRequestField -Fields $fields -Name 'requester_agent'
+    if ((Test-NamingRetirementRequest -Fields $fields -Relay $relayRecord) -and
+        [string]::IsNullOrWhiteSpace($requesterSession)) {
+        throw ('Legacy retirement relay {0} cannot name live pane {1} without exact requester session, tab, and agent provenance.' -f $RelayRef, $targetPaneId)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($requesterSession)) {
+        $liveTargetAgent = (Invoke-HerdrJson -Arguments @('agent', 'get', $targetPaneId)).result.agent
+        $liveTargetSession = Get-AgentSessionId -AgentRecord $liveTargetAgent
+        if ([string]$targetPane.tab_id -ne $requesterTab -or
+            [string]$liveTargetAgent.agent -ne $requesterAgent -or
+            $liveTargetSession -ne $requesterSession) {
+            throw ('Requesting pane {0} no longer hosts the naming request native session.' -f $targetPaneId)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RequiredTargetSession) -and $RequiredTargetSession -ne $requesterSession) {
+            throw 'Explicit target session conflicts with the naming request requester session.'
+        }
+        $RequiredTargetSession = $requesterSession
     }
     $targetTabId = [string]$targetPane.tab_id
     $liveLabel = ([string](Invoke-HerdrJson -Arguments @("tab", "get", $targetTabId)).result.tab.label `
@@ -3041,6 +3504,13 @@ function Invoke-NamingRequestConsumption {
             -TargetTabId $targetTabId `
             -LiveTabs (Get-LiveTabLabels)
     }
+
+    $intentTargetAgent = (Invoke-HerdrJson -Arguments @('agent', 'get', $targetPaneId)).result.agent
+    $intentTargetSession = Get-AgentSessionId -AgentRecord $intentTargetAgent
+    if ([string]::IsNullOrWhiteSpace($intentTargetSession)) {
+        throw 'Target pane lacks stable native session proof before naming mutation.'
+    }
+    $null = Add-NamingApplyIntent -Path $LogPath -RelayRef $RelayRef -Relay $relayRecord -CoordinatorPaneId $CoordinatorPaneId -TargetPane $targetPane -TargetSession $intentTargetSession
 
     $applied = Invoke-CoordinatorApplyName `
         -CoordinatorPaneId $CoordinatorPaneId `
@@ -3105,8 +3575,8 @@ switch ($Action) {
             throw "-Message is required for append."
         }
         $normalizedAppendMessage = ($Message -replace "[\r\n]+", " ").Trim()
-        if ($normalizedAppendMessage -match '^\[(?:HA|HN):[0-9a-fA-F]{8}\](?:\s|$)' -or
-            $normalizedAppendMessage -match '\[APPLIED re \[HR:[0-9a-fA-F]{8}\]\]' -or
+        if ($normalizedAppendMessage -match '^\[(?:HA|HN|HD|HI):[0-9a-fA-F]{8}\](?:\s|$)' -or
+            $normalizedAppendMessage -match '\[(?:APPLIED|DISPOSED|APPLY-STARTED) re \[HR:[0-9a-fA-F]{8}\]\]' -or
             ($normalizedAppendMessage -match '^\[HR:[0-9a-fA-F]{8}\](?:\s|$)' -and
                 $normalizedAppendMessage -match '\[(?:REISSUE-OF|RECIPIENT-SESSION|PAYLOAD-SHA256)\s')) {
             throw "append refuses receipt or lineage-bearing protocol entries; use the proof-bound send, ack-read, or apply-name action."
@@ -3215,14 +3685,26 @@ switch ($Action) {
         elseif ($WorkKind -eq "explore" -and [string]::IsNullOrWhiteSpace($Topic)) {
             throw "Explore name-request requires -Topic."
         }
+        if ($NamingLifecycle -eq 'retirement' -and
+            ([string]::IsNullOrWhiteSpace($PreviousName) -or
+                $PreviousName -notmatch '^(?:STM|AGT|Hdr|Buzz)-[A-Z][A-Z0-9]*-[A-Z][0-9]+$' -or
+                [string]::IsNullOrWhiteSpace($PreviousWork))) {
+            throw 'Retirement name-request requires a valid -PreviousName and non-empty -PreviousWork.'
+        }
 
         foreach ($value in @($WorkTitle, $Topic, $PreviousName, $PreviousWork)) {
             if ($null -ne $value -and $value -match '[\r\n]') {
                 throw "name-request fields cannot contain newlines."
             }
         }
+        $requesterProof = Get-NamingRequesterProof -SenderPaneId $sender
         $requestParts = [Collections.Generic.List[string]]::new()
         $requestParts.Add("PANE NAMING REQUEST: repo=$RepoCode")
+        $requestParts.Add('lifecycle={0}' -f $NamingLifecycle)
+        $requestParts.Add('requester_pane={0}' -f $requesterProof.pane_id)
+        $requestParts.Add('requester_tab={0}' -f $requesterProof.tab_id)
+        $requestParts.Add('requester_agent={0}' -f $requesterProof.agent)
+        $requestParts.Add('requester_session={0}' -f $requesterProof.session)
         $requestParts.Add("lane=$LaneCode")
         $requestParts.Add("role=$RoleCode")
         $requestParts.Add("work=$WorkKind")
@@ -3247,6 +3729,9 @@ switch ($Action) {
         $requestParts.Add("coordinator_action=apply-name-and-return-proof")
         $requestParts.Add("coordinator_command=consume-name-requests")
         $requestParts.Add("routing_gate=continue-by-stable-pane-id-while-pending")
+        if ($NamingLifecycle -eq 'retirement') {
+            $requestParts.Add('close_gate=wait-for-applied-or-retirement_target_gone')
+        }
         $requestMessage = $requestParts -join "; "
         $sendOutput = & $PSCommandPath `
             -Action send `
@@ -3256,6 +3741,8 @@ switch ($Action) {
             -TabLabel $TabLabel `
             -ExpectedAgent $ExpectedAgent `
             -ExpectedSession $ExpectedSession `
+            -WatchTimeoutMs $WatchTimeoutMs `
+            -EarlyAlertMs $EarlyAlertMs `
             -LogPath $LogPath 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "name-request delivery failed: $($sendOutput -join [Environment]::NewLine)"
@@ -3323,6 +3810,8 @@ switch ($Action) {
             applied = [bool]$result.applied
             relay_ref = [string]$result.relay_ref
             duplicate = [bool]$result.duplicate
+            state = [string]$result.state
+            terminal = $result.PSObject.Properties['terminal'] -and [bool]$result.terminal
             proof = $result.proof
             coordinator_pane_id = $result.coordinator_pane_id
             coordinator_session = $result.coordinator_session
@@ -3349,6 +3838,14 @@ switch ($Action) {
                 if ($candidates.Count -ne 1) {
                     throw "Relay $RelayRef is not an outstanding PANE NAMING REQUEST addressed to $coordinatorPaneId."
                 }
+            }
+            else {
+                # Ordinary sweeps only process outstanding work. Terminal
+                # records remain addressable explicitly for idempotent retries.
+                $candidates = @($candidates | Where-Object {
+                        @(Get-ValidNamingAppliedProofs -Path $LogPath -Relay $_ -Records $records).Count -eq 0 -and
+                        @(Get-ValidNamingDispositionProofs -Path $LogPath -Relay $_ -Records $records).Count -eq 0
+                    })
             }
             # Newest first: a pane may have several redirects queued.  Apply
             # only the newest request for each target; older requests must not
@@ -3410,6 +3907,7 @@ switch ($Action) {
             coordinator_pane_id = $coordinatorPaneId
             examined = $candidates.Count
             applied_count = @($processed | Where-Object { [bool]$_.applied -and -not [bool]$_.duplicate }).Count
+            terminal_count = @($processed | Where-Object { [string]$_.state -eq 'retirement_target_gone' -and -not [bool]$_.duplicate }).Count
             duplicate_count = @($processed | Where-Object { [bool]$_.duplicate }).Count
             skipped_count = @($processed | Where-Object { -not [bool]$_.applied }).Count
             failed_count = $failures.Count
@@ -3448,19 +3946,20 @@ switch ($Action) {
         # log.  Once a newer request for that same pane has an APPLIED proof,
         # older unapplied requests are superseded—not overdue—and must not
         # keep the watchdog red forever.
-        $appliedByPane = @{}
-        foreach ($appliedRequest in @($requests | Where-Object { $_.state -eq "applied" })) {
-            $paneKey = [string]$appliedRequest.requesting_pane_id
-            if (-not $appliedByPane.ContainsKey($paneKey)) {
-                $appliedByPane[$paneKey] = @()
+        $completedByPane = @{}
+        foreach ($completedRequest in @($requests | Where-Object { $_.state -in @('applied', 'retirement_target_gone') })) {
+            $paneKey = [string]$completedRequest.requesting_pane_id
+            if (-not $completedByPane.ContainsKey($paneKey)) {
+                $completedByPane[$paneKey] = @()
             }
-            $appliedByPane[$paneKey] += $appliedRequest
+            $completedByPane[$paneKey] += $completedRequest
         }
         foreach ($request in $requests) {
-            if ($request.state -eq "applied" -or -not $appliedByPane.ContainsKey([string]$request.requesting_pane_id)) {
+            if ($request.state -in @('applied', 'retirement_target_gone') -or
+                -not $completedByPane.ContainsKey([string]$request.requesting_pane_id)) {
                 continue
             }
-            $newer = @($appliedByPane[[string]$request.requesting_pane_id] | Where-Object {
+            $newer = @($completedByPane[[string]$request.requesting_pane_id] | Where-Object {
                     [string]$_.request_stamp -gt [string]$request.request_stamp
                 } | Sort-Object request_stamp -Descending | Select-Object -First 1)
             if ($newer.Count -gt 0) {
@@ -3479,6 +3978,9 @@ switch ($Action) {
             truncated = [bool]$scan.truncated
             ambiguous_relay_refs = @($scan.ambiguous_relay_refs)
             applied_count = @($requests | Where-Object { $_.state -eq "applied" }).Count
+            terminal_count = @($requests | Where-Object { $_.state -eq 'retirement_target_gone' }).Count
+            uncertain_count = @($requests | Where-Object { $_.state -eq 'uncertain_apply' }).Count
+            reconciliation_required_count = @($requests | Where-Object { $_.state -eq 'reconciliation_required' }).Count
             awaiting_read_ack_count = @($requests | Where-Object { $_.state -eq "awaiting_read_ack" }).Count
             read_acked_unapplied_count = @($requests | Where-Object { $_.state -eq "read_acked_unapplied" }).Count
             superseded_count = @($requests | Where-Object { $_.state -eq "superseded" }).Count

@@ -10,9 +10,9 @@ param(
 
     [Nullable[datetime]]$NowUtc,
 
-    [string]$LedgerPath = "C:\tmp\herdr-workflow-ledger.jsonl",
-    [string]$WatchLogPath = "C:\tmp\herdr-coordination-watch.md",
-    [string]$CoordinationLogPath = "C:\tmp\herdr-coordination.md",
+    [string]$LedgerPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-workflow-ledger.jsonl"),
+    [string]$WatchLogPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination-watch.md"),
+    [string]$CoordinationLogPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination.md"),
     [string]$WorkflowScriptPath = $(Join-Path $PSScriptRoot "herdr_workflow.ps1")
 )
 

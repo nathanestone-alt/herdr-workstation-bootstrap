@@ -35,11 +35,11 @@ param(
 
     [datetime]$NowUtc = [DateTime]::UtcNow,
 
-    [string]$LedgerPath = "C:\tmp\herdr-workflow-ledger.jsonl",
-    [string]$WatchLogPath = "C:\tmp\herdr-coordination-watch.md",
-    [string]$CoordinationLogPath = "C:\tmp\herdr-coordination.md",
+    [string]$LedgerPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-workflow-ledger.jsonl"),
+    [string]$WatchLogPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination-watch.md"),
+    [string]$CoordinationLogPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination.md"),
     [string]$CoordinationHelperPath = $(Join-Path $PSScriptRoot "herdr_coordination.ps1"),
-    [string]$PaneRegistryPath = "C:\tmp\herdr-pane-registry.jsonl",
+    [string]$PaneRegistryPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-pane-registry.jsonl"),
     [string]$PaneRegistryHelperPath = $(Join-Path $PSScriptRoot "herdr_pane_registry.ps1")
 )
 

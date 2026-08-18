@@ -607,6 +607,7 @@ exit /b 2
         $env:HERDR_PANE_ID = "w1:p2"
         $env:CODEX_THREAD_ID = "session-before"
         $env:HERDR_AGENT_SESSION_ID = "session-before"
+        $env:HERDR_AGENT_SESSION_ID = "session-before"
         $env:HERDR_TEST_CALLER_AGENT_PID = "$PID"
 
         Write-Output "CASE: copied environment/session metadata without process binding cannot acknowledge"
@@ -1020,6 +1021,15 @@ exit /b 2
 
         Write-Output "CASE: validated name-request emits one coordinator relay"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
+        Remove-Item Env:HERDR_TEST_CALLER_AGENT_PID -ErrorAction SilentlyContinue
+        $unboundNameLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
+        $unboundNameRequest = & pwsh -NoProfile -File $helperPath `
+            -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
+            -WorkKind issue -IssueNumber 828 -WorkTitle "must not relay" -LogPath $coordLogPath 2>&1
+        Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Process-unbound name-request was accepted."
+        Assert-True -Condition (($unboundNameRequest -join [Environment]::NewLine) -match 'not process-bound') -Message "Process-unbound name-request refusal was not explained."
+        Assert-Equal -Actual @(Get-Content -LiteralPath $coordLogPath).Count -Expected $unboundNameLineCount -Message "Process-unbound name-request created a relay."
+        $env:HERDR_TEST_CALLER_AGENT_PID = "$PID"
         $nameRequestOutput = & pwsh -NoProfile -File $helperPath `
             -Action name-request `
             -From "w1:p2" `
@@ -1031,22 +1041,45 @@ exit /b 2
             -WorkTitle "UserForm diagnostic coordinate mapping" `
             -PreviousName "AGT-T-R1" `
             -PreviousWork "#829" `
+            -WatchTimeoutMs 20000 `
             -LogPath $coordLogPath 2>&1
         Assert-Equal -Actual $LASTEXITCODE -Expected 0 -Message "Validated name-request failed: $($nameRequestOutput -join [Environment]::NewLine)"
         $nameRequest = ($nameRequestOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 32
         Assert-Equal -Actual $nameRequest.action -Expected "name-request" -Message "Name-request action was not reported."
         Assert-True -Condition ([string]$nameRequest.request -match 'issue=#828') -Message "Name-request did not normalize the issue number."
+        Assert-True -Condition ([string]$nameRequest.request -match 'lifecycle=assignment') -Message "Ordinary name-request did not declare assignment lifecycle."
+        Assert-True -Condition ([string]$nameRequest.request -match 'requester_pane=w1:p2') -Message "Name-request lost requester pane provenance."
+        Assert-True -Condition ([string]$nameRequest.request -match 'requester_tab=w1:t2') -Message "Name-request lost requester tab provenance."
+        Assert-True -Condition ([string]$nameRequest.request -match 'requester_agent=codex') -Message "Name-request lost requester agent provenance."
+        Assert-True -Condition ([string]$nameRequest.request -match 'requester_session=session-before') -Message "Name-request lost requester session provenance."
         Assert-True -Condition ([string]$nameRequest.request -match 'previous_work=#829') -Message "Name-request lost the redirect provenance."
         Assert-True -Condition ([string]$nameRequest.request -match 'coordinator_action=apply-name-and-return-proof') -Message "Name-request did not require coordinator application proof."
         Assert-True -Condition ([string]$nameRequest.request -match 'coordinator_command=consume-name-requests') -Message "Name-request did not require the coordinator consumer command."
         Assert-True -Condition ([string]$nameRequest.request -match 'routing_gate=continue-by-stable-pane-id-while-pending') -Message "Name-request did not declare asynchronous stable-ID routing."
         $nameRequestLog = (Get-Content -LiteralPath $coordLogPath) -join "`n"
-        Assert-True -Condition ($nameRequestLog -match 'PANE NAMING REQUEST: repo=AGT; lane=T; role=R; work=issue; issue=#828') -Message "Name-request body was not durably recorded."
+        Assert-True -Condition ($nameRequestLog -match 'PANE NAMING REQUEST: repo=AGT; lifecycle=assignment; requester_pane=w1:p2; requester_tab=w1:t2') -Message "Name-request body/provenance was missing or pane-label enrichment corrupted its machine fields."
 
         $invalidNameRequest = & pwsh -NoProfile -File $helperPath `
             -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
             -WorkKind issue -IssueNumber 828 -WorkTitle "bad`nvalue" -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Newline-bearing name-request was accepted."
+
+        Write-Output "CASE: retirement name-request declares terminal close gate"
+        Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
+        Set-Content -LiteralPath $coordLogPath -Value "" -Encoding utf8
+        $retirementRequestOutput = & pwsh -NoProfile -File $helperPath `
+            -Action name-request -NamingLifecycle retirement -From "w1:p2" `
+            -RepoCode AGT -LaneCode T -RoleCode R -WorkKind issue -IssueNumber 828 `
+            -WorkTitle "retired" -PreviousName "AGT-T-R1" -PreviousWork "#828 · completed" `
+            -WatchTimeoutMs 20000 `
+            -LogPath $coordLogPath 2>&1
+        Assert-Equal -Actual $LASTEXITCODE -Expected 0 -Message "Retirement name-request failed: $($retirementRequestOutput -join [Environment]::NewLine)"
+        $retirementRequest = ($retirementRequestOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 32
+        Assert-True -Condition ([string]$retirementRequest.request -match 'lifecycle=retirement') -Message "Retirement lifecycle marker was missing."
+        Assert-True -Condition ([string]$retirementRequest.request -match 'close_gate=wait-for-applied-or-retirement_target_gone') -Message "Retirement close gate was missing."
+        Assert-True -Condition ([string]$retirementRequest.request -match 'previous_name=AGT-T-R1') -Message "Retirement previous identity was missing."
+        $retirementRequestLog = (Get-Content -LiteralPath $coordLogPath) -join "`n"
+        Assert-True -Condition ($retirementRequestLog -match 'lifecycle=retirement; requester_pane=w1:p2; requester_tab=w1:t2') -Message "Retirement relay provenance was corrupted during nested send."
 
         Write-Output "CASE: large-log relay lineage lookup remains bounded"
         $largeLogPath = Join-Path $tempRoot "coordination-large.md"
