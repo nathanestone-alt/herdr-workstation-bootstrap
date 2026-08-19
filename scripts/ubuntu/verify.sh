@@ -52,15 +52,15 @@ check_exact_version python3.13 "Python $PYTHON_VERSION"
 
 if command -v uv >/dev/null 2>&1; then
   uv_path="$(command -v uv)"
-  [[ "$uv_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL uv is not managed: $uv_path"; failures=$((failures + 1)); }
+  [[ "$uv_path" == "$HOME/.local/bin/uv" ]] || { echo "FAIL uv is not managed: $uv_path"; failures=$((failures + 1)); }
 fi
 if command -v python3.13 >/dev/null 2>&1; then
   python_path="$(command -v python3.13)"
-  [[ "$python_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL python3.13 is not managed: $python_path"; failures=$((failures + 1)); }
+  [[ "$python_path" == "$HOME/.local/bin/python3.13" ]] || { echo "FAIL python3.13 is not managed: $python_path"; failures=$((failures + 1)); }
 fi
 if command -v py >/dev/null 2>&1; then
   py_path="$(command -v py)"
-  [[ "$py_path" == "$HOME/.local/bin/"* ]] || { echo "FAIL py is not managed: $py_path"; failures=$((failures + 1)); }
+  [[ "$py_path" == "$HOME/.local/bin/py" ]] || { echo "FAIL py is not managed: $py_path"; failures=$((failures + 1)); }
   if py_probe="$(py -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")' 2>&1)" && [[ "$py_probe" == "$PYTHON_VERSION|x86_64|linux" ]]; then
     echo "PASS py -3.13 selects $py_probe"
   else
@@ -81,12 +81,56 @@ if command -v py >/dev/null 2>&1; then
   fi
 fi
 
+home_real="$(realpath -e -- "$HOME" 2>/dev/null || true)"
+check_managed_command_target() {
+  local name="$1"
+  local expected_path="$2"
+  local actual_path
+  local resolved_path
+  if command -v "$name" >/dev/null 2>&1; then
+    actual_path="$(command -v "$name")"
+    if [[ "$actual_path" == "$expected_path" ]]; then
+      resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
+      if path_is_under "$resolved_path" "$home_real"; then
+        echo "PASS managed target $name $resolved_path"
+      else
+        echo "FAIL managed target $name resolves outside HOME: $resolved_path"
+        failures=$((failures + 1))
+      fi
+    fi
+  fi
+}
+check_managed_command_target uv "$HOME/.local/bin/uv"
+check_managed_command_target python3.13 "$HOME/.local/bin/python3.13"
+check_managed_command_target py "$HOME/.local/bin/py"
+
 toolchain_receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+lock_sha256="$(sha256sum "$lock_file" | awk '{print $1}')"
+if [[ -L "$toolchain_receipt" ]]; then
+  echo "FAIL receipt is a symlink: $toolchain_receipt"
+  failures=$((failures + 1))
+fi
 for receipt_line in \
+  'receipt_format=issue-961-toolchain-v2' \
+  "lock_sha256=$lock_sha256" \
+  'host_platform=linux' \
+  'host_architecture=x86_64' \
+  "uv_path=$HOME/.local/bin/uv" \
+  "python3.13_path=$HOME/.local/bin/python3.13" \
+  "py_path=$HOME/.local/bin/py" \
   "uv_version=uv $UV_VERSION ($UV_PLATFORM)" \
   "python3.13_version=Python $PYTHON_VERSION" \
   "py_3.13_version=Python $PYTHON_VERSION" \
-  "py_3.13_probe=$PYTHON_VERSION|x86_64|linux"; do
+  "py_3.13_probe=$PYTHON_VERSION|x86_64|linux" \
+  "uv_platform=$UV_PLATFORM" \
+  "uv_url=$UV_URL" \
+  "uv_sha256=$UV_SHA256" \
+  "python_version=$PYTHON_VERSION" \
+  "python_platform=$PYTHON_PLATFORM" \
+  "python_release=$PYTHON_RELEASE" \
+  "python_archive=$PYTHON_ARCHIVE" \
+  "python_url=$PYTHON_URL" \
+  "python_sha256=$PYTHON_SHA256"; do
   if [[ -f "$toolchain_receipt" ]] && grep -Fqx -- "$receipt_line" "$toolchain_receipt"; then
     echo "PASS receipt $receipt_line"
   else

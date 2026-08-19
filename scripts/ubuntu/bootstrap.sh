@@ -36,6 +36,72 @@ for key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 
   [[ "${!key}" =~ ^[0-9a-f]{64}$ ]] || { echo "Lock key '$key' is not a lowercase SHA-256 value." >&2; exit 22; }
 done
 
+path_is_under() {
+  local child="$1"
+  local parent="$2"
+  [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+validate_user_home() {
+  [[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != '/' && -d "$HOME" ]] || {
+    echo 'HOME is not a safe absolute user directory.' >&2
+    return 1
+  }
+  [[ ! -L "$HOME" ]] || {
+    echo 'HOME itself must not be a symlink.' >&2
+    return 1
+  }
+  home_real="$(realpath -e -- "$HOME" 2>/dev/null || true)"
+  [[ -n "$home_real" && -d "$home_real" ]] || {
+    echo 'Could not resolve the real user home.' >&2
+    return 1
+  }
+  [[ "$(stat -c '%u' -- "$home_real" 2>/dev/null || true)" == "$(id -u)" ]] || {
+    echo 'The resolved user home is not owned by the current user.' >&2
+    return 1
+  }
+}
+
+validate_managed_path() {
+  local path="$1"
+  local normalized
+  local relative
+  local component
+  local component_path
+  local -a components
+
+  [[ "$path" == "$HOME" || "$path" == "$HOME/"* ]] || {
+    echo "Managed path is outside HOME: $path" >&2
+    return 1
+  }
+  normalized="$(realpath -m -- "$path" 2>/dev/null || true)"
+  path_is_under "$normalized" "$home_real" || {
+    echo "Managed path resolves outside the real user home: $path" >&2
+    return 1
+  }
+
+  [[ "$path" == "$HOME" ]] && return 0
+  relative="${path#"$HOME"/}"
+  component_path="$HOME"
+  IFS='/' read -r -a components <<< "$relative"
+  for component in "${components[@]}"; do
+    [[ -z "$component" || "$component" == '.' ]] && continue
+    component_path="$component_path/$component"
+    [[ ! -L "$component_path" ]] || {
+      echo "Managed path contains a symlinked component: $component_path" >&2
+      return 1
+    }
+  done
+}
+
+validate_managed_paths() {
+  validate_user_home || return 1
+  local path
+  for path in "$@"; do
+    validate_managed_path "$path" || return 1
+  done
+}
+
 validate_toolchain_lock() {
   for lock_hash_key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
     [[ "${!lock_hash_key:-}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -104,6 +170,10 @@ check_python_platform() {
 write_py_compat() {
   local wrapper="$bin_dir/py"
   local replacement
+  validate_managed_paths "$wrapper" || {
+    echo "Unsafe managed py path: $wrapper" >&2
+    exit 24
+  }
   replacement="$(mktemp)"
   cat > "$replacement" <<'EOF'
 #!/usr/bin/env bash
@@ -140,13 +210,19 @@ download_verified() {
 install_python_toolchain() {
   validate_toolchain_lock || exit 22
   validate_platform || exit 20
-  mkdir -p "$state_dir" "$bin_dir"
 
   managed_root="$HOME/.local/lib/herdr-workstation"
   uv_parent="$managed_root/uv"
   python_parent="$managed_root/python"
   uv_dir="$uv_parent/$UV_VERSION/$UV_PLATFORM"
   python_dir="$python_parent/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+  validate_managed_paths \
+    "$state_dir" "$bin_dir" "$managed_root" "$uv_parent" "$python_parent" \
+    "$uv_dir" "$uv_dir/uv" "$python_dir" "$python_dir/bin" "$python_dir/bin/python3.13" || {
+      echo 'Managed Python toolchain paths are unsafe.' >&2
+      exit 24
+    }
+  mkdir -p "$state_dir" "$bin_dir"
   mkdir -p "$uv_parent/$UV_VERSION" "$python_parent"
 
   if [[ ! -x "$uv_dir/uv" ]] || ! check_uv_version "$uv_dir/uv"; then
@@ -165,7 +241,7 @@ install_python_toolchain() {
     }
     uv_install_stage="$(mktemp -d "$uv_parent/.install.XXXXXX")"
     install -m 0755 "${uv_candidates[0]}" "$uv_install_stage/uv"
-    [[ "$uv_dir" == "$managed_root/"* ]] || { echo 'Unsafe uv managed path.' >&2; exit 24; }
+    validate_managed_paths "$uv_dir" || { echo 'Unsafe uv managed path.' >&2; exit 24; }
     if [[ -e "$uv_dir" || -L "$uv_dir" ]]; then rm -rf -- "$uv_dir"; fi
     mv -- "$uv_install_stage" "$uv_dir"
     rm -rf -- "$uv_stage"
@@ -193,7 +269,7 @@ install_python_toolchain() {
       echo 'Staged CPython runtime failed its exact version/platform check.' >&2
       exit 24
     }
-    [[ "$python_dir" == "$managed_root/"* ]] || { echo 'Unsafe Python managed path.' >&2; exit 24; }
+    validate_managed_paths "$python_dir" || { echo 'Unsafe Python managed path.' >&2; exit 24; }
     if [[ -e "$python_dir" || -L "$python_dir" ]]; then rm -rf -- "$python_dir"; fi
     mv -- "$python_install_stage" "$python_dir"
     rm -rf -- "$python_stage"
@@ -227,6 +303,10 @@ converge_profile_hook() {
   local marker='# BEGIN herdr-workstation PATH'
   local end_marker='# END herdr-workstation PATH'
   local replacement
+  validate_managed_paths "$profile_file" || {
+    echo "Unsafe managed profile path: $profile_file" >&2
+    exit 24
+  }
   replacement="$(mktemp)"
   touch "$profile_file"
   mapfile -t begin_lines < <(grep -nFx "$marker" "$profile_file" | cut -d: -f1)
@@ -272,6 +352,10 @@ converge_profile_hook() {
 }
 
 install_base() {
+  validate_managed_paths "$state_dir" "$state_dir/base-complete" "$bin_dir" || {
+    echo 'Managed bootstrap paths are unsafe.' >&2
+    exit 24
+  }
   mkdir -p "$state_dir" "$bin_dir"
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -311,6 +395,15 @@ install_base() {
 }
 
 install_tools() {
+  profile_dir="$HOME/.config/herdr-workstation"
+  node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
+  validate_managed_paths \
+    "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
+    "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" "$HOME/src" \
+    "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" || {
+      echo 'Managed bootstrap paths are unsafe.' >&2
+      exit 24
+    }
   mkdir -p "$state_dir" "$bin_dir"
   if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
     echo 'systemd is required before the tools phase.' >&2
@@ -368,7 +461,6 @@ install_tools() {
   }
   ln -sfn "$cargo_install_root/bin/rtk" "$bin_dir/rtk"
 
-  profile_dir="$HOME/.config/herdr-workstation"
   mkdir -p "$profile_dir"
   profile_script_tmp="$(mktemp)"
   {
@@ -389,7 +481,6 @@ install_tools() {
 
   install_python_toolchain
 
-  node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   if [[ ! -x "$node_dir/bin/node" ]]; then
     archive="$(mktemp --suffix=.tar.gz)"
     download_verified "$NODE_URL" "$NODE_SHA256" "$archive"
@@ -430,14 +521,26 @@ install_tools() {
 
   manifest="$state_dir/toolchain-manifest.txt"
   {
+    printf 'receipt_format=%s\n' 'issue-961-toolchain-v2'
     printf 'lock_sha256=%s\n' "$(sha256sum "$lock_file" | awk '{print $1}')"
+    printf 'host_platform=%s\n' 'linux'
+    printf 'host_architecture=%s\n' "$(uname -m)"
+    printf 'uv_path=%s\n' "$bin_dir/uv"
+    printf 'python3.13_path=%s\n' "$bin_dir/python3.13"
+    printf 'py_path=%s\n' "$bin_dir/py"
     printf 'uv_version=%s\n' "$("$bin_dir/uv" --version)"
+    printf 'uv_url=%s\n' "$UV_URL"
+    printf 'uv_sha256=%s\n' "$UV_SHA256"
     printf 'python3.13_version=%s\n' "$("$bin_dir/python3.13" --version 2>&1)"
     printf 'py_3.13_version=%s\n' "$("$bin_dir/py" -3.13 --version 2>&1)"
     printf 'py_3.13_probe=%s\n' "$("$bin_dir/py" -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")')"
     printf 'uv_platform=%s\n' "$UV_PLATFORM"
+    printf 'python_version=%s\n' "$PYTHON_VERSION"
     printf 'python_platform=%s\n' "$PYTHON_PLATFORM"
     printf 'python_release=%s\n' "$PYTHON_RELEASE"
+    printf 'python_archive=%s\n' "$PYTHON_ARCHIVE"
+    printf 'python_url=%s\n' "$PYTHON_URL"
+    printf 'python_sha256=%s\n' "$PYTHON_SHA256"
     printf 'tailscale=%s\n' "$(tailscale version | head -n 1)"
     printf 'rustup=%s\n' "$(rustup --version | head -n 1)"
     printf 'rustc=%s\n' "$(rustc --version)"

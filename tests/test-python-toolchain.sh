@@ -83,4 +83,66 @@ set -e
   exit 1
 }
 
+expect_bootstrap_path_blocked() {
+  local case_name="$1"
+  local home="$2"
+  local phase="${3:-install-python}"
+  local output="$test_root/bootstrap-$case_name.out"
+  set +e
+  HOME="$home" bash -c 'bootstrap_script="$1"; requested_phase="$2"; set --; source "$bootstrap_script"; if [[ "$requested_phase" == install-tools ]]; then install_tools; else install_python_toolchain; fi' \
+    _ "$repo_root/scripts/ubuntu/bootstrap.sh" "$phase" > "$output" 2>&1
+  local status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { echo "$case_name unexpectedly passed." >&2; exit 1; }
+  grep -Fq 'Managed path' "$output" || { sed -n '1,80p' "$output" >&2; exit 1; }
+}
+
+make_bootstrap_safety_home() {
+  local case_name="$1"
+  local home="$test_root/bootstrap-home-$case_name"
+  rm -rf "$home"
+  mkdir -p "$home"
+  printf '%s' "$home"
+}
+
+bootstrap_local_home="$(make_bootstrap_safety_home local)"
+bootstrap_local_outside="$test_root/bootstrap-outside-local"
+mkdir -p "$bootstrap_local_outside"
+printf 'local sentinel\n' > "$bootstrap_local_outside/sentinel.txt"
+ln -s "$bootstrap_local_outside" "$bootstrap_local_home/.local"
+expect_bootstrap_path_blocked local "$bootstrap_local_home"
+[[ "$(< "$bootstrap_local_outside/sentinel.txt")" == 'local sentinel' ]] || exit 1
+
+bootstrap_lib_home="$(make_bootstrap_safety_home lib)"
+bootstrap_lib_outside="$test_root/bootstrap-outside-lib"
+mkdir -p "$bootstrap_lib_home/.local/lib" "$bootstrap_lib_home/.local/bin" "$bootstrap_lib_home/.local/state" "$bootstrap_lib_outside"
+printf 'lib sentinel\n' > "$bootstrap_lib_outside/sentinel.txt"
+ln -s "$bootstrap_lib_outside" "$bootstrap_lib_home/.local/lib/herdr-workstation"
+expect_bootstrap_path_blocked lib "$bootstrap_lib_home"
+[[ "$(< "$bootstrap_lib_outside/sentinel.txt")" == 'lib sentinel' ]] || exit 1
+
+bootstrap_bin_home="$(make_bootstrap_safety_home bin)"
+bootstrap_bin_outside="$test_root/bootstrap-outside-bin"
+mkdir -p "$bootstrap_bin_home/.local/state" "$bootstrap_bin_outside"
+printf 'bin sentinel\n' > "$bootstrap_bin_outside/sentinel.txt"
+ln -s "$bootstrap_bin_outside" "$bootstrap_bin_home/.local/bin"
+expect_bootstrap_path_blocked bin "$bootstrap_bin_home"
+[[ "$(< "$bootstrap_bin_outside/sentinel.txt")" == 'bin sentinel' ]] || exit 1
+
+bootstrap_state_home="$(make_bootstrap_safety_home state)"
+bootstrap_state_outside="$test_root/bootstrap-outside-state"
+mkdir -p "$bootstrap_state_home/.local/bin" "$bootstrap_state_outside"
+printf 'state sentinel\n' > "$bootstrap_state_outside/sentinel.txt"
+ln -s "$bootstrap_state_outside" "$bootstrap_state_home/.local/state"
+expect_bootstrap_path_blocked state "$bootstrap_state_home"
+[[ "$(< "$bootstrap_state_outside/sentinel.txt")" == 'state sentinel' ]] || exit 1
+
+bootstrap_profile_home="$(make_bootstrap_safety_home profile)"
+bootstrap_profile_outside="$test_root/bootstrap-outside-profile"
+mkdir -p "$bootstrap_profile_home/.local/bin" "$bootstrap_profile_home/.local/state" "$bootstrap_profile_outside"
+printf 'profile sentinel\n' > "$bootstrap_profile_outside/sentinel.txt"
+ln -s "$bootstrap_profile_outside" "$bootstrap_profile_home/.config"
+expect_bootstrap_path_blocked profile "$bootstrap_profile_home" install-tools
+[[ "$(< "$bootstrap_profile_outside/sentinel.txt")" == 'profile sentinel' ]] || exit 1
+
 echo 'Python 3.13 lock, selector and convergence seam tests passed.'

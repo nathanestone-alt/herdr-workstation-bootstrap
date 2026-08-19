@@ -5,6 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 export HOME="$test_root/home"
+# shellcheck disable=SC1091
+source "$repo_root/config/ubuntu-toolchain.lock"
+lock_sha256="$(sha256sum "$repo_root/config/ubuntu-toolchain.lock" | awk '{print $1}')"
 managed_bin="$HOME/.local/bin"
 mkdir -p "$managed_bin"
 profile_dir="$HOME/.config/herdr-workstation"
@@ -41,12 +44,28 @@ esac
 EOF
 chmod +x "$managed_bin/uv" "$managed_bin/python3.13" "$managed_bin/py"
 mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
-cat > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt" <<'EOF'
-uv_version=uv 0.12.5 (x86_64-unknown-linux-gnu)
-python3.13_version=Python 3.13.15
-py_3.13_version=Python 3.13.15
-py_3.13_probe=3.13.15|x86_64|linux
-EOF
+{
+  printf 'receipt_format=issue-961-toolchain-v2\n'
+  printf 'lock_sha256=%s\n' "$lock_sha256"
+  printf 'host_platform=linux\n'
+  printf 'host_architecture=x86_64\n'
+  printf 'uv_path=%s\n' "$HOME/.local/bin/uv"
+  printf 'python3.13_path=%s\n' "$HOME/.local/bin/python3.13"
+  printf 'py_path=%s\n' "$HOME/.local/bin/py"
+  printf 'uv_version=uv %s (%s)\n' "$UV_VERSION" "$UV_PLATFORM"
+  printf 'uv_url=%s\n' "$UV_URL"
+  printf 'uv_sha256=%s\n' "$UV_SHA256"
+  printf 'python3.13_version=Python %s\n' "$PYTHON_VERSION"
+  printf 'py_3.13_version=Python %s\n' "$PYTHON_VERSION"
+  printf 'py_3.13_probe=%s|x86_64|linux\n' "$PYTHON_VERSION"
+  printf 'uv_platform=%s\n' "$UV_PLATFORM"
+  printf 'python_version=%s\n' "$PYTHON_VERSION"
+  printf 'python_platform=%s\n' "$PYTHON_PLATFORM"
+  printf 'python_release=%s\n' "$PYTHON_RELEASE"
+  printf 'python_archive=%s\n' "$PYTHON_ARCHIVE"
+  printf 'python_url=%s\n' "$PYTHON_URL"
+  printf 'python_sha256=%s\n' "$PYTHON_SHA256"
+} > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 
 # Exercise verify.sh's real bash -lc branch without allowing Git Bash's
 # machine-wide /etc/profile to replace the fixture HOME. The wrapper still
@@ -138,6 +157,32 @@ run_verify_layout() {
 run_verify_layout profile
 run_verify_layout bash-profile
 run_verify_layout bash-login
+
+expect_receipt_field_failure() {
+  local field="$1"
+  local receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+  local backup="$test_root/receipt-$field.before"
+  local output="$test_root/verify-output-tampered-$field.txt"
+  cp "$receipt" "$backup"
+  sed -i "/^${field}=/c\\${field}=tampered" "$receipt"
+  set +e
+  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  local status=$?
+  set -e
+  mv "$backup" "$receipt"
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "verify.sh accepted tampered $field." >&2; exit 1; }
+  grep -q '^FAIL receipt missing ' "$output" || { cat "$output" >&2; echo "verify.sh did not report tampered $field." >&2; exit 1; }
+}
+
+receipt_fields=(
+  receipt_format lock_sha256 host_platform host_architecture
+  uv_path python3.13_path py_path uv_version python3.13_version
+  py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
+  python_version python_platform python_release python_archive python_url python_sha256
+)
+for receipt_field in "${receipt_fields[@]}"; do
+  expect_receipt_field_failure "$receipt_field"
+done
 
 rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
 : > "$HOME/.profile"
