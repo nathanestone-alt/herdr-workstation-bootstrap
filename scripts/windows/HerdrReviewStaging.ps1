@@ -615,10 +615,23 @@ function Get-HerdrPhysicalPathProof {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [switch]$AllowMissingLeaf
+        [switch]$AllowMissingLeaf,
+        [object]$ExistingLeafHandle
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
+    if ($null -ne $ExistingLeafHandle) {
+        if (-not $IsWindows) { throw 'An existing native leaf handle is available only on Windows.' }
+        if ($null -eq $ExistingLeafHandle.SafeHandle -or
+            $ExistingLeafHandle.SafeHandle.IsClosed -or
+            $ExistingLeafHandle.SafeHandle.IsInvalid) {
+            throw "The existing native leaf handle is closed: '$canonical'."
+        }
+        $handlePath = Get-HerdrCanonicalPath -Path ([string]$ExistingLeafHandle.Path)
+        if (-not $handlePath.Equals($canonical, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The existing native leaf handle does not belong to '$canonical'."
+        }
+    }
     $ancestors = [Collections.Generic.List[object]]::new()
     $leafExists = $true
     $leafIdentity = $null
@@ -628,6 +641,39 @@ function Get-HerdrPhysicalPathProof {
     if ($IsWindows) {
         for ($index = 0; $index -lt $components.Count; $index++) {
             $component = [string]$components[$index]
+            if ($null -ne $ExistingLeafHandle -and $index -eq ($components.Count - 1)) {
+                if ($ancestors.Count -eq 0) { throw "The existing native leaf handle has no parent: '$canonical'." }
+                $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity(
+                    $ExistingLeafHandle.SafeHandle.DangerousGetHandle())
+                if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
+                    throw "Path component is a reparse point: '$component'."
+                }
+                if ([int64]$identity.NumberOfLinks -gt 1) {
+                    throw "Path component has multiple hard links: '$component'."
+                }
+                $finalPath = ConvertTo-HerdrFinalPath -Path (
+                    [Herdr.Security.NativeMethods]::ReadFinalPath($ExistingLeafHandle.SafeHandle.DangerousGetHandle()))
+                $parentFinalPath = [string]$ancestors[$ancestors.Count - 1].FinalPath
+                $expectedFinalPath = Get-HerdrCanonicalPath -Path (Join-Path -Path $parentFinalPath `
+                    -ChildPath ([IO.Path]::GetFileName($canonical)))
+                if (-not $finalPath.Equals($expectedFinalPath, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "The existing native leaf handle no longer matches '$canonical'."
+                }
+                $record = [pscustomobject][ordered]@{
+                    LexicalPath = Get-HerdrCanonicalPath -Path $component
+                    FinalPath = $finalPath
+                    IsDirectory = $false
+                    Attributes = [int64]$identity.Attributes
+                    VolumeSerialNumber = [uint64]$identity.VolumeSerialNumber
+                    FileIndex = [uint64]$identity.FileIndex
+                    NumberOfLinks = [uint64]$identity.NumberOfLinks
+                    FileIdentity = '{0:x8}:{1:x16}' -f $identity.VolumeSerialNumber, $identity.FileIndex
+                }
+                $null = $ancestors.Add($record)
+                $leafIdentity = $record
+                $leafFinalPath = $finalPath
+                continue
+            }
             $isDirectory = [IO.Directory]::Exists($component)
             $isFile = [IO.File]::Exists($component)
             if (-not $isDirectory -and -not $isFile) {
@@ -745,11 +791,17 @@ function Assert-HerdrPhysicalPathUnderRoot {
         [object]$ExpectedCandidate,
         [object]$ExpectedRoot,
         [string]$Description = 'Configured path',
-        [switch]$AllowEqual
+        [switch]$AllowEqual,
+        [object]$ExistingCandidateHandle
     )
 
     $rootProof = Get-HerdrPhysicalPathProof -Path $RootPath
-    $candidateProof = Get-HerdrPhysicalPathProof -Path $CandidatePath
+    $candidateProof = if ($null -eq $ExistingCandidateHandle) {
+        Get-HerdrPhysicalPathProof -Path $CandidatePath
+    }
+    else {
+        Get-HerdrPhysicalPathProof -Path $CandidatePath -ExistingLeafHandle $ExistingCandidateHandle
+    }
     if ($null -ne $ExpectedRoot) { Compare-HerdrPhysicalIdentity -Expected $ExpectedRoot -Actual $rootProof -Description "$Description root" | Out-Null }
     if ($null -ne $ExpectedCandidate) { Compare-HerdrPhysicalIdentity -Expected $ExpectedCandidate -Actual $candidateProof -Description "$Description candidate" -IncludeLinkCount | Out-Null }
     if ([string]$rootProof.Leaf.VolumeSerialNumber -ne [string]$candidateProof.Leaf.VolumeSerialNumber -and

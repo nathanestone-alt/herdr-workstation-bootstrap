@@ -86,6 +86,13 @@ try {
         if ($null -ne $jsonReaderBorrowedHandle -and -not $jsonReaderBorrowedHandle.IsClosed) { $jsonReaderBorrowedHandle.Dispose() }
         if ($null -ne $jsonReaderOwner) { $jsonReaderOwner.Dispose() }
     }
+    if ($IsWindows) {
+        $jsonReaderExclusivePath = Join-Path $root 'json-reader-exclusive.json'
+        [IO.File]::WriteAllText($jsonReaderExclusivePath, '{"schema":"exclusive-share-zero"}', [Text.UTF8Encoding]::new($false))
+        $jsonReaderExclusiveValue = Read-HerdrJsonFile -Path $jsonReaderExclusivePath
+        Assert-True ($jsonReaderExclusiveValue.schema -ceq 'exclusive-share-zero') `
+            'The production Windows JSON reader did not complete with its share-zero handle held during proof.'
+    }
     $success = New-TestJob
     $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
         -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `

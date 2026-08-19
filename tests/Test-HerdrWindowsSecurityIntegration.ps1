@@ -230,43 +230,64 @@ try {
     New-Item -ItemType Directory -Path $raceParent, $raceOutside -Force | Out-Null
     $raceSource = Join-Path $raceTrusted 'race-source.xlsx'
     [IO.File]::WriteAllText($raceSource, 'race-source')
+    $raceEvidence = [Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
     $raceStop = [Threading.ManualResetEventSlim]::new($false)
     $raceAction = {
-        while (-not $raceStop.IsSet) {
+        [void]$raceEvidence.TryAdd('race-thread-started', $true)
+        for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++) {
             try {
                 if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
                     [IO.Directory]::Move($raceParent, $raceMoved)
+                    [void]$raceEvidence.TryAdd('parent-moved', $true)
                 }
                 if (-not [IO.Directory]::Exists($raceParent)) {
                     New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
+                    [void]$raceEvidence.TryAdd('junction-created', $true)
                 }
                 Start-Sleep -Milliseconds 1
                 if ([IO.Directory]::Exists($raceParent) -and
                     (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
                     Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+                    [void]$raceEvidence.TryAdd('junction-removed', $true)
                 }
                 if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
                     [IO.Directory]::Move($raceMoved, $raceParent)
+                    [void]$raceEvidence.TryAdd('parent-restored', $true)
                 }
             }
-            catch { }
+            catch { [void]$raceEvidence.TryAdd('race-mutator-error', $true) }
         }
     }.GetNewClosure()
     $raceThread = [Threading.Thread]::new([Threading.ThreadStart]$raceAction)
     $raceThread.Start()
+    $raceOperationAttempts = 0
+    $raceOperationSuccesses = 0
+    $raceOperationFailures = [Collections.Generic.List[string]]::new()
     try {
         for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $raceOperationAttempts++
             try {
                 Ensure-HerdrManagedDirectory -Path (Join-Path $raceParent ("created-{0:d2}" -f $attempt)) `
                     -TrustedRoot $raceTrusted -Description 'concurrent create race' | Out-Null
+                $raceOperationSuccesses++
             }
-            catch { }
+            catch {
+                if ($raceOperationFailures.Count -lt 8) {
+                    [void]$raceOperationFailures.Add("Ensure[$attempt]: $($_.Exception.Message)")
+                }
+            }
+            $raceOperationAttempts++
             try {
                 Copy-HerdrFileExclusive -SourcePath $raceSource `
                     -DestinationPath (Join-Path $raceParent ("copy-{0:d2}.xlsx" -f $attempt)) `
                     -TrustedRoot $raceTrusted -TrustedDestinationRoot $raceTrusted | Out-Null
+                $raceOperationSuccesses++
             }
-            catch { }
+            catch {
+                if ($raceOperationFailures.Count -lt 8) {
+                    [void]$raceOperationFailures.Add("Copy[$attempt]: $($_.Exception.Message)")
+                }
+            }
         }
     }
     finally {
@@ -280,6 +301,19 @@ try {
     if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
         [IO.Directory]::Move($raceMoved, $raceParent)
     }
+    $raceEvidenceKeys = @($raceEvidence.Keys)
+    $raceMutationEvidence = @($raceEvidenceKeys | Where-Object {
+        $_ -in @('parent-moved', 'junction-created', 'junction-removed', 'parent-restored')
+    })
+    Assert-True ($raceOperationAttempts -eq 80) `
+        "Ancestor/junction race did not execute the bounded operation set (attempts=$raceOperationAttempts)."
+    Assert-True ($raceOperationSuccesses -gt 0) `
+        ("Ancestor/junction race helper threw on every operation; attempts={0}; successes={1}; failures={2}; " +
+         "race_evidence={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
+         ($raceEvidenceKeys -join ', '))
+    Assert-True ($raceMutationEvidence.Count -gt 0) `
+        ("Ancestor/junction race did not observe a bounded ancestor mutation; attempts={0}; successes={1}; " +
+         "race_evidence={2}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '))
     Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative create/copy race wrote outside the trusted root.'
 

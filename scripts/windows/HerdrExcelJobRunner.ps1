@@ -79,11 +79,17 @@ function Read-HerdrJsonFile {
             $raw = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
         }
         $value = $raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop
-        $afterProof = Get-HerdrPhysicalPathProof -Path $Path
+        $afterProof = if ($IsWindows) {
+            Get-HerdrPhysicalPathProof -Path $Path -ExistingLeafHandle $opened
+        }
+        else {
+            Get-HerdrPhysicalPathProof -Path $Path
+        }
         Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $afterProof.Leaf -Description 'JSON input after read' -IncludeLinkCount | Out-Null
         if ($null -ne $boundaryBefore) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot `
-                -ExpectedCandidate $proof -ExpectedRoot $boundaryBefore.Root -Description 'JSON input boundary after read' | Out-Null
+                -ExpectedCandidate $proof -ExpectedRoot $boundaryBefore.Root -Description 'JSON input boundary after read' `
+                -ExistingCandidateHandle $opened | Out-Null
         }
     }
     catch {
