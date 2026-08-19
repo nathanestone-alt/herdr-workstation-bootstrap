@@ -79,7 +79,7 @@ EOF
 
   cat > "$fake_bin/pwsh" <<'EOF'
 #!/usr/bin/env bash
-printf '7.6.4\n'
+printf '7.6.5\n'
 EOF
 
   cat > "$fake_bin/systemctl" <<'EOF'
@@ -134,7 +134,7 @@ run_case() {
   set +e
   CASE_ROOT="$case_root" \
   CASE_MODE="$case_mode" \
-  EXPECTED_TAILSCALE_VERSION='1.88.4' \
+  EXPECTED_TAILSCALE_VERSION='1.102.2' \
   HOME="$home" \
   PATH="$case_root/bin:/usr/bin:/bin" \
   bash -c '
@@ -198,15 +198,15 @@ run_case() {
     "$case_name" "$status" "$expect_marker" "$expect_allow_downgrades"
 }
 
-run_case parent-downgrade "$test_root/starting-bootstrap.sh" exact 1.102.2 100 no no
-run_case candidate-downgrade "$repo_root/scripts/ubuntu/bootstrap.sh" exact 1.102.2 0 yes yes
+run_case parent-downgrade "$test_root/starting-bootstrap.sh" exact 1.103.0 100 no no
+run_case candidate-downgrade "$repo_root/scripts/ubuntu/bootstrap.sh" exact 1.103.0 0 yes yes
 run_case candidate-upgrade "$repo_root/scripts/ubuntu/bootstrap.sh" exact 1.80.0 0 yes yes
-run_case candidate-exact "$repo_root/scripts/ubuntu/bootstrap.sh" exact 1.88.4 0 yes no
-run_case candidate-arbitrary-installer "$repo_root/scripts/ubuntu/bootstrap.sh" arbitrary-installer 1.102.2 24 no no
-run_case candidate-invalid-lock "$repo_root/scripts/ubuntu/bootstrap.sh" invalid-lock 1.102.2 22 no no
-run_case candidate-checksum-failure "$repo_root/scripts/ubuntu/bootstrap.sh" checksum-failure 1.102.2 23 no no
-run_case candidate-install-failure "$repo_root/scripts/ubuntu/bootstrap.sh" install-failure 1.102.2 71 no yes
-run_case candidate-post-mismatch "$repo_root/scripts/ubuntu/bootstrap.sh" post-mismatch 1.102.2 24 no yes
+run_case candidate-exact "$repo_root/scripts/ubuntu/bootstrap.sh" exact 1.102.2 0 yes no
+run_case candidate-arbitrary-installer "$repo_root/scripts/ubuntu/bootstrap.sh" arbitrary-installer 1.103.0 24 no no
+run_case candidate-invalid-lock "$repo_root/scripts/ubuntu/bootstrap.sh" invalid-lock 1.103.0 22 no no
+run_case candidate-checksum-failure "$repo_root/scripts/ubuntu/bootstrap.sh" checksum-failure 1.103.0 23 no no
+run_case candidate-install-failure "$repo_root/scripts/ubuntu/bootstrap.sh" install-failure 1.103.0 71 no yes
+run_case candidate-post-mismatch "$repo_root/scripts/ubuntu/bootstrap.sh" post-mismatch 1.103.0 24 no yes
 
 exact_case="$test_root/candidate-exact"
 if [[ -f "$exact_case/apt.log" ]] && grep -Fq 'tailscale=' "$exact_case/apt.log"; then
