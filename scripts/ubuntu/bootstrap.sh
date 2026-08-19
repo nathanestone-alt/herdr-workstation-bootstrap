@@ -349,6 +349,10 @@ validate_toolchain_lock() {
   [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
     echo 'TAILSCALE_VERSION is not a pinned semantic version.' >&2; return 1;
   }
+  [[ "$TAILSCALE_INSTALLER_URL" == 'https://tailscale.com/install.sh' ]] || {
+    echo 'TAILSCALE_INSTALLER_URL is not the pinned official installer.' >&2
+    return 1
+  }
   return 0
 }
 
@@ -442,6 +446,78 @@ download_verified() {
     exit 23
   }
 }
+
+install_locked_tailscale() (
+  local installed_tailscale
+  local tailscale_temp_dir
+  local installer
+  local apt_get_shim
+  local real_apt_get
+  local installer_status
+
+  validate_toolchain_lock || exit 22
+  installed_tailscale="$(tailscale version 2>/dev/null | head -n 1 || true)"
+  [[ "$installed_tailscale" == "$TAILSCALE_VERSION" ]] && return 0
+
+  tailscale_temp_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$tailscale_temp_dir"' EXIT
+  installer="$tailscale_temp_dir/install.sh"
+  apt_get_shim="$tailscale_temp_dir/apt-get"
+  real_apt_get="$(command -v apt-get || true)"
+  [[ "$real_apt_get" == /* && -x "$real_apt_get" ]] || {
+    echo 'Could not resolve the system apt-get executable.' >&2
+    exit 24
+  }
+
+  download_verified "$TAILSCALE_INSTALLER_URL" "$TAILSCALE_INSTALLER_SHA256" "$installer"
+  cat > "$apt_get_shim" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_apt_get="${HERDR_TAILSCALE_REAL_APT_GET:?}"
+locked_version="${TAILSCALE_VERSION:?}"
+args=("$@")
+has_tailscale_package=0
+for arg in "${args[@]}"; do
+  case "$arg" in
+    tailscale|tailscale=*) has_tailscale_package=1 ;;
+  esac
+done
+
+if (( has_tailscale_package == 1 )); then
+  if [[ "${#args[@]}" -eq 4 &&
+        "${args[0]}" == 'install' &&
+        "${args[1]}" == '-y' &&
+        "${args[2]}" == "tailscale=$locked_version" &&
+        "${args[3]}" == 'tailscale-archive-keyring' ]]; then
+    exec "$real_apt_get" install --allow-downgrades -y "${args[2]}" "${args[3]}"
+  fi
+  echo 'Unexpected or unlocked Tailscale apt-get invocation.' >&2
+  exit 24
+fi
+
+exec "$real_apt_get" "${args[@]}"
+EOF
+  chmod 0755 "$apt_get_shim"
+
+  if sudo env \
+    PATH="$tailscale_temp_dir:$PATH" \
+    HERDR_TAILSCALE_REAL_APT_GET="$real_apt_get" \
+    TAILSCALE_VERSION="$TAILSCALE_VERSION" \
+    sh "$installer"; then
+    installer_status=0
+  else
+    installer_status=$?
+  fi
+  (( installer_status == 0 )) || {
+    echo "Tailscale installer failed with exit status $installer_status." >&2
+    exit "$installer_status"
+  }
+  [[ "$(tailscale version | head -n 1)" == "$TAILSCALE_VERSION" ]] || {
+    echo "Tailscale version does not match lock ($TAILSCALE_VERSION)." >&2
+    exit 24
+  }
+)
 
 install_python_toolchain() {
   local state_fd
@@ -664,6 +740,7 @@ install_base() {
   local state_fd
   local bin_fd
   local state_anchor
+  validate_toolchain_lock || exit 22
   validate_managed_paths "$state_dir" "$state_dir/base-complete" "$bin_dir" || {
     echo 'Managed bootstrap paths are unsafe.' >&2
     exit 24
@@ -697,16 +774,7 @@ install_base() {
   }
 
   sudo systemctl enable --now ssh
-  installed_tailscale="$(tailscale version 2>/dev/null | head -n 1 || true)"
-  if [[ "$installed_tailscale" != "$TAILSCALE_VERSION" ]]; then
-    installer="$(mktemp)"
-    download_verified "$TAILSCALE_INSTALLER_URL" "$TAILSCALE_INSTALLER_SHA256" "$installer"
-    sudo env TAILSCALE_VERSION="$TAILSCALE_VERSION" sh "$installer"
-    rm -f "$installer"
-  fi
-  [[ "$(tailscale version | head -n 1)" == "$TAILSCALE_VERSION" ]] || {
-    echo "Tailscale version does not match lock ($TAILSCALE_VERSION)." >&2; exit 24;
-  }
+  install_locked_tailscale
   sudo systemctl enable --now tailscaled
   fence_require_directory "$state_dir" "$state_fd" 'base state directory'
   : > "$state_anchor/base-complete"
