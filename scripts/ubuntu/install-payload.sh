@@ -31,12 +31,33 @@ source_commit=''
 source_commit_before_transaction=''
 stage_root=''
 backup_root=''
+transaction_root=''
+transaction_root_anchor=''
+transaction_state_file=''
+transaction_display_root=''
+transaction_display_state_file=''
+transaction_display_backup_root=''
+transaction_id=''
+transaction_phase=''
+transaction_owner_uid=''
+transaction_state_untrusted=0
+transaction_recovery_required=0
+transaction_recovery_mode=0
 agents_had_original=0
 claude_had_original=0
 agents_new=0
 claude_new=0
 receipt_had_original=0
 receipt_touched=0
+agents_backup_present=0
+claude_backup_present=0
+receipt_backup_present=0
+agents_backup_pending=0
+claude_backup_pending=0
+receipt_backup_pending=0
+agents_publish_pending=0
+claude_publish_pending=0
+receipt_publish_pending=0
 transaction_guard_enabled=0
 transaction_backups_ready=0
 transaction_committed=0
@@ -62,6 +83,390 @@ path_is_under() {
   local child="$1"
   local parent="$2"
   [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+path_present() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+transaction_state_keys=(
+  state_version transaction_id owner_uid home_real state_dir repo_root source_commit
+  manifest_sha256 transaction_root stage_root backup_root state_file
+  agents_destination claude_destination payload_receipt phase
+  agents_had_original claude_had_original receipt_had_original
+  agents_backup_present claude_backup_present receipt_backup_present
+  agents_backup_pending claude_backup_pending receipt_backup_pending
+  agents_publish_pending claude_publish_pending receipt_publish_pending
+  agents_new claude_new receipt_touched
+)
+
+write_transaction_state() {
+  local phase="$1"
+  local state_tmp
+  transaction_phase="$phase"
+  [[ -n "$transaction_root_anchor" && -n "$transaction_state_file" ]] || return 1
+  if ! state_tmp="$(mktemp "$transaction_root_anchor/.state.tmp.XXXXXX" 2>/dev/null)"; then
+    transaction_state_untrusted=1
+    return 1
+  fi
+  if ! {
+    printf 'state_version=issue-961-payload-transaction-v1\n'
+    printf 'transaction_id=%s\n' "$transaction_id"
+    printf 'owner_uid=%s\n' "$(id -u)"
+    printf 'home_real=%s\n' "$home_real"
+    printf 'state_dir=%s\n' "$state_dir"
+    printf 'repo_root=%s\n' "$repo_root"
+    printf 'source_commit=%s\n' "$source_commit"
+    printf 'manifest_sha256=%s\n' "$manifest_sha256"
+    printf 'transaction_root=%s\n' "$transaction_display_root"
+    printf 'stage_root=%s\n' "$transaction_display_root/stage"
+    printf 'backup_root=%s\n' "$transaction_display_backup_root"
+    printf 'state_file=%s\n' "$transaction_display_state_file"
+    printf 'agents_destination=%s\n' "$agents_destination"
+    printf 'claude_destination=%s\n' "$claude_destination"
+    printf 'payload_receipt=%s\n' "$payload_receipt"
+    printf 'phase=%s\n' "$phase"
+    printf 'agents_had_original=%s\n' "$agents_had_original"
+    printf 'claude_had_original=%s\n' "$claude_had_original"
+    printf 'receipt_had_original=%s\n' "$receipt_had_original"
+    printf 'agents_backup_present=%s\n' "$agents_backup_present"
+    printf 'claude_backup_present=%s\n' "$claude_backup_present"
+    printf 'receipt_backup_present=%s\n' "$receipt_backup_present"
+    printf 'agents_backup_pending=%s\n' "$agents_backup_pending"
+    printf 'claude_backup_pending=%s\n' "$claude_backup_pending"
+    printf 'receipt_backup_pending=%s\n' "$receipt_backup_pending"
+    printf 'agents_publish_pending=%s\n' "$agents_publish_pending"
+    printf 'claude_publish_pending=%s\n' "$claude_publish_pending"
+    printf 'receipt_publish_pending=%s\n' "$receipt_publish_pending"
+    printf 'agents_new=%s\n' "$agents_new"
+    printf 'claude_new=%s\n' "$claude_new"
+    printf 'receipt_touched=%s\n' "$receipt_touched"
+  } > "$state_tmp"; then
+    rm -f -- "$state_tmp"
+    transaction_state_untrusted=1
+    return 1
+  fi
+  if ! chmod 0600 -- "$state_tmp" || ! mv -T -- "$state_tmp" "$transaction_state_file"; then
+    rm -f -- "$state_tmp"
+    transaction_state_untrusted=1
+    return 1
+  fi
+  sync -f "$transaction_state_file" 2>/dev/null || true
+  transaction_state_untrusted=0
+}
+
+create_transaction() {
+  local transaction_root_created
+  fence_require_directory "$state_dir" "$state_dir_fd" 'payload transaction state directory'
+  if ! transaction_root_anchor="$(mktemp -d "$state_dir_anchor/.payload-transaction.XXXXXX")"; then
+    fail_closed 'could not create the payload transaction journal.'
+  fi
+  transaction_id="${transaction_root_anchor##*/}"
+  transaction_display_root="$state_dir/$transaction_id"
+  transaction_root="$transaction_display_root"
+  transaction_display_state_file="$transaction_display_root/state"
+  transaction_display_backup_root="$transaction_display_root/backup"
+  transaction_state_file="$transaction_root_anchor/state"
+  stage_root="$transaction_root_anchor/stage"
+  backup_root="$transaction_root_anchor/backup"
+  transaction_root_created=1
+  if ! chmod 0700 -- "$transaction_root_anchor" ||
+    ! mkdir -- "$stage_root" "$backup_root" ||
+    ! chmod 0700 -- "$stage_root" "$backup_root"; then
+    (( transaction_root_created == 1 )) && rm -rf -- "$transaction_root_anchor"
+    fail_closed "could not initialize the payload transaction journal: $transaction_display_root"
+  fi
+  transaction_owner_uid="$(id -u)"
+  transaction_phase='staging'
+  transaction_state_untrusted=0
+  manifest_sha256="$(sha256sum "$manifest_file" | awk '{print $1}')"
+  if ! write_transaction_state staging; then
+    rm -rf -- "$transaction_root_anchor"
+    fail_closed "could not persist the payload transaction journal: $transaction_display_root"
+  fi
+}
+
+load_transaction_state() {
+  local candidate_root="$1"
+  local line
+  local key
+  local value
+  local state_mode
+  local root_mode
+  local backup_mode
+  local stage_mode
+  local -A values=()
+
+  [[ -d "$candidate_root" && ! -L "$candidate_root" ]] || {
+    fail_closed "incomplete payload transaction is not a real directory: $candidate_root"
+  }
+  root_mode="$(stat -c '%a' -- "$candidate_root" 2>/dev/null || true)"
+  [[ "$(stat -c '%u' -- "$candidate_root" 2>/dev/null || true)" == "$(id -u)" && "$root_mode" == 700 ]] || {
+    fail_closed "incomplete payload transaction has unsafe ownership or permissions: $candidate_root"
+  }
+
+  transaction_root_anchor="$candidate_root"
+  transaction_id="${candidate_root##*/}"
+  [[ "$transaction_id" =~ ^\.payload-transaction\.[A-Za-z0-9]+$ ]] || {
+    fail_closed "incomplete payload transaction has an invalid identity: $candidate_root"
+  }
+  transaction_display_root="$state_dir/$transaction_id"
+  transaction_root="$transaction_display_root"
+  transaction_state_file="$transaction_root_anchor/state"
+  transaction_display_state_file="$transaction_display_root/state"
+  transaction_display_backup_root="$transaction_display_root/backup"
+  stage_root="$transaction_root_anchor/stage"
+  backup_root="$transaction_root_anchor/backup"
+  [[ -f "$transaction_state_file" && ! -L "$transaction_state_file" ]] || {
+    fail_closed "incomplete payload transaction has no trusted journal: $transaction_display_root"
+  }
+  state_mode="$(stat -c '%a' -- "$transaction_state_file" 2>/dev/null || true)"
+  [[ "$(stat -c '%u' -- "$transaction_state_file" 2>/dev/null || true)" == "$(id -u)" && "$state_mode" == 600 ]] || {
+    fail_closed "incomplete payload transaction journal has unsafe ownership or permissions: $transaction_display_state_file"
+  }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([a-z0-9_]+)=(.*)$ ]] || {
+      fail_closed "malformed payload transaction journal: $transaction_display_state_file"
+    }
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "$key" in
+      state_version|transaction_id|owner_uid|home_real|state_dir|repo_root|source_commit|manifest_sha256|\
+      transaction_root|stage_root|backup_root|state_file|agents_destination|claude_destination|payload_receipt|phase|\
+      agents_had_original|claude_had_original|receipt_had_original|agents_backup_present|claude_backup_present|\
+      receipt_backup_present|agents_backup_pending|claude_backup_pending|receipt_backup_pending|agents_publish_pending|\
+      claude_publish_pending|receipt_publish_pending|agents_new|claude_new|receipt_touched) ;;
+      *) fail_closed "unknown payload transaction journal key: $key" ;;
+    esac
+    [[ -z "${values[$key]+present}" ]] || fail_closed "duplicate payload transaction journal key: $key"
+    values["$key"]="$value"
+  done < "$transaction_state_file"
+
+  local required_key
+  for required_key in "${transaction_state_keys[@]}"; do
+    [[ -n "${values[$required_key]+present}" ]] || {
+      fail_closed "missing payload transaction journal key: $required_key"
+    }
+  done
+
+  [[ "${values[state_version]}" == 'issue-961-payload-transaction-v1' ]] || fail_closed 'unsupported payload transaction journal version.'
+  [[ "${values[transaction_id]}" == "$transaction_id" ]] || fail_closed 'payload transaction journal identity mismatch.'
+  [[ "${values[owner_uid]}" == "$(id -u)" ]] || fail_closed "payload transaction is owned by another uid: $transaction_display_root"
+  [[ "${values[home_real]}" == "$home_real" ]] || fail_closed "payload transaction belongs to another HOME: $transaction_display_root"
+  [[ "${values[state_dir]}" == "$state_dir" && "${values[repo_root]}" == "$repo_root" ]] || fail_closed "payload transaction ownership path mismatch: $transaction_display_root"
+  [[ "${values[transaction_root]}" == "$transaction_display_root" &&
+    "${values[stage_root]}" == "$transaction_display_root/stage" &&
+    "${values[backup_root]}" == "$transaction_display_root/backup" &&
+    "${values[state_file]}" == "$transaction_display_root/state" ]] || {
+    fail_closed "payload transaction journal path mismatch: $transaction_display_root"
+  }
+  [[ "${values[agents_destination]}" == "$agents_destination" &&
+    "${values[claude_destination]}" == "$claude_destination" &&
+    "${values[payload_receipt]}" == "$payload_receipt" ]] || {
+    fail_closed "payload transaction destination ownership mismatch: $transaction_display_root"
+  }
+  [[ "${values[source_commit]}" =~ ^[0-9a-f]{40}$ && "${values[manifest_sha256]}" =~ ^[0-9a-f]{64}$ ]] || {
+    fail_closed "payload transaction source identity is malformed: $transaction_display_root"
+  }
+  case "${values[phase]}" in
+    staging|backing-up|publishing|writing-receipt|rollback-started|rollback-incomplete|committing|committed|rolled-back) ;;
+    *) fail_closed "payload transaction journal phase is invalid: ${values[phase]}" ;;
+  esac
+  for required_key in agents_had_original claude_had_original receipt_had_original \
+    agents_backup_present claude_backup_present receipt_backup_present \
+    agents_backup_pending claude_backup_pending receipt_backup_pending \
+    agents_publish_pending claude_publish_pending receipt_publish_pending \
+    agents_new claude_new receipt_touched; do
+    [[ "${values[$required_key]}" =~ ^[01]$ ]] || fail_closed "payload transaction journal flag is malformed: $required_key"
+  done
+
+  transaction_owner_uid="${values[owner_uid]}"
+  source_commit="${values[source_commit]}"
+  manifest_sha256="${values[manifest_sha256]}"
+  transaction_phase="${values[phase]}"
+  agents_had_original="${values[agents_had_original]}"
+  claude_had_original="${values[claude_had_original]}"
+  receipt_had_original="${values[receipt_had_original]}"
+  agents_backup_present="${values[agents_backup_present]}"
+  claude_backup_present="${values[claude_backup_present]}"
+  receipt_backup_present="${values[receipt_backup_present]}"
+  agents_backup_pending="${values[agents_backup_pending]}"
+  claude_backup_pending="${values[claude_backup_pending]}"
+  receipt_backup_pending="${values[receipt_backup_pending]}"
+  agents_publish_pending="${values[agents_publish_pending]}"
+  claude_publish_pending="${values[claude_publish_pending]}"
+  receipt_publish_pending="${values[receipt_publish_pending]}"
+  agents_new="${values[agents_new]}"
+  claude_new="${values[claude_new]}"
+  receipt_touched="${values[receipt_touched]}"
+  transaction_state_untrusted=0
+  transaction_backups_ready=1
+  [[ -d "$backup_root" && ! -L "$backup_root" ]] || {
+    [[ "$transaction_phase" == committed || "$transaction_phase" == rolled-back ]] || {
+      fail_closed "incomplete payload transaction backup root is missing: $transaction_display_backup_root"
+    }
+  }
+  if [[ -d "$backup_root" && ! -L "$backup_root" ]]; then
+    backup_mode="$(stat -c '%a' -- "$backup_root" 2>/dev/null || true)"
+    [[ "$(stat -c '%u' -- "$backup_root" 2>/dev/null || true)" == "$(id -u)" && "$backup_mode" == 700 ]] || {
+      fail_closed "incomplete payload transaction backup root has unsafe ownership or permissions: $transaction_display_backup_root"
+    }
+  fi
+  if [[ -e "$stage_root" || -L "$stage_root" ]]; then
+    [[ -d "$stage_root" && ! -L "$stage_root" ]] || fail_closed "incomplete payload transaction stage root is unsafe: $transaction_display_root/stage"
+    stage_mode="$(stat -c '%a' -- "$stage_root" 2>/dev/null || true)"
+    [[ "$(stat -c '%u' -- "$stage_root" 2>/dev/null || true)" == "$(id -u)" && "$stage_mode" == 700 ]] || {
+      fail_closed "incomplete payload transaction stage root has unsafe ownership or permissions: $transaction_display_root/stage"
+    }
+  fi
+}
+
+reconcile_pending_transaction_state() {
+  local changed=0
+  local backup_path
+  local receipt_tmp_candidate
+
+  if (( agents_backup_pending == 1 )); then
+    backup_path="$backup_root/agents-skills"
+    if path_present "$backup_path" && ! path_present "$agents_destination_anchor"; then
+      agents_backup_pending=0
+      agents_backup_present=1
+    elif ! path_present "$backup_path" && path_present "$agents_destination_anchor"; then
+      agents_backup_pending=0
+      agents_backup_present=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( claude_backup_pending == 1 )); then
+    backup_path="$backup_root/claude-skills"
+    if path_present "$backup_path" && ! path_present "$claude_destination_anchor"; then
+      claude_backup_pending=0
+      claude_backup_present=1
+    elif ! path_present "$backup_path" && path_present "$claude_destination_anchor"; then
+      claude_backup_pending=0
+      claude_backup_present=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( receipt_backup_pending == 1 )); then
+    backup_path="$backup_root/payload-runtime-receipt.txt"
+    if path_present "$backup_path" && ! path_present "$state_dir_anchor/payload-runtime-receipt.txt"; then
+      receipt_backup_pending=0
+      receipt_backup_present=1
+    elif ! path_present "$backup_path" && path_present "$state_dir_anchor/payload-runtime-receipt.txt"; then
+      receipt_backup_pending=0
+      receipt_backup_present=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( agents_publish_pending == 1 )); then
+    if path_present "$agents_destination_anchor" && ! path_present "$stage_root/agents-skills"; then
+      agents_publish_pending=0
+      agents_new=1
+    elif ! path_present "$agents_destination_anchor" && path_present "$stage_root/agents-skills"; then
+      agents_publish_pending=0
+      agents_new=0
+    elif (( transaction_recovery_mode == 1 )) && ! path_present "$agents_destination_anchor" && ! path_present "$stage_root/agents-skills"; then
+      agents_publish_pending=0
+      agents_new=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( claude_publish_pending == 1 )); then
+    if path_present "$claude_destination_anchor" && ! path_present "$stage_root/claude-skills"; then
+      claude_publish_pending=0
+      claude_new=1
+    elif ! path_present "$claude_destination_anchor" && path_present "$stage_root/claude-skills"; then
+      claude_publish_pending=0
+      claude_new=0
+    elif (( transaction_recovery_mode == 1 )) && ! path_present "$claude_destination_anchor" && ! path_present "$stage_root/claude-skills"; then
+      claude_publish_pending=0
+      claude_new=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( receipt_publish_pending == 1 )); then
+    receipt_tmp_candidate="$(find -L "$transaction_root_anchor" -maxdepth 1 -type f -name '.payload-runtime-receipt.*' -print -quit 2>/dev/null || true)"
+    if path_present "$state_dir_anchor/payload-runtime-receipt.txt" && [[ -z "$receipt_tmp_candidate" ]]; then
+      receipt_publish_pending=0
+      receipt_touched=1
+    elif ! path_present "$state_dir_anchor/payload-runtime-receipt.txt" && [[ -n "$receipt_tmp_candidate" ]]; then
+      receipt_publish_pending=0
+      receipt_touched=0
+    elif (( transaction_recovery_mode == 1 )) && ! path_present "$state_dir_anchor/payload-runtime-receipt.txt" && [[ -z "$receipt_tmp_candidate" ]]; then
+      receipt_publish_pending=0
+      receipt_touched=0
+    else
+      return 1
+    fi
+    changed=1
+  fi
+  if (( changed == 1 )); then
+    write_transaction_state "$transaction_phase" || return 1
+  fi
+}
+
+recover_prior_transaction() {
+  local candidate
+  local recovery_parents_open=0
+  local -a candidates=()
+  while IFS= read -r -d '' candidate; do
+    candidates+=("$candidate")
+  done < <(find -L "$state_dir_anchor" -mindepth 1 -maxdepth 1 -name '.payload-transaction.*' -print0 2>/dev/null)
+  (( ${#candidates[@]} == 0 )) && return 0
+  (( ${#candidates[@]} == 1 )) || fail_closed 'multiple payload transactions require manual recovery; refusing to choose one.'
+
+  load_transaction_state "${candidates[0]}"
+  case "$transaction_phase" in
+    committed|rolled-back)
+      transaction_committed=1
+      transaction_recovery_mode=1
+      cleanup_transaction_residue || fail_closed "could not remove committed payload transaction residue; recover $transaction_display_root"
+      transaction_recovery_mode=0
+      ;;
+    staging)
+      fail_closed "payload transaction is incomplete before durable backups; inspect and recover $transaction_display_root before retrying."
+      ;;
+    backing-up|publishing|writing-receipt|committing|rollback-started|rollback-incomplete)
+      fence_open_parent "$agents_destination" agents_parent_fd agents_destination_anchor agents_parent_path
+      fence_open_parent "$claude_destination" claude_parent_fd claude_destination_anchor claude_parent_path
+      recovery_parents_open=1
+      fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents recovery destination parent'
+      fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude recovery destination parent'
+      transaction_recovery_mode=1
+      reconcile_pending_transaction_state || fail_closed "payload transaction recovery is ambiguous; inspect $transaction_display_root and preserve its backups."
+      rollback_transaction || fail_closed "incomplete rollback retained at $transaction_display_root; rerun after resolving the reported restore failure."
+      cleanup_transaction_residue || fail_closed "recovered payload transaction residue could not be removed; recover $transaction_display_root"
+      if (( recovery_parents_open == 1 )); then
+        close_fence_fd "$agents_parent_fd"
+        close_fence_fd "$claude_parent_fd"
+      fi
+      transaction_recovery_mode=0
+      ;;
+    *)
+      fail_closed "payload transaction has an unsupported recovery phase at $transaction_display_root"
+      ;;
+  esac
+  transaction_root=''
+  transaction_root_anchor=''
+  transaction_state_file=''
+  transaction_display_root=''
+  transaction_display_state_file=''
+  transaction_display_backup_root=''
+  transaction_id=''
+  stage_root=''
+  backup_root=''
 }
 
 validate_user_home() {
@@ -499,9 +904,11 @@ verify_installed_payload() {
 write_runtime_receipt() {
   [[ "${HERDR_PAYLOAD_TEST_FAIL_RECEIPT_WRITE:-0}" != 1 ]] || return 1
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload receipt state directory'
-  receipt_tmp="$(mktemp "$state_dir_anchor/.payload-runtime-receipt.XXXXXX")"
+  receipt_publish_pending=1
+  write_transaction_state writing-receipt || return 1
+  receipt_tmp="$(mktemp "$transaction_root_anchor/.payload-runtime-receipt.XXXXXX")"
   manifest_sha256="$(sha256sum "$manifest_file" | awk '{print $1}')"
-  {
+  if ! {
     printf 'receipt_format=issue-961-payload-v1\n'
     printf 'source_commit=%s\n' "$source_commit"
     printf 'tracked_manifest_sha256=%s\n' "$manifest_sha256"
@@ -526,17 +933,20 @@ write_runtime_receipt() {
       test_number=$((test_number + 1))
       printf 'regression_test_command_%02d=%s\n' "$test_number" "pwsh -NoProfile -File $regression_test"
     done
-  } > "$receipt_tmp"
-  chmod 0644 "$receipt_tmp"
+  } > "$receipt_tmp"; then
+    return 1
+  fi
+  chmod 0644 "$receipt_tmp" || return 1
   fence_test_pause before-receipt-publish
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload receipt state directory'
   if ! mv -T -- "$receipt_tmp" "$state_dir_anchor/payload-runtime-receipt.txt"; then
-    rm -f "$receipt_tmp"
     return 1
   fi
   receipt_touched=1
+  receipt_publish_pending=0
   rm -f "$receipt_tmp"
   receipt_tmp=''
+  write_transaction_state writing-receipt || return 1
 }
 
 validate_written_receipt() {
@@ -551,67 +961,139 @@ validate_written_receipt() {
 
 rollback_transaction() {
   local rollback_status=0
+  local old_recovery_mode
   (( rollback_in_progress == 1 )) && return 0
   (( transaction_backups_ready == 1 )) || return 0
   (( transaction_committed == 0 )) || return 0
   (( transaction_rolled_back == 1 )) && return 0
   rollback_in_progress=1
-  if (( agents_new == 1 )) && [[ -e "$agents_destination_anchor" || -L "$agents_destination_anchor" ]]; then
-    rm -rf -- "$agents_destination_anchor" || rollback_status=1
+  old_recovery_mode="$transaction_recovery_mode"
+  transaction_recovery_mode=1
+  if ! write_transaction_state rollback-started || ! reconcile_pending_transaction_state; then
+    transaction_recovery_required=1
+    write_transaction_state rollback-incomplete || true
+    rollback_in_progress=0
+    transaction_recovery_mode="$old_recovery_mode"
+    return 1
   fi
-  if (( claude_new == 1 )) && [[ -e "$claude_destination_anchor" || -L "$claude_destination_anchor" ]]; then
-    rm -rf -- "$claude_destination_anchor" || rollback_status=1
-  fi
-  if (( agents_had_original == 1 )) && [[ -e "$backup_root/agents-skills" || -L "$backup_root/agents-skills" ]]; then
-    mv -T -- "$backup_root/agents-skills" "$agents_destination_anchor" || rollback_status=1
-  fi
-  if (( claude_had_original == 1 )) && [[ -e "$backup_root/claude-skills" || -L "$backup_root/claude-skills" ]]; then
-    mv -T -- "$backup_root/claude-skills" "$claude_destination_anchor" || rollback_status=1
-  fi
-  if (( receipt_touched == 1 )) && [[ -e "$state_dir_anchor/payload-runtime-receipt.txt" || -L "$state_dir_anchor/payload-runtime-receipt.txt" ]]; then
-    rm -f -- "$state_dir_anchor/payload-runtime-receipt.txt" || rollback_status=1
-  fi
-  if (( receipt_had_original == 1 )) && [[ -e "$backup_root/payload-runtime-receipt.txt" || -L "$backup_root/payload-runtime-receipt.txt" ]]; then
-    mv -T -- "$backup_root/payload-runtime-receipt.txt" "$state_dir_anchor/payload-runtime-receipt.txt" || rollback_status=1
-  fi
-  if (( rollback_status == 0 )); then
-    agents_new=0
-    claude_new=0
-    receipt_touched=0
-    agents_had_original=0
-    claude_had_original=0
-    receipt_had_original=0
+
+  rollback_remove_directory() {
+    local destination="$1"
+    local flag_name="$2"
+    local current_value="${!flag_name}"
+    (( current_value == 1 )) || return 0
+    (( transaction_state_untrusted == 0 )) || return 1
+    if path_present "$destination" && ! rm -rf -- "$destination"; then
+      return 1
+    fi
+    printf -v "$flag_name" '%s' 0
+    write_transaction_state rollback-started
+  }
+
+  rollback_remove_file() {
+    local destination="$1"
+    local flag_name="$2"
+    local current_value="${!flag_name}"
+    (( current_value == 1 )) || return 0
+    (( transaction_state_untrusted == 0 )) || return 1
+    if path_present "$destination" && ! rm -f -- "$destination"; then
+      return 1
+    fi
+    printf -v "$flag_name" '%s' 0
+    write_transaction_state rollback-started
+  }
+
+  rollback_restore() {
+    local backup_path="$1"
+    local destination="$2"
+    local had_name="$3"
+    local backup_name="$4"
+    local had_value="${!had_name}"
+    local backup_value="${!backup_name}"
+    if (( had_value == 1 )); then
+      if (( backup_value == 1 )); then
+        path_present "$backup_path" || return 1
+        path_present "$destination" && return 1
+        (( transaction_state_untrusted == 0 )) || return 1
+        mv -T -- "$backup_path" "$destination" || return 1
+        printf -v "$backup_name" '%s' 0
+        write_transaction_state rollback-started
+      else
+        path_present "$destination" || return 1
+      fi
+    else
+      return 0
+    fi
+  }
+
+  if ! rollback_remove_directory "$agents_destination_anchor" agents_new; then rollback_status=1; fi
+  if ! rollback_remove_directory "$claude_destination_anchor" claude_new; then rollback_status=1; fi
+  if ! rollback_restore "$backup_root/agents-skills" "$agents_destination_anchor" agents_had_original agents_backup_present; then rollback_status=1; fi
+  if ! rollback_restore "$backup_root/claude-skills" "$claude_destination_anchor" claude_had_original claude_backup_present; then rollback_status=1; fi
+  if ! rollback_remove_file "$state_dir_anchor/payload-runtime-receipt.txt" receipt_touched; then rollback_status=1; fi
+  if ! rollback_restore "$backup_root/payload-runtime-receipt.txt" "$state_dir_anchor/payload-runtime-receipt.txt" receipt_had_original receipt_backup_present; then rollback_status=1; fi
+
+  if (( rollback_status == 0 && transaction_state_untrusted == 0 )) &&
+    (( agents_new == 0 && claude_new == 0 && receipt_touched == 0 &&
+       agents_backup_present == 0 && claude_backup_present == 0 && receipt_backup_present == 0 &&
+       agents_backup_pending == 0 && claude_backup_pending == 0 && receipt_backup_pending == 0 &&
+       agents_publish_pending == 0 && claude_publish_pending == 0 && receipt_publish_pending == 0 )); then
     transaction_rolled_back=1
+    transaction_recovery_required=0
+    if ! write_transaction_state rolled-back; then
+      transaction_recovery_required=1
+      rollback_status=1
+    fi
+  else
+    transaction_recovery_required=1
+    write_transaction_state rollback-incomplete || true
+    rollback_status=1
   fi
   rollback_in_progress=0
+  transaction_recovery_mode="$old_recovery_mode"
   return "$rollback_status"
 }
 
 cleanup_transaction_residue() {
   local cleanup_status=0
-  if [[ -n "$receipt_tmp" && -e "$receipt_tmp" ]]; then
-    rm -f -- "$receipt_tmp" || cleanup_status=1
+  if (( transaction_recovery_required == 1 )); then
+    echo "BLOCKED: incomplete rollback retained at $transaction_display_root; backup evidence: $transaction_display_backup_root" >&2
+    return 1
+  fi
+  if (( transaction_backups_ready == 1 && transaction_committed == 0 && transaction_rolled_back == 0 )); then
+    echo "BLOCKED: transaction backups retained at $transaction_display_backup_root until rollback completes." >&2
+    return 1
   fi
   if (( transaction_committed == 1 )); then
     fence_test_pause during-backup-cleanup
   fi
-  [[ -z "$backup_root" || ! -e "$backup_root" ]] || rm -rf -- "$backup_root" || cleanup_status=1
+  if [[ -n "$transaction_root_anchor" && -e "$transaction_root_anchor" ]]; then
+    rm -rf -- "$transaction_root_anchor" || cleanup_status=1
+  fi
   if (( transaction_committed == 1 )); then
     fence_test_pause after-backup-cleanup
   fi
-  [[ -z "$stage_root" || ! -e "$stage_root" ]] || rm -rf -- "$stage_root" || cleanup_status=1
+  if (( cleanup_status == 0 )); then
+    transaction_backups_ready=0
+    receipt_tmp=''
+  fi
   return "$cleanup_status"
 }
 
 transaction_exit_handler() {
   local status="$1"
+  local rollback_status=0
   trap - EXIT HUP INT TERM
   if (( transaction_guard_enabled == 1 )); then
     transaction_guard_enabled=0
     if (( status != 0 && transaction_committed == 0 )); then
-      rollback_transaction || echo 'BLOCKED: transaction rollback was incomplete.' >&2
+      rollback_transaction || rollback_status=1
     fi
-    cleanup_transaction_residue || echo 'BLOCKED: transaction residue cleanup was incomplete.' >&2
+    if (( rollback_status == 0 )); then
+      cleanup_transaction_residue || echo "BLOCKED: transaction residue cleanup was incomplete; recover $transaction_display_root" >&2
+    else
+      echo "BLOCKED: incomplete rollback retained at $transaction_display_root; backup evidence: $transaction_display_backup_root" >&2
+    fi
   fi
   return "$status"
 }
@@ -619,8 +1101,10 @@ transaction_exit_handler() {
 install_transaction_guard() {
   transaction_guard_enabled=1
   transaction_committed=0
-  transaction_backups_ready=0
   transaction_rolled_back=0
+  transaction_state_untrusted=0
+  transaction_recovery_required=0
+  transaction_recovery_mode=0
   trap 'transaction_exit_handler "$?"' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -628,7 +1112,12 @@ install_transaction_guard() {
 }
 
 commit_transaction() {
+  write_transaction_state committing || return 1
   transaction_committed=1
+  if ! write_transaction_state committed; then
+    transaction_committed=0
+    return 1
+  fi
   transaction_guard_enabled=0
   fence_test_pause between-rollback-disarm-and-trap-removal
   test_failure between-rollback-disarm-and-trap-removal
@@ -661,7 +1150,19 @@ prepare_receipt_backup() {
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload receipt state directory'
   if [[ -e "$state_dir_anchor/payload-runtime-receipt.txt" || -L "$state_dir_anchor/payload-runtime-receipt.txt" ]]; then
     receipt_had_original=1
-    mv -T -- "$state_dir_anchor/payload-runtime-receipt.txt" "$backup_root/payload-runtime-receipt.txt" || fail_closed 'could not reserve the existing payload receipt.'
+    receipt_backup_pending=1
+    write_transaction_state backing-up || fail_closed 'could not journal the existing payload receipt reservation.'
+    if ! mv -T -- "$state_dir_anchor/payload-runtime-receipt.txt" "$backup_root/payload-runtime-receipt.txt"; then
+      fail_closed 'could not reserve the existing payload receipt.'
+    fi
+    receipt_backup_pending=0
+    receipt_backup_present=1
+    write_transaction_state backing-up || fail_closed 'could not journal the existing payload receipt backup.'
+  else
+    receipt_had_original=0
+    receipt_backup_pending=0
+    receipt_backup_present=0
+    write_transaction_state backing-up || fail_closed 'could not journal the absent payload receipt.'
   fi
 }
 
@@ -680,6 +1181,7 @@ main() {
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'
   validate_destination_safety
   acquire_install_lock
+  recover_prior_transaction
 
   ensure_source_clean
   validate_payload_manifest
@@ -694,7 +1196,7 @@ main() {
   fi
 
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'
-  stage_root="$(mktemp -d "$state_dir_anchor/.payload-stage.XXXXXX")"
+  create_transaction
   install_transaction_guard
   mkdir -- "$stage_root/agents-skills" "$stage_root/claude-skills"
   cp -a "$agents_source"/. "$stage_root/agents-skills"/
@@ -705,7 +1207,6 @@ main() {
   validate_managed_toolchain
 
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'
-  backup_root="$(mktemp -d "$state_dir_anchor/.payload-backup.XXXXXX")"
   transaction_backups_ready=1
   agents_had_original=0
   claude_had_original=0
@@ -713,6 +1214,16 @@ main() {
   claude_new=0
   receipt_had_original=0
   receipt_touched=0
+  agents_backup_present=0
+  claude_backup_present=0
+  receipt_backup_present=0
+  agents_backup_pending=0
+  claude_backup_pending=0
+  receipt_backup_pending=0
+  agents_publish_pending=0
+  claude_publish_pending=0
+  receipt_publish_pending=0
+  write_transaction_state backing-up || fail_closed 'could not persist the payload transaction backup state.'
   prepare_receipt_backup
 
   fence_open_parent "$agents_destination" agents_parent_fd agents_destination_anchor agents_parent_path
@@ -723,41 +1234,66 @@ main() {
 
   if [[ -e "$agents_destination_anchor" || -L "$agents_destination_anchor" ]]; then
     agents_had_original=1
+    agents_backup_pending=1
+    write_transaction_state backing-up || fail_closed 'could not journal the agents-skills backup reservation.'
     fence_test_pause before-agents-backup
     fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents destination parent'
     if ! mv -T -- "$agents_destination_anchor" "$backup_root/agents-skills"; then
       fail_closed 'could not reserve agents-skills without leaving a partial installation.'
     fi
+    agents_backup_pending=0
+    agents_backup_present=1
+    write_transaction_state backing-up || fail_closed 'could not journal the agents-skills backup.'
     fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents destination parent'
+  else
+    agents_had_original=0
+    write_transaction_state backing-up || fail_closed 'could not journal the absent agents-skills destination.'
   fi
   test_pause after-agents-backup
   test_failure after-agents-backup
   if [[ -e "$claude_destination_anchor" || -L "$claude_destination_anchor" ]]; then
     claude_had_original=1
+    claude_backup_pending=1
+    write_transaction_state backing-up || fail_closed 'could not journal the claude-skills backup reservation.'
     fence_test_pause before-claude-backup
     fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude destination parent'
     if ! mv -T -- "$claude_destination_anchor" "$backup_root/claude-skills"; then
       fail_closed 'could not reserve claude-skills without leaving a partial installation.'
     fi
+    claude_backup_pending=0
+    claude_backup_present=1
+    write_transaction_state backing-up || fail_closed 'could not journal the claude-skills backup.'
     fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude destination parent'
+  else
+    claude_had_original=0
+    write_transaction_state backing-up || fail_closed 'could not journal the absent claude-skills destination.'
   fi
-  agents_new=1
+  agents_publish_pending=1
+  write_transaction_state publishing || fail_closed 'could not journal the agents-skills publication.'
   fence_test_pause before-agents-publish
   fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents destination parent'
   if ! mv -T -- "$stage_root/agents-skills" "$agents_destination_anchor"; then
     fail_closed 'could not stage agents-skills without leaving a partial installation.'
   fi
+  agents_publish_pending=0
+  agents_new=1
+  write_transaction_state publishing || fail_closed 'could not journal the agents-skills publication.'
   fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents destination parent'
   test_pause after-agents-commit
   test_failure after-agents-commit
-  claude_new=1
+  claude_publish_pending=1
+  write_transaction_state publishing || fail_closed 'could not journal the claude-skills publication.'
   fence_test_pause before-claude-publish
   fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude destination parent'
   if ! mv -T -- "$stage_root/claude-skills" "$claude_destination_anchor"; then
     fail_closed 'could not stage claude-skills without leaving a partial installation.'
   fi
+  claude_publish_pending=0
+  claude_new=1
+  write_transaction_state publishing || fail_closed 'could not journal the claude-skills publication.'
   fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude destination parent'
   test_pause after-claude-commit
+  test_failure after-claude-commit
 
   if ! (verify_installed_payload); then
     fail_closed 'installed payload hash verification failed; previous destinations were restored.'
@@ -775,11 +1311,10 @@ main() {
   fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents destination parent'
   fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude destination parent'
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'
-  commit_transaction
+  commit_transaction || fail_closed 'payload commit was not durably journaled; previous state was retained.'
   fence_test_pause before-cleanup
   test_failure before-cleanup
-  cleanup_transaction_residue || fail_closed 'transaction residue could not be removed.'
-  transaction_backups_ready=0
+  cleanup_transaction_residue || fail_closed "transaction residue could not be removed; recover $transaction_display_root"
   close_fence_fd "$agents_parent_fd"
   close_fence_fd "$claude_parent_fd"
   close_fence_fd "$state_dir_fd"

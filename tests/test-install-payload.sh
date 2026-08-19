@@ -155,6 +155,58 @@ assert_restored_transaction() {
   fi
 }
 
+make_restore_mv_shim() {
+  local home="$1"
+  cat > "$home/.local/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -u
+source_path="${3:-}"
+fail_source="${HERDR_TEST_FAIL_MV_SOURCE:-}"
+case "$source_path" in
+  */backup/agents-skills|*/backup/claude-skills|*/backup/payload-runtime-receipt.txt)
+    if [[ -n "$fail_source" && "$source_path" == *"/backup/$fail_source" ]]; then
+      printf 'injected rollback mv failure: %s\n' "$fail_source" >&2
+      if [[ "${HERDR_TEST_MV_SIGNAL:-}" == TERM ]]; then
+        kill -TERM "$PPID"
+      fi
+      exit 73
+    fi
+    ;;
+esac
+exec /usr/bin/mv "$@"
+EOF
+  chmod 0755 "$home/.local/bin/mv"
+}
+
+transaction_root() {
+  local home="$1"
+  find "$home/.local/state/herdr-workstation-bootstrap" -mindepth 1 -maxdepth 1 \
+    -type d -name '.payload-transaction.*' -print -quit
+}
+
+assert_retained_transaction() {
+  local home="$1"
+  local root
+  local root_count
+  root_count="$(find "$home/.local/state/herdr-workstation-bootstrap" -mindepth 1 -maxdepth 1 \
+    -type d -name '.payload-transaction.*' -printf x | wc -c)"
+  [[ "$root_count" == 1 ]] || { echo "Expected one retained transaction, found $root_count." >&2; exit 1; }
+  root="$(transaction_root "$home")"
+  [[ -n "$root" && -d "$root/backup" && -f "$root/state" ]] || exit 1
+  [[ "$(stat -c '%a' "$root")" == 700 ]] || exit 1
+  [[ "$(stat -c '%a' "$root/backup")" == 700 ]] || exit 1
+  [[ "$(stat -c '%a' "$root/state")" == 600 ]] || exit 1
+  grep -Fqx 'phase=rollback-incomplete' "$root/state"
+}
+
+assert_no_owned_transaction_residue() {
+  local home="$1"
+  [[ -z "$(transaction_root "$home")" ]] || {
+    echo "Owned transaction residue remained in $home." >&2
+    exit 1
+  }
+}
+
 wait_for_file() {
   local path="$1"
   local attempt
@@ -559,6 +611,142 @@ receipt_failure_status=$?
 set -e
 [[ "$receipt_failure_status" -ne 0 ]] || exit 1
 assert_restored_transaction "$receipt_failure_home" "$receipt_failure_before"
+
+# A restore failure retains only the exact transaction's unrestored backup and
+# makes the next invocation recover it before starting any new transaction.
+run_retained_restore_case() {
+  local case_name="$1"
+  local fail_source="$2"
+  local fail_phase="$3"
+  local home
+  local receipt_before="$test_root/$case_name.receipt.before"
+  local output="$test_root/$case_name.out"
+  local retry_output="$test_root/$case_name.retry.out"
+  local root
+  local status
+  local retry_status
+  local install_status
+  local idempotent_status
+  local foreign_backup
+
+  make_fixture
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  write_payload_receipt_sentinel "$home"
+  cp "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" "$receipt_before"
+  foreign_backup="$home/.local/state/herdr-workstation-bootstrap/.payload-backup-foreign"
+  mkdir -p "$foreign_backup/agents-skills"
+  chmod 0700 "$foreign_backup"
+  printf 'foreign backup sentinel\n' > "$foreign_backup/agents-skills/sentinel.txt"
+  make_restore_mv_shim "$home"
+
+  set +e
+  HERDR_PAYLOAD_TEST_FAIL_PHASE="$fail_phase" \
+  HERDR_TEST_FAIL_MV_SOURCE="$fail_source" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" == 31 ]] || { cat "$output" >&2; echo "$case_name expected exit 31, got $status." >&2; exit 1; }
+  grep -Fq 'incomplete rollback retained at' "$output"
+  assert_retained_transaction "$home"
+  root="$(transaction_root "$home")"
+  [[ "$(find "$root/backup" -mindepth 1 -maxdepth 1 -printf x | wc -c)" == 1 ]] || exit 1
+  case "$fail_source" in
+    agents-skills)
+      [[ ! -e "$home/.agents/skills" && ! -L "$home/.agents/skills" ]] || exit 1
+      [[ "$(< "$home/.claude/skills/keep.txt")" == 'keep claude' ]] || exit 1
+      [[ -f "$root/backup/agents-skills/keep.txt" ]] || exit 1
+      [[ ! -e "$root/backup/claude-skills" && ! -e "$root/backup/payload-runtime-receipt.txt" ]] || exit 1
+      ;;
+    claude-skills)
+      [[ "$(< "$home/.agents/skills/keep.txt")" == 'keep agents' ]] || exit 1
+      [[ ! -e "$home/.claude/skills" && ! -L "$home/.claude/skills" ]] || exit 1
+      [[ -f "$root/backup/claude-skills/keep.txt" ]] || exit 1
+      [[ ! -e "$root/backup/agents-skills" && ! -e "$root/backup/payload-runtime-receipt.txt" ]] || exit 1
+      ;;
+    payload-runtime-receipt.txt)
+      [[ "$(< "$home/.agents/skills/keep.txt")" == 'keep agents' ]] || exit 1
+      [[ "$(< "$home/.claude/skills/keep.txt")" == 'keep claude' ]] || exit 1
+      [[ ! -e "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" ]] || exit 1
+      cmp -s "$receipt_before" "$root/backup/payload-runtime-receipt.txt"
+      [[ ! -e "$root/backup/agents-skills" && ! -e "$root/backup/claude-skills" ]] || exit 1
+      ;;
+    *) exit 1 ;;
+  esac
+  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
+
+  set +e
+  HERDR_TEST_FAIL_MV_SOURCE="$fail_source" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$retry_output" 2>&1
+  retry_status=$?
+  set -e
+  [[ "$retry_status" == 31 ]] || { cat "$retry_output" >&2; echo "$case_name retry expected exit 31, got $retry_status." >&2; exit 1; }
+  grep -Fq 'incomplete rollback retained at' "$retry_output"
+  assert_retained_transaction "$home"
+  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
+
+  rm "$home/.local/bin/mv"
+  set +e
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/$case_name.recovered.out" 2>&1
+  install_status=$?
+  set -e
+  [[ "$install_status" == 0 ]] || { cat "$test_root/$case_name.recovered.out" >&2; exit 1; }
+  assert_no_owned_transaction_residue "$home"
+  [[ -f "$home/.agents/skills/demo/SKILL.md" && -f "$home/.claude/skills/demo/SKILL.md" ]] || exit 1
+  [[ -s "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" ]] || exit 1
+  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
+
+  set +e
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/$case_name.idempotent.out" 2>&1
+  idempotent_status=$?
+  set -e
+  [[ "$idempotent_status" == 0 ]] || { cat "$test_root/$case_name.idempotent.out" >&2; exit 1; }
+  assert_no_owned_transaction_residue "$home"
+  [[ -f "$home/.agents/skills/demo/SKILL.md" && -f "$home/.claude/skills/demo/SKILL.md" ]] || exit 1
+  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
+}
+
+run_retained_restore_case rollback-failed-agents agents-skills after-agents-commit
+run_retained_restore_case rollback-failed-claude claude-skills after-claude-commit
+run_retained_restore_case rollback-failed-receipt payload-runtime-receipt.txt after-claude-commit
+
+# A signal during incomplete rollback must leave the journal and every
+# unrestored backup in place; the next invocation can finish the exact journal.
+make_fixture
+signal_recovery_home="$(new_home rollback-signal-during-recovery)"
+make_sentinels "$signal_recovery_home"
+write_payload_receipt_sentinel "$signal_recovery_home"
+make_restore_mv_shim "$signal_recovery_home"
+set +e
+HERDR_PAYLOAD_TEST_FAIL_PHASE=after-agents-commit \
+HERDR_TEST_FAIL_MV_SOURCE=agents-skills \
+HERDR_TEST_MV_SIGNAL=TERM \
+HOME="$signal_recovery_home" PATH="$signal_recovery_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/rollback-signal-during-recovery.out" 2>&1
+signal_recovery_status=$?
+set -e
+[[ "$signal_recovery_status" == 143 ]] || {
+  cat "$test_root/rollback-signal-during-recovery.out" >&2
+  echo "rollback signal expected exit 143, got $signal_recovery_status." >&2
+  exit 1
+}
+signal_recovery_root="$(transaction_root "$signal_recovery_home")"
+[[ -n "$signal_recovery_root" && -f "$signal_recovery_root/state" ]] || exit 1
+[[ "$(stat -c '%a' "$signal_recovery_root")" == 700 ]] || exit 1
+[[ "$(stat -c '%a' "$signal_recovery_root/state")" == 600 ]] || exit 1
+[[ -f "$signal_recovery_root/backup/agents-skills/keep.txt" ]] || exit 1
+[[ -f "$signal_recovery_root/backup/claude-skills/keep.txt" ]] || exit 1
+[[ -f "$signal_recovery_root/backup/payload-runtime-receipt.txt" ]] || exit 1
+rm "$signal_recovery_home/.local/bin/mv"
+HOME="$signal_recovery_home" PATH="$signal_recovery_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/rollback-signal-during-recovery.retry.out" 2>&1
+assert_no_owned_transaction_residue "$signal_recovery_home"
+[[ -f "$signal_recovery_home/.agents/skills/demo/SKILL.md" ]] || exit 1
+[[ -f "$signal_recovery_home/.claude/skills/demo/SKILL.md" ]] || exit 1
 
 # Source drift after staging is detected before the first live mutation.
 make_fixture
