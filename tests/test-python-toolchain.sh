@@ -28,6 +28,14 @@ if validate_toolchain_lock; then
   exit 1
 fi
 PYTHON_VERSION="$saved_python_version"
+
+saved_tailscale_version="$TAILSCALE_VERSION"
+TAILSCALE_VERSION=not-a-semantic-version
+if validate_toolchain_lock; then
+  echo 'Lock validation accepted a malformed Tailscale version.' >&2
+  exit 1
+fi
+TAILSCALE_VERSION="$saved_tailscale_version"
 validate_toolchain_lock
 
 wrong_python="$test_root/wrong-python"

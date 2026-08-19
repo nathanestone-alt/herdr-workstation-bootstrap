@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 fixture_root="$test_root/source"
+# shellcheck disable=SC1090
+source "$repo_root/config/ubuntu-toolchain.lock"
 
 make_tool_fixtures() {
   local home="$1"
@@ -98,6 +100,7 @@ write_toolchain_receipt() {
     printf 'python_archive=%s\n' "$PYTHON_ARCHIVE"
     printf 'python_url=%s\n' "$PYTHON_URL"
     printf 'python_sha256=%s\n' "$PYTHON_SHA256"
+    printf 'tailscale=%s\n' "$TAILSCALE_VERSION"
   } > "$home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 }
 
@@ -153,6 +156,17 @@ assert_restored_transaction() {
       exit 1
     }
   fi
+}
+
+expect_receipt_blocked() {
+  local case_name="$1"
+  local home="$2"
+  local expected_text="$3"
+  local path_prefix="${4:-$home/.local/bin}"
+  make_sentinels "$home"
+  expect_blocked "$case_name" "$home" "$expected_text" "$path_prefix"
+  assert_sentinels "$home"
+  assert_no_transaction_residue "$home"
 }
 
 make_restore_mv_shim() {
@@ -406,29 +420,67 @@ set -e
 assert_no_owned_transaction_residue "$success_home"
 [[ "$(< "$success_foreign/sentinel.txt")" == 'foreign success sentinel' ]] || exit 1
 
+# The current bootstrap producer emits a tailscale field. Prove the exact
+# starting consumer rejects that producer-shaped receipt, then prove the
+# corrected consumer accepts it without touching a real HOME.
+make_fixture
+starting_receipt_home="$(new_home producer-shaped-starting)"
+make_sentinels "$starting_receipt_home"
+starting_script="$fixture_root/scripts/ubuntu/install-payload-starting.sh"
+git -C "$repo_root" show 03629049df8e6322e76619e6b92e5213dd3dd6f4:scripts/ubuntu/install-payload.sh > "$starting_script"
+chmod 0755 "$starting_script"
+git -C "$fixture_root" add scripts/ubuntu/install-payload-starting.sh
+git -C "$fixture_root" commit -qm 'starting consumer fixture'
+set +e
+HOME="$starting_receipt_home" PATH="$starting_receipt_home/.local/bin:$PATH" \
+  bash "$starting_script" > "$test_root/producer-shaped-starting.out" 2>&1
+starting_receipt_status=$?
+set -e
+[[ "$starting_receipt_status" -ne 0 ]] || { cat "$test_root/producer-shaped-starting.out" >&2; exit 1; }
+grep -Fq 'unknown toolchain receipt key: tailscale' "$test_root/producer-shaped-starting.out" || {
+  cat "$test_root/producer-shaped-starting.out" >&2
+  exit 1
+}
+assert_sentinels "$starting_receipt_home"
+assert_no_transaction_residue "$starting_receipt_home"
+
+candidate_receipt_home="$(new_home producer-shaped-candidate)"
+candidate_receipt_output="$test_root/producer-shaped-candidate.out"
+set +e
+HOME="$candidate_receipt_home" PATH="$candidate_receipt_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$candidate_receipt_output" 2>&1
+candidate_receipt_status=$?
+set -e
+[[ "$candidate_receipt_status" == 0 ]] || { cat "$candidate_receipt_output" >&2; exit 1; }
+[[ "$(< "$candidate_receipt_home/.agents/skills/demo/SKILL.md")" == '# fixture agents skill' ]] || exit 1
+[[ "$(< "$candidate_receipt_home/.claude/skills/demo/SKILL.md")" == '# fixture claude skill' ]] || exit 1
+assert_no_owned_transaction_residue "$candidate_receipt_home"
+printf 'Tailscale receipt compatibility: starting_status=%s (rejected), candidate_status=%s (accepted).\n' \
+  "$starting_receipt_status" "$candidate_receipt_status"
+
 # Locked toolchain provenance is required before any payload destination move.
 make_fixture
 wrong_uv_home="$(FIXTURE_UV_VERSION=0.0.1 new_home wrong-uv-version)"
-expect_blocked wrong-uv-version "$wrong_uv_home" 'managed uv version is not locked'
+expect_receipt_blocked wrong-uv-version "$wrong_uv_home" 'managed uv version is not locked'
 
 make_fixture
 wrong_platform_home="$(FIXTURE_UV_PLATFORM=aarch64-unknown-linux-gnu new_home wrong-uv-platform)"
-expect_blocked wrong-uv-platform "$wrong_platform_home" 'managed uv version is not locked'
+expect_receipt_blocked wrong-uv-platform "$wrong_platform_home" 'managed uv version is not locked'
 
 make_fixture
 wrong_probe_home="$(FIXTURE_PY_PROBE='3.13.15|aarch64|linux' new_home wrong-python-probe)"
-expect_blocked wrong-python-probe "$wrong_probe_home" 'managed py platform probe is not locked'
+expect_receipt_blocked wrong-python-probe "$wrong_probe_home" 'managed py platform probe is not locked'
 
 make_fixture
 wrong_release_home="$(new_home wrong-python-release)"
 sed -i 's/^python_release=.*/python_release=stale-release/' \
   "$wrong_release_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked wrong-python-release "$wrong_release_home" 'toolchain receipt mismatch: python_release'
+expect_receipt_blocked wrong-python-release "$wrong_release_home" 'toolchain receipt mismatch: python_release'
 
 make_fixture
 missing_receipt_home="$(new_home missing-toolchain-receipt)"
 rm "$missing_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked missing-toolchain-receipt "$missing_receipt_home" 'Missing bootstrap toolchain receipt'
+expect_receipt_blocked missing-toolchain-receipt "$missing_receipt_home" 'Missing bootstrap toolchain receipt'
 
 make_fixture
 lock_mismatch_home="$(new_home lock-mismatch)"
@@ -436,14 +488,14 @@ sed -i 's/^UV_SHA256=.*/UV_SHA256=0000000000000000000000000000000000000000000000
   "$fixture_root/config/ubuntu-toolchain.lock"
 git -C "$fixture_root" add config/ubuntu-toolchain.lock
 git -C "$fixture_root" commit -qm 'stale toolchain receipt fixture'
-expect_blocked lock-mismatch "$lock_mismatch_home" 'toolchain receipt mismatch: lock_sha256'
+expect_receipt_blocked lock-mismatch "$lock_mismatch_home" 'toolchain receipt mismatch: lock_sha256'
 
 make_fixture
 unmanaged_home="$(new_home unmanaged-toolchain)"
 unmanaged_bin="$test_root/unmanaged-bin"
 mkdir -p "$unmanaged_bin"
 cp "$unmanaged_home/.local/bin/uv" "$unmanaged_home/.local/bin/python3.13" "$unmanaged_home/.local/bin/py" "$unmanaged_bin/"
-expect_blocked unmanaged-toolchain "$unmanaged_home" 'uv is not managed' "$unmanaged_bin"
+expect_receipt_blocked unmanaged-toolchain "$unmanaged_home" 'uv is not managed' "$unmanaged_bin"
 
 # Toolchain receipts are strict single-assignment maps: duplicates, malformed
 # assignments, and unknown keys are all rejected before payload mutation.
@@ -452,25 +504,43 @@ duplicate_same_home="$(new_home receipt-duplicate-same)"
 duplicate_same_line="$(grep '^uv_version=' "$duplicate_same_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt")"
 printf '%s\n' "$duplicate_same_line" >> \
   "$duplicate_same_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked receipt-duplicate-same "$duplicate_same_home" 'duplicate toolchain receipt key: uv_version'
+expect_receipt_blocked receipt-duplicate-same "$duplicate_same_home" 'duplicate toolchain receipt key: uv_version'
 
 make_fixture
 duplicate_conflict_home="$(new_home receipt-duplicate-conflict)"
 printf 'uv_version=uv 0.0.0 (x86_64-unknown-linux-gnu)\n' >> \
   "$duplicate_conflict_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked receipt-duplicate-conflict "$duplicate_conflict_home" 'duplicate toolchain receipt key: uv_version'
+expect_receipt_blocked receipt-duplicate-conflict "$duplicate_conflict_home" 'duplicate toolchain receipt key: uv_version'
 
 make_fixture
 malformed_receipt_home="$(new_home receipt-malformed)"
 printf 'not a receipt assignment\n' >> \
   "$malformed_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked receipt-malformed "$malformed_receipt_home" 'malformed toolchain receipt line'
+expect_receipt_blocked receipt-malformed "$malformed_receipt_home" 'malformed toolchain receipt line'
 
 make_fixture
 unknown_receipt_home="$(new_home receipt-unknown)"
 printf 'future_key=not-allowed\n' >> \
   "$unknown_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-expect_blocked receipt-unknown "$unknown_receipt_home" 'unknown toolchain receipt key: future_key'
+expect_receipt_blocked receipt-unknown "$unknown_receipt_home" 'unknown toolchain receipt key: future_key'
+
+make_fixture
+missing_tailscale_home="$(new_home receipt-missing-tailscale)"
+sed -i '/^tailscale=/d' \
+  "$missing_tailscale_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked receipt-missing-tailscale "$missing_tailscale_home" 'missing toolchain receipt key: tailscale'
+
+make_fixture
+duplicate_tailscale_home="$(new_home receipt-duplicate-tailscale)"
+printf 'tailscale=%s\n' "$TAILSCALE_VERSION" >> \
+  "$duplicate_tailscale_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked receipt-duplicate-tailscale "$duplicate_tailscale_home" 'duplicate toolchain receipt key: tailscale'
+
+make_fixture
+invalid_tailscale_home="$(new_home receipt-invalid-tailscale)"
+sed -i 's/^tailscale=.*/tailscale=not-a-tailscale-version/' \
+  "$invalid_tailscale_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked receipt-invalid-tailscale "$invalid_tailscale_home" 'toolchain receipt mismatch: tailscale'
 
 # Dirty tracked source is rejected before any destination mutation.
 make_fixture

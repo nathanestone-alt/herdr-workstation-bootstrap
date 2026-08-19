@@ -117,7 +117,7 @@ validate_runtime_receipt() {
     receipt_format lock_sha256 host_platform host_architecture
     uv_path python3.13_path py_path uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
-    python_version python_platform python_release python_archive python_url python_sha256
+    python_version python_platform python_release python_archive python_url python_sha256 tailscale
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -142,6 +142,7 @@ validate_runtime_receipt() {
   expected_by_key[python_archive]="$PYTHON_ARCHIVE"
   expected_by_key[python_url]="$PYTHON_URL"
   expected_by_key[python_sha256]="$PYTHON_SHA256"
+  expected_by_key[tailscale]="$TAILSCALE_VERSION"
 
   if [[ ! -f "$toolchain_receipt" || -L "$toolchain_receipt" ]]; then
     echo "FAIL receipt missing $toolchain_receipt"

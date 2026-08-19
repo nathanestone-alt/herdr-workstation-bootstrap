@@ -65,6 +65,7 @@ mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
   printf 'python_archive=%s\n' "$PYTHON_ARCHIVE"
   printf 'python_url=%s\n' "$PYTHON_URL"
   printf 'python_sha256=%s\n' "$PYTHON_SHA256"
+  printf 'tailscale=%s\n' "$TAILSCALE_VERSION"
 } > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 
 # Exercise verify.sh's real bash -lc branch without allowing Git Bash's
@@ -178,7 +179,7 @@ receipt_fields=(
   receipt_format lock_sha256 host_platform host_architecture
   uv_path python3.13_path py_path uv_version python3.13_version
   py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
-  python_version python_platform python_release python_archive python_url python_sha256
+  python_version python_platform python_release python_archive python_url python_sha256 tailscale
 )
 for receipt_field in "${receipt_fields[@]}"; do
   expect_receipt_field_failure "$receipt_field"
@@ -207,6 +208,7 @@ expect_receipt_structure_failure() {
 
 expect_receipt_structure_failure duplicate-same "uv_version=uv $UV_VERSION ($UV_PLATFORM)"
 expect_receipt_structure_failure duplicate-conflict 'uv_version=uv 0.0.0 (x86_64-unknown-linux-gnu)'
+expect_receipt_structure_failure duplicate-tailscale "tailscale=$TAILSCALE_VERSION"
 expect_receipt_structure_failure malformed 'not a receipt assignment'
 expect_receipt_structure_failure unknown 'future_key=not-allowed'
 

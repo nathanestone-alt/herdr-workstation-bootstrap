@@ -346,6 +346,9 @@ validate_toolchain_lock() {
   [[ "$PYTHON_URL" == "$expected_python_url" ]] || {
     echo 'PYTHON_URL does not identify the pinned official CPython artifact.' >&2; return 1;
   }
+  [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'TAILSCALE_VERSION is not a pinned semantic version.' >&2; return 1;
+  }
   return 0
 }
 

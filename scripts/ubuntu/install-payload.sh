@@ -655,7 +655,7 @@ load_toolchain_lock() {
   # shellcheck disable=SC1090
   source "$toolchain_lock_file"
   local required_key
-  for required_key in UV_VERSION UV_PLATFORM UV_URL UV_SHA256 PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256; do
+  for required_key in UV_VERSION UV_PLATFORM UV_URL UV_SHA256 PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256 TAILSCALE_VERSION; do
     [[ -n "${!required_key:-}" ]] || fail_closed "Toolchain lock key is missing: $required_key"
   done
   [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock uv version is not exact.'
@@ -669,6 +669,7 @@ load_toolchain_lock() {
   expected_python_url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/${PYTHON_ARCHIVE//+/%2B}"
   [[ "$PYTHON_URL" == "$expected_python_url" ]] || fail_closed 'Toolchain lock Python URL is inconsistent.'
   [[ "$UV_SHA256" =~ ^[0-9a-f]{64}$ && "$PYTHON_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_closed 'Toolchain lock runtime checksum is not exact.'
+  [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock Tailscale version is not exact.'
 }
 
 validate_toolchain_receipt() {
@@ -682,7 +683,7 @@ validate_toolchain_receipt() {
     receipt_format lock_sha256 host_platform host_architecture
     uv_path python3.13_path py_path uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
-    python_version python_platform python_release python_archive python_url python_sha256
+    python_version python_platform python_release python_archive python_url python_sha256 tailscale
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -707,6 +708,7 @@ validate_toolchain_receipt() {
   expected_by_key[python_archive]="$PYTHON_ARCHIVE"
   expected_by_key[python_url]="$PYTHON_URL"
   expected_by_key[python_sha256]="$PYTHON_SHA256"
+  expected_by_key[tailscale]="$TAILSCALE_VERSION"
 
   [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || fail_closed "Missing bootstrap toolchain receipt: $receipt_path"
   while IFS= read -r line || [[ -n "$line" ]]; do
