@@ -4,6 +4,17 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+$fixtureText = [IO.File]::ReadAllText($PSCommandPath)
+$rawThreadPattern = '[Threading.' + 'ThreadStart]'
+if ($fixtureText.Contains($rawThreadPattern, [StringComparison]::Ordinal)) {
+    throw 'Mechanical race-fixture regression: raw ThreadStart execution is forbidden.'
+}
+if (-not $fixtureText.Contains('RunspaceFactory', [StringComparison]::Ordinal) -or
+    -not $fixtureText.Contains('[PowerShell]::Create()', [StringComparison]::Ordinal)) {
+    throw 'Mechanical race-fixture regression: the mutator must own an explicit PowerShell runspace.'
+}
+Write-Host 'PASS: race-fixture execution mechanism is runspace-backed.'
+
 if (-not $IsWindows) {
     Write-Host 'SKIP: Windows handle, ACL, process-identity, and Excel COM integration fixtures require Windows.'
     exit 0
@@ -29,6 +40,92 @@ function Assert-Throws([scriptblock]$Action, [string]$Expected, [string]$Name) {
 
 function Write-TestJson([string]$Path, [object]$Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+}
+
+function Start-HerdrRaceMutator {
+    param(
+        [Parameter(Mandatory)][string]$RaceParent,
+        [Parameter(Mandatory)][string]$RaceMoved,
+        [Parameter(Mandatory)][string]$RaceOutside,
+        [Parameter(Mandatory)][object]$RaceEvidence,
+        [Parameter(Mandatory)][object]$RaceStop,
+        [Parameter(Mandatory)][object]$RaceErrors
+    )
+
+    $script = @'
+param($raceParent, $raceMoved, $raceOutside, $raceEvidence, $raceStop, $raceErrors)
+[void]$raceEvidence.TryAdd('race-runspace-started', $true)
+for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++) {
+    [void]$raceEvidence.TryAdd('race-cycle', $true)
+    try {
+        if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
+            [IO.Directory]::Move($raceParent, $raceMoved)
+            [void]$raceEvidence.TryAdd('parent-moved', $true)
+        }
+        if (-not [IO.Directory]::Exists($raceParent)) {
+            New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
+            [void]$raceEvidence.TryAdd('junction-created', $true)
+        }
+        Start-Sleep -Milliseconds 1
+        if ([IO.Directory]::Exists($raceParent) -and
+            (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+            [void]$raceEvidence.TryAdd('junction-removed', $true)
+        }
+        if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+            [IO.Directory]::Move($raceMoved, $raceParent)
+            [void]$raceEvidence.TryAdd('parent-restored', $true)
+        }
+    }
+    catch {
+        [void]$raceErrors.Enqueue($_.Exception.ToString())
+        [void]$raceEvidence.TryAdd('race-mutator-error', $true)
+    }
+}
+'@
+    $runspace = [Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.Open()
+    $powerShell = [PowerShell]::Create()
+    $powerShell.Runspace = $runspace
+    [void]$powerShell.AddScript($script)
+    [void]$powerShell.AddArgument($RaceParent)
+    [void]$powerShell.AddArgument($RaceMoved)
+    [void]$powerShell.AddArgument($RaceOutside)
+    [void]$powerShell.AddArgument($RaceEvidence)
+    [void]$powerShell.AddArgument($RaceStop)
+    [void]$powerShell.AddArgument($RaceErrors)
+    $async = $powerShell.BeginInvoke()
+    [pscustomobject]@{
+        PowerShell = $powerShell
+        Runspace = $runspace
+        Async = $async
+        Stop = $RaceStop
+    }
+}
+
+function Stop-HerdrRaceMutator {
+    param([Parameter(Mandatory)][object]$Worker)
+
+    $Worker.Stop.Set()
+    if (-not $Worker.Async.AsyncWaitHandle.WaitOne(10000)) {
+        $Worker.PowerShell.Stop()
+        if (-not $Worker.Async.AsyncWaitHandle.WaitOne(1000)) {
+            throw 'The runspace-backed race mutator did not stop within the bounded timeout.'
+        }
+    }
+    try {
+        [void]$Worker.PowerShell.EndInvoke($Worker.Async)
+        if ($Worker.PowerShell.Streams.Error.Count -gt 0) {
+            throw (($Worker.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join ' | ')
+        }
+    }
+    catch {
+        throw "The runspace-backed race mutator failed: $($_.Exception.Message)"
+    }
+    finally {
+        $Worker.PowerShell.Dispose()
+        $Worker.Runspace.Dispose()
+    }
 }
 
 function New-IntegrationFixture {
@@ -231,38 +328,19 @@ try {
     $raceSource = Join-Path $raceTrusted 'race-source.xlsx'
     [IO.File]::WriteAllText($raceSource, 'race-source')
     $raceEvidence = [Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
+    $raceErrors = [Collections.Concurrent.ConcurrentQueue[string]]::new()
     $raceStop = [Threading.ManualResetEventSlim]::new($false)
-    $raceAction = {
-        [void]$raceEvidence.TryAdd('race-thread-started', $true)
-        for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++) {
-            try {
-                if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
-                    [IO.Directory]::Move($raceParent, $raceMoved)
-                    [void]$raceEvidence.TryAdd('parent-moved', $true)
-                }
-                if (-not [IO.Directory]::Exists($raceParent)) {
-                    New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
-                    [void]$raceEvidence.TryAdd('junction-created', $true)
-                }
-                Start-Sleep -Milliseconds 1
-                if ([IO.Directory]::Exists($raceParent) -and
-                    (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-                    Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
-                    [void]$raceEvidence.TryAdd('junction-removed', $true)
-                }
-                if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
-                    [IO.Directory]::Move($raceMoved, $raceParent)
-                    [void]$raceEvidence.TryAdd('parent-restored', $true)
-                }
-            }
-            catch { [void]$raceEvidence.TryAdd('race-mutator-error', $true) }
-        }
-    }.GetNewClosure()
-    $raceThread = [Threading.Thread]::new([Threading.ThreadStart]$raceAction)
-    $raceThread.Start()
+    $raceWorker = Start-HerdrRaceMutator -RaceParent $raceParent -RaceMoved $raceMoved -RaceOutside $raceOutside `
+        -RaceEvidence $raceEvidence -RaceStop $raceStop -RaceErrors $raceErrors
+    $raceStartDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not $raceEvidence.ContainsKey('race-runspace-started') -and [DateTime]::UtcNow -lt $raceStartDeadline) {
+        Start-Sleep -Milliseconds 10
+    }
+    Assert-True ($raceEvidence.ContainsKey('race-runspace-started')) 'The runspace-backed race mutator did not start.'
     $raceOperationAttempts = 0
     $raceOperationSuccesses = 0
     $raceOperationFailures = [Collections.Generic.List[string]]::new()
+    $raceWorkerFailure = $null
     try {
         for ($attempt = 0; $attempt -lt 40; $attempt++) {
             $raceOperationAttempts++
@@ -291,8 +369,8 @@ try {
         }
     }
     finally {
-        $raceStop.Set()
-        if (-not $raceThread.Join(10000)) { throw 'The concurrent ancestor substitution race did not stop.' }
+        try { Stop-HerdrRaceMutator -Worker $raceWorker }
+        catch { $raceWorkerFailure = $_.Exception }
     }
     if ([IO.Directory]::Exists($raceParent) -and
         (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
@@ -300,6 +378,12 @@ try {
     }
     if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
         [IO.Directory]::Move($raceMoved, $raceParent)
+    }
+    if ($null -ne $raceWorkerFailure) {
+        throw "The ancestor/junction race worker failed: $($raceWorkerFailure.Message)"
+    }
+    if ($raceErrors.Count -gt 0) {
+        throw "The ancestor/junction race worker reported an exception: $($raceErrors.ToArray()[0])"
     }
     $raceEvidenceKeys = @($raceEvidence.Keys)
     $raceMutationEvidence = @($raceEvidenceKeys | Where-Object {
@@ -307,29 +391,39 @@ try {
     })
     Assert-True ($raceOperationAttempts -eq 80) `
         "Ancestor/junction race did not execute the bounded operation set (attempts=$raceOperationAttempts)."
-    Assert-True ($raceOperationSuccesses -gt 0) `
-        ("Ancestor/junction race helper threw on every operation; attempts={0}; successes={1}; failures={2}; " +
-         "race_evidence={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
-         ($raceEvidenceKeys -join ', '))
     Assert-True ($raceMutationEvidence.Count -gt 0) `
         ("Ancestor/junction race did not observe a bounded ancestor mutation; attempts={0}; successes={1}; " +
          "race_evidence={2}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '))
+    $raceControlSuccess = $false
+    try {
+        Ensure-HerdrManagedDirectory -Path (Join-Path $raceParent 'control-after-race') `
+            -TrustedRoot $raceTrusted -Description 'post-race control operation' | Out-Null
+        $raceControlSuccess = $true
+    }
+    catch {
+        [void]$raceOperationFailures.Add("Control: $($_.Exception.Message)")
+    }
+    Assert-True $raceControlSuccess `
+        ("Ancestor/junction race control operation failed after parent restoration; attempts={0}; successes={1}; failures={2}; " +
+         "race_evidence={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
+         ($raceEvidenceKeys -join ', '))
     Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative create/copy race wrote outside the trusted root.'
 
     $cleanupCollision = Join-Path $raceParent 'cleanup-collision.json'
     [IO.File]::WriteAllText($cleanupCollision, '{}')
     $raceStop.Reset()
-    $cleanupRaceThread = [Threading.Thread]::new([Threading.ThreadStart]$raceAction)
-    $cleanupRaceThread.Start()
+    $cleanupRaceWorker = Start-HerdrRaceMutator -RaceParent $raceParent -RaceMoved $raceMoved -RaceOutside $raceOutside `
+        -RaceEvidence $raceEvidence -RaceStop $raceStop -RaceErrors $raceErrors
     $cleanupError = $null
+    $cleanupWorkerFailure = $null
     try {
         Write-HerdrAtomicText -Path $cleanupCollision -Content '{"safe":true}' -TrustedRoot $raceTrusted | Out-Null
     }
     catch { $cleanupError = $_.Exception }
     finally {
-        $raceStop.Set()
-        if (-not $cleanupRaceThread.Join(10000)) { throw 'The concurrent cleanup substitution race did not stop.' }
+        try { Stop-HerdrRaceMutator -Worker $cleanupRaceWorker }
+        catch { $cleanupWorkerFailure = $_.Exception }
     }
     if ([IO.Directory]::Exists($raceParent) -and
         (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
@@ -337,6 +431,12 @@ try {
     }
     if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
         [IO.Directory]::Move($raceMoved, $raceParent)
+    }
+    if ($null -ne $cleanupWorkerFailure) {
+        throw "The cleanup collision race worker failed: $($cleanupWorkerFailure.Message)"
+    }
+    if ($raceErrors.Count -gt 0) {
+        throw "The cleanup collision race worker reported an exception: $($raceErrors.ToArray()[0])"
     }
     Assert-True ($null -ne $cleanupError) 'Handle-relative cleanup race accepted an output collision.'
     Assert-True (@(Get-ChildItem -LiteralPath $raceTrusted -Recurse -Force -File -Filter '.herdr-text-*.tmp' -ErrorAction SilentlyContinue).Count -eq 0) `

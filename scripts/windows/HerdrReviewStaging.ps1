@@ -981,23 +981,120 @@ function Assert-HerdrMetadataValue {
     return $Value
 }
 
-function Get-HerdrDefaultOneDriveInboxRoot {
+function Get-HerdrRuntimeString {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory)][object]$Document,
+        [Parameter(Mandatory)][string]$Name
+    )
 
-    $oneDriveRoot = if (-not [string]::IsNullOrWhiteSpace($env:OneDriveCommercial)) {
-        $env:OneDriveCommercial
+    $property = $Document.PSObject.Properties[$Name]
+    if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        throw "Host-owned runtime configuration is missing '$Name'."
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
-        $env:OneDrive
+    return [string]$property.Value
+}
+
+function Get-HerdrRuntimeConfiguration {
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [switch]$TestMode
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { $Path = $env:HERDR_WINDOWS_REVIEW_CONFIG }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'A host-owned runtime configuration is required; pass -RuntimeConfigurationPath or set HERDR_WINDOWS_REVIEW_CONFIG.'
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Join-Path $env:USERPROFILE 'OneDrive'
+    $configurationPath = Get-HerdrCanonicalPath -Path $Path
+    if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
+        throw "Host-owned runtime configuration does not exist: '$configurationPath'."
     }
-    else {
-        throw 'No configured OneDrive root is available; pass -OneDriveInboxRoot explicitly.'
+    $configurationItem = Get-Item -LiteralPath $configurationPath -Force -ErrorAction Stop
+    if (($configurationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Host-owned runtime configuration must not be a reparse point: '$configurationPath'."
     }
-    return (Join-Path (Join-Path $oneDriveRoot 'Herdr Review Exchange') 'Inbox')
+    try {
+        $document = [IO.File]::ReadAllText($configurationPath) | ConvertFrom-Json
+    }
+    catch {
+        throw "Host-owned runtime configuration is not valid JSON: '$configurationPath'."
+    }
+    if ($null -eq $document -or $document -is [Array]) {
+        throw 'Host-owned runtime configuration must be one JSON object.'
+    }
+    $allowed = @(
+        'schema', 'approved', 'one_drive_exchange_root', 'one_drive_account',
+        'exchange_root', 'review_jobs_root', 'tools_root',
+        'designated_interactive_user_sid', 'designated_interactive_session_id',
+        'bridge_account_sid'
+    )
+    foreach ($property in @($document.PSObject.Properties)) {
+        if ($property.Name -notin $allowed) {
+            throw "Host-owned runtime configuration contains unknown field '$($property.Name)'."
+        }
+    }
+    if ((Get-HerdrRuntimeString -Document $document -Name 'schema') -cne 'herdr-windows-review-runtime-v1') {
+        throw 'Host-owned runtime configuration schema is unsupported.'
+    }
+    $approvedProperty = $document.PSObject.Properties['approved']
+    if ($null -eq $approvedProperty -or $approvedProperty.Value -isnot [bool] -or $approvedProperty.Value -ne $true) {
+        throw 'Host-owned runtime configuration is not explicitly approved.'
+    }
+    $oneDriveExchangeRoot = Assert-HerdrConfiguredLocalPath -Path (Get-HerdrRuntimeString -Document $document -Name 'one_drive_exchange_root')
+    $exchangeRoot = Assert-HerdrConfiguredLocalPath -Path (Get-HerdrRuntimeString -Document $document -Name 'exchange_root')
+    $reviewJobsRoot = Assert-HerdrConfiguredLocalPath -Path (Get-HerdrRuntimeString -Document $document -Name 'review_jobs_root')
+    $toolsRoot = Assert-HerdrConfiguredLocalPath -Path (Get-HerdrRuntimeString -Document $document -Name 'tools_root')
+    $oneDriveAccount = Assert-HerdrMetadataValue -Value (Get-HerdrRuntimeString -Document $document -Name 'one_drive_account') -Name 'OneDrive account'
+    if ($oneDriveAccount -match '^<.*>$') { throw 'OneDrive account must be supplied by host-owned runtime configuration.' }
+    $interactiveUserSid = Get-HerdrRuntimeString -Document $document -Name 'designated_interactive_user_sid'
+    $bridgeAccountSid = Get-HerdrRuntimeString -Document $document -Name 'bridge_account_sid'
+    if ($interactiveUserSid -notmatch '^S-\d-\d+(?:-\d+)+$') { throw 'Configured designated interactive user SID is invalid.' }
+    if ($bridgeAccountSid -notmatch '^S-\d-\d+(?:-\d+)+$') { throw 'Configured bridge account SID is invalid.' }
+    $sessionText = Get-HerdrRuntimeString -Document $document -Name 'designated_interactive_session_id'
+    $interactiveSessionId = 0
+    if (-not [int]::TryParse($sessionText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$interactiveSessionId) -or $interactiveSessionId -le 0) {
+        throw 'Configured designated interactive session ID must be a positive integer.'
+    }
+
+    $oneDriveInboxRoot = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveExchangeRoot 'Inbox')
+    $oneDriveOutboxRoot = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveExchangeRoot 'Outbox')
+    $oneDriveArchiveRoot = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveExchangeRoot 'Archive')
+    $pathRecords = @(
+        [pscustomobject]@{ Name = 'OneDrive exchange'; Path = $oneDriveExchangeRoot },
+        [pscustomobject]@{ Name = 'local exchange'; Path = $exchangeRoot },
+        [pscustomobject]@{ Name = 'review jobs'; Path = $reviewJobsRoot },
+        [pscustomobject]@{ Name = 'tools'; Path = $toolsRoot }
+    )
+    for ($leftIndex = 0; $leftIndex -lt $pathRecords.Count; $leftIndex++) {
+        for ($rightIndex = $leftIndex + 1; $rightIndex -lt $pathRecords.Count; $rightIndex++) {
+            if ((Test-HerdrPathSameOrDescendant -Candidate $pathRecords[$leftIndex].Path -Ancestor $pathRecords[$rightIndex].Path) -or
+                (Test-HerdrPathSameOrDescendant -Candidate $pathRecords[$rightIndex].Path -Ancestor $pathRecords[$leftIndex].Path)) {
+                throw "Host-owned runtime configuration paths overlap: $($pathRecords[$leftIndex].Name) and $($pathRecords[$rightIndex].Name)."
+            }
+        }
+    }
+    foreach ($managedPath in $pathRecords) {
+        if (Test-HerdrPathSameOrDescendant -Candidate $configurationPath -Ancestor $managedPath.Path) {
+            throw "Host-owned runtime configuration must be outside the configured $($managedPath.Name) root."
+        }
+    }
+    [pscustomobject][ordered]@{
+        Schema = 'herdr-windows-review-runtime-v1'
+        ConfigurationPath = $configurationPath
+        Approved = $true
+        OneDriveExchangeRoot = $oneDriveExchangeRoot
+        OneDriveAccount = $oneDriveAccount
+        OneDriveInboxRoot = $oneDriveInboxRoot
+        OneDriveOutboxRoot = $oneDriveOutboxRoot
+        OneDriveArchiveRoot = $oneDriveArchiveRoot
+        ExchangeRoot = $exchangeRoot
+        ReviewJobsRoot = $reviewJobsRoot
+        ToolsRoot = $toolsRoot
+        DesignatedInteractiveUserSid = $interactiveUserSid
+        DesignatedInteractiveSessionId = $interactiveSessionId
+        BridgeAccountSid = $bridgeAccountSid
+    }
 }
 
 function Get-HerdrDefaultOneDriveSiblingRoot {
@@ -1748,7 +1845,7 @@ function Invoke-HerdrReviewStaging {
     $completed = $false
     try {
         $firstSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot
-        if ($null -ne $BetweenSourceReads) { & $BetweenSourceReads }
+        if ($null -ne $BetweenSourceReads) { & $BetweenSourceReads $sourceCanonical }
         if ($StabilityIntervalMilliseconds -gt 0) { Start-Sleep -Milliseconds $StabilityIntervalMilliseconds }
         $secondSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot -ExpectedIdentity $firstSnapshot
         Assert-HerdrSnapshotsEqual -Expected $firstSnapshot -Actual $secondSnapshot -Description 'OneDrive source'

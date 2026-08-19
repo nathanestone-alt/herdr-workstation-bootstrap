@@ -26,12 +26,14 @@ function Write-TestJson([string]$Path, [object]$Value) {
 }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-runner-test-$([Guid]::NewGuid().ToString('N'))"
-$inbox = Join-Path $root 'onedrive\Herdr Review Exchange\Inbox'
-$oneDriveOutbox = Join-Path $root 'onedrive\Herdr Review Exchange\Outbox'
-$oneDriveArchive = Join-Path $root 'onedrive\Herdr Review Exchange\Archive'
+$oneDriveExchange = Join-Path $root 'onedrive\Herdr Review Exchange'
+$inbox = Join-Path $oneDriveExchange 'Inbox'
+$oneDriveOutbox = Join-Path $oneDriveExchange 'Outbox'
+$oneDriveArchive = Join-Path $oneDriveExchange 'Archive'
 $exchange = Join-Path $root 'exchange'
 $reviewJobs = Join-Path $root 'review-jobs'
 $tools = Join-Path $root 'tools'
+$runtimeConfig = Join-Path $root 'runtime-config.json'
 $secret = 'TEST-SECRET-MUST-NOT-LEAK'
 $counter = 0
 $accessCalls = [Collections.Generic.List[string]]::new()
@@ -40,9 +42,10 @@ $accessProbe = {
     foreach ($path in $Paths) { [void]$accessCalls.Add([string]$path) }
 }.GetNewClosure()
 $interactiveProbe = { $true }
+$copyHerdrFileExclusive = Get-Command Copy-HerdrFileExclusive -CommandType Function -ErrorAction Stop
 $excelProbe = {
     param([string]$InputPath, [string]$ResultPath)
-    Copy-HerdrFileExclusive -SourcePath $InputPath -DestinationPath $ResultPath | Out-Null
+    & $copyHerdrFileExclusive -SourcePath $InputPath -DestinationPath $ResultPath | Out-Null
 }.GetNewClosure()
 
 function New-TestJob {
@@ -68,6 +71,35 @@ function New-TestJob {
 
 try {
     New-Item -ItemType Directory -Path $inbox, $oneDriveOutbox, $oneDriveArchive, $exchange, $reviewJobs, $tools -Force | Out-Null
+    Write-TestJson -Path $runtimeConfig -Value ([ordered]@{
+        schema = 'herdr-windows-review-runtime-v1'
+        approved = $true
+        one_drive_exchange_root = $oneDriveExchange
+        one_drive_account = 'configured@example.invalid'
+        exchange_root = $exchange
+        review_jobs_root = $reviewJobs
+        tools_root = $tools
+        designated_interactive_user_sid = 'S-1-5-21-961-1001'
+        designated_interactive_session_id = 7
+        bridge_account_sid = 'S-1-5-21-961-1002'
+    })
+    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig -TestMode
+    Assert-True ($runtime.ReviewJobsRoot -ceq $reviewJobs) 'Runtime configuration did not resolve the local review-job root.'
+    Assert-True ($runtime.OneDriveArchiveRoot -ceq $oneDriveArchive) 'Runtime configuration did not derive the OneDrive Archive root.'
+    Assert-True ($null -ne (Get-Command Copy-HerdrFileExclusive -ErrorAction SilentlyContinue)) 'Runner dependency did not expose Copy-HerdrFileExclusive.'
+    $unapprovedConfig = Join-Path $root 'unapproved-runtime-config.json'
+    $unapprovedDocument = [IO.File]::ReadAllText($runtimeConfig) | ConvertFrom-Json
+    $unapprovedDocument.approved = $false
+    Write-TestJson -Path $unapprovedConfig -Value $unapprovedDocument
+    Assert-Throws { Get-HerdrRuntimeConfiguration -Path $unapprovedConfig -TestMode } 'not explicitly approved' 'unapproved runtime configuration'
+    Assert-HerdrOneDriveReady -OneDriveExchangeRoot $oneDriveExchange -OneDriveAccount 'configured@example.invalid' `
+        -IdentityConfiguration ([pscustomobject]@{ InteractiveUserSid = 'S-1-5-21-961-1001'; InteractiveSessionId = 7 }) `
+        -TestMode -ReadyProbe { $true } | Out-Null
+    Assert-Throws {
+        Assert-HerdrOneDriveReady -OneDriveExchangeRoot $oneDriveExchange -OneDriveAccount 'configured@example.invalid' `
+            -IdentityConfiguration ([pscustomobject]@{ InteractiveUserSid = 'S-1-5-21-961-1001'; InteractiveSessionId = 7 }) `
+            -TestMode -ReadyProbe { $false } | Out-Null
+    } 'not ready' 'OneDrive readiness gate'
     $jsonReaderProbePath = Join-Path $root 'json-reader-probe.json'
     [IO.File]::WriteAllText($jsonReaderProbePath, '{"schema":"probe"}', [Text.UTF8Encoding]::new($false))
     $jsonReaderOwner = [IO.FileStream]::new($jsonReaderProbePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -94,8 +126,7 @@ try {
             'The production Windows JSON reader did not complete with its share-zero handle held during proof.'
     }
     $success = New-TestJob
-    $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
-        -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+    $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -RuntimeConfigurationPath $runtimeConfig `
         -TestMode `
         -InteractiveSessionProbe $interactiveProbe `
         -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe
@@ -184,6 +215,7 @@ try {
     $safeAcl = [pscustomobject]@{ AreAccessRulesProtected = $true; Access = @($readRule) }
     $safeReader = { param([string]$Path) $safeAcl }.GetNewClosure()
     Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $safeReader -GroupSidReader $groups -TestMode | Out-Null
+    Assert-HerdrBridgeCannotWrite -Paths @($runtimeConfig) -AclReader $safeReader -GroupSidReader $groups -TestMode | Out-Null
 
     $runnerText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1')
     Assert-True ($runnerText.Contains('FileStream]::new($opened.SafeHandle', [StringComparison]::Ordinal)) 'The production JSON reader is not handle-backed through FileStream.'

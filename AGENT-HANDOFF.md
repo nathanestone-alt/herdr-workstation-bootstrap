@@ -14,7 +14,7 @@ Commission the MS-A2 without losing the known-good Surface workflow. Windows 11 
 6. Treat reboots as phase boundaries and stop for the user.
 7. Require human participation for browser/device authentication and recovery-key handling.
 8. Run Excel COM only in the interactive Windows user session.
-9. Keep repositories in `~/code`; exchange workbooks through `/srv/herdr-exchange`.
+9. Keep repositories in `~/code`; transfer finite #961 workbook payloads over SSH to `herdr-win` into the host-configured Windows OneDrive exchange.
 10. Record evidence in uncommitted `LOCAL-COMMISSIONING-LOG.md`.
 
 ## Phase A — Assess
@@ -116,28 +116,40 @@ Follow [REMOTE-ACCESS.md](REMOTE-ACCESS.md). Required gates:
 
 ## Phase G — Excel exchange
 
-From elevated interactive Windows PowerShell:
+The #961 workbook lane uses the native Windows OneDrive client and does not
+install OneDrive or rclone in Ubuntu. Transfer each finite payload over SSH to
+herdr-win into the host-configured OneDrive exchange; do not synchronize the
+same OneDrive account concurrently from Ubuntu and Windows.
+
+From an elevated interactive Windows PowerShell session, create the runtime
+configuration outside Git from
+config/windows-review-runtime.example.json. Set
+HERDR_WINDOWS_REVIEW_CONFIG to that file and approve it only after recording
+the host-owned OneDrive exchange root, account, local staging root, local
+review-job root, reviewed-tools root, and designated interactive/bridge SIDs.
+The configuration is rejected when missing, unapproved, malformed, overlapping,
+reparse-point based, or otherwise inconsistent.
+
+Commissioning must prove that OneDrive is running and signed in under the
+designated interactive Windows user before staging or Excel work. Then run the
+reviewed staging and runner entry points with the runtime configuration; they
+reject Offline/Recall sources, stabilize and hash the Inbox original, stage a
+copy in the configured local bridge root, and copy/re-hash a final local
+review-job copy before Excel opens it. Results and provenance return through
+the configured OneDrive Outbox. Excel never opens an exchange/OneDrive copy
+directly, and the configured exchange, staging, review-job, and tools roots are
+never Excel Trusted Locations.
 
 ~~~powershell
-$acceptedFirewallRules = @() # Populate only after reviewing and recording an exception reported by preflight.
-& .\scripts\windows\New-HerdrExchangeShare.ps1 -AcceptedFirewallRule $acceptedFirewallRules
-& .\scripts\windows\Test-HerdrExchangeBoundary.ps1 -AcceptedFirewallRule $acceptedFirewallRules
-& .\bootstrap.ps1 -Stage Excel
+$env:HERDR_WINDOWS_REVIEW_CONFIG = '<host-owned runtime configuration path>'
+& .\scripts\windows\Stage-HerdrReviewWorkbook.ps1 -SourcePath '<configured OneDrive Inbox workbook>' -JobId '<unique finite job id>' -RuntimeConfigurationPath $env:HERDR_WINDOWS_REVIEW_CONFIG
+& .\scripts\windows\Invoke-HerdrExcelJob.ps1 -JobPath '<staged job definition>' -RuntimeConfigurationPath $env:HERDR_WINDOWS_REVIEW_CONFIG
 ~~~
 
-The user supplies and stores a long, strong password for the fixed, dedicated non-admin `HerdrBridge` account. It intentionally does not expire because Ubuntu uses a root-only static mount credential. Rotate it only in a coordinated maintenance window: run the Windows script with `-RotatePassword` (it securely prompts for the new password), then immediately run the Ubuntu command below with that same password. The Ubuntu script unmounts any existing SMB session before replacing the credential, converges its managed `/etc/fstab` block, creates a fresh encrypted SMB session, and must pass the write test before the window ends.
-
-The share script requires a normal path on a local fixed drive; it rejects UNC paths, Windows device namespaces, drive roots, Windows system trees, reparse points, and any existing directory that is neither the already-marked path of the matching `HerdrExchange` SMB share nor explicitly approved. If a reviewed first-run or interrupted setup must adopt an existing ordinary directory, inspect the path and its contents, record that decision, and pass `-AllowExistingSharePath` once. The switch never overrides local-path, protected-system-path, or reparse-point checks.
-
-~~~bash
-bash scripts/ubuntu/configure-excel-share.sh --host herdr-win --owner HERDR_UBUNTU_USER
-~~~
-
-The Windows script idempotently adds `HerdrBridge` directly to the built-in Users group and rejects every other direct group membership. Its firewall conflict gate runs before mutation and covers explicit port 445/ranges plus unscoped TCP-capable rules, including `Protocol=Any`; owner-scoped AppContainer rules are excluded. Tailscale rules whose local or remote addresses are confined to `100.64.0.0/10` or `fd7a:115c:a1e0::/48` are compatible by scope. On stock Windows 11, Network Discovery for Teredo and WFD Driver-only rules may be reported. Review each exact rule name: disable an unnecessary rule with the printed `Disable-NetFirewallRule -Name '<name>'` command, or record the reason for retaining it and pass that exact name through `-AcceptedFirewallRule` to both commands above. Never accept a rule by display name or merely to make the gate pass. The script also creates and recursively protects host-owned `C:\HerdrReviewJobs`, then reads its DACL back. The boundary test runs as `HerdrBridge` and must prove it can write `in`, cannot create files or directories directly under `C:\HerdrExchange` (including `scripts`), cannot write `C:\HerdrTools` or `C:\HerdrReviewJobs`, and that no unconfined, unaccepted inbound allow rule exposes TCP 445.
-
-Keep the reviewed Windows-side job runner and all executable helpers under host-owned `C:\HerdrTools`, which is outside the SMB share. It must run in the designated interactive Windows session, accept only reviewed operations over workbook inputs/outputs under `C:\HerdrExchange`, log every job, and reject arbitrary PowerShell/code payloads.
-
-Configure the Windows OneDrive client with `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, all marked Always keep on this device. GitHub remains authoritative for repositories. The reviewed staging helper must reject Offline/Recall attributes, require stable size/time/hash across two exclusive reads, preserve and hash the Inbox original, copy and re-hash it under `C:\HerdrExchange\in\<job-id>`, then copy and re-hash it again into non-shared `C:\HerdrReviewJobs\<job-id>` immediately before Excel/COM opens it. Return results and the complete provenance manifest through OneDrive Outbox. Never automate inside OneDrive or a bridge-writable directory, mount OneDrive in Ubuntu, or make OneDrive, `C:\HerdrExchange`, or `C:\HerdrReviewJobs` an Excel Trusted Location.
+The existing SMB bootstrap scripts are not the #961 workbook route. Ubuntu
+must not mount OneDrive or run rclone for this lane; the only Ubuntu-side
+requirement is a proven SSH path to herdr-win and an operational handoff that
+does not bypass the Windows readiness gate.
 
 ## Phase H — Herdr, skills and plugins
 
@@ -167,7 +179,7 @@ Follow [VPS-ACCESS.md](VPS-ACCESS.md). Preserve hPanel recovery and the Surface 
 3. Recreate AMD64 dependencies; never copy ARM64 binaries or virtual environments.
 4. Keep Windows-only Python/COM dependencies on Windows.
 5. Replace absolute Surface and Windows paths in Linux configuration.
-6. Use the SMB exchange only for workbook inputs, outputs and logs—not as the Git working tree.
+6. For #961, transfer finite workbook inputs over SSH to `herdr-win` and let the Windows OneDrive/Excel lane own exchange, staging, and output. The legacy SMB utility is outside this route and must not bypass the runtime configuration or readiness gate.
 
 ## Phase K — Verify and hand off
 

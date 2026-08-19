@@ -26,7 +26,7 @@ MINISFORUM MS-A2
     |   |-- OpenSSH + Mosh + native systemd
     |   `-- Herdr, repositories and AMD64 CLI tooling
     |-- Tailscale node: herdr-win
-    |-- Restricted SMB share: \\herdr-win\HerdrExchange
+    |-- OpenSSH endpoint for finite review-payload transfers
     `-- 2 TB factory NVMe SSD
 
 Recovery layers
@@ -127,25 +127,25 @@ Excel automation must run in an interactive Windows user session:
 - Use RDP over Tailscale when interactive Excel work is needed.
 - Do not expose RDP or SSH directly to the public internet.
 - Do not run Excel COM automation as a Windows service or unattended Session 0 process.
-- Exchange workbooks through the restricted `HerdrExchange` SMB share mounted at `/srv/herdr-exchange` in Ubuntu.
+- Transfer finite review payloads over SSH to `herdr-win`; do not install or run OneDrive or rclone in Ubuntu.
 - Invoke Excel through a reviewed Windows-side job runner in the interactive user session; Hyper-V has no WSL-style `powershell.exe` interop.
 
 ### OneDrive review exchange
 
 Use GitHub as the source of truth for repositories and OneDrive as the human-facing exchange for one-off documents and workbook reviews. This provides a lightweight path for reviewing an STModel workbook without creating a Git branch or performing a full repository handoff.
 
-Configure the native Windows OneDrive client with a dedicated `Herdr Review Exchange` folder containing `Inbox`, `Outbox`, and `Archive`. Mark the entire folder **Always keep on this device**. Do not install or mount OneDrive inside Ubuntu.
+Configure the native Windows OneDrive client with a dedicated `Herdr Review Exchange` folder containing `Inbox`, `Outbox`, and `Archive`. Mark the entire folder **Always keep on this device**. Do not install or mount OneDrive inside Ubuntu. Keep the host-owned runtime configuration outside Git and select it with `HERDR_WINDOWS_REVIEW_CONFIG`.
 
 OneDrive is a transfer and version-history layer, not an automation workspace:
 
-1. Upload a uniquely named workbook to `Inbox` from the laptop.
-2. The reviewed staging helper must reject the `Offline`, `RecallOnOpen`, and `RecallOnDataAccess` attributes, then require unchanged size, last-write time, and SHA-256 across two exclusive reads separated by a settle interval. A green OneDrive icon or Always keep on this device request alone is not acceptance evidence.
-3. Preserve the Inbox original, record its SHA-256, copy it into a job-specific directory below `C:\HerdrExchange\in`, and immediately re-hash that copy. Refuse the job unless both hashes match.
-4. Ubuntu agents may inspect the bridge copy. Immediately before Excel/COM execution, the Windows runner must copy the accepted workbook into protected, host-owned `C:\HerdrReviewJobs\<job-id>`, which is not shared with `HerdrBridge`, and re-hash it against the accepted staged hash. `New-HerdrExchangeShare.ps1` establishes the DACL, the boundary test proves bridge writes fail, and Excel opens only that immutable last-mile copy.
-5. Copy the completed workbook plus a small provenance manifest to `Outbox`; include the source, bridge-stage, last-mile and result paths/hashes, timestamp, and originating repository/branch/commit when applicable.
-6. After acceptance, move the transfer set to `Archive` according to the retention policy.
+1. Transfer a uniquely named finite payload over SSH to `herdr-win` and place it in the configured Windows OneDrive `Inbox`; do not synchronize the same account concurrently from Ubuntu.
+2. Before exchange or Excel work, prove OneDrive is running and signed in under the designated interactive Windows user. A green OneDrive icon or Always keep on this device request alone is not acceptance evidence.
+3. The reviewed staging helper must reject the `Offline`, `RecallOnOpen`, and `RecallOnDataAccess` attributes, then require unchanged size, last-write time, and SHA-256 across two exclusive reads separated by a settle interval.
+4. Preserve the Inbox original, record its SHA-256, and copy it into the configured local bridge staging root. Refuse the job unless both hashes match.
+5. Immediately before Excel/COM execution, the Windows runner must copy the accepted workbook into the configured host-owned local review-job workspace, outside OneDrive and bridge-writable roots, and re-hash it against the accepted staged hash. Excel opens only that immutable last-mile copy.
+6. Copy the completed workbook plus a small provenance manifest to the configured OneDrive `Outbox`; include the source, bridge-stage, last-mile and result paths/hashes, timestamp, and originating repository/branch/commit when applicable. Archive accepted transfer sets according to the retention policy.
 
-Do not place Git working trees, Hyper-V disks, credentials, private keys, automation logs, or active databases in OneDrive. Never add the OneDrive exchange, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or any child directory as an Excel Trusted Location. Do not enable macros or external links in an untrusted workbook merely because it arrived through the exchange.
+Do not place Git working trees, Hyper-V disks, credentials, private keys, automation logs, or active databases in OneDrive. Never add the configured OneDrive exchange, local staging root, local review-job root, or any child directory as an Excel Trusted Location. Do not enable macros or external links in an untrusted workbook merely because it arrived through the exchange.
 
 ## Remote access and recovery
 
@@ -214,7 +214,7 @@ Backblaze complements this system by protecting supported user data offsite. It 
 - Prefer the MS-A2 Intel I226-V 2.5 GbE interface for the primary LAN connection.
 - Run Tailscale independently on Windows (`herdr-win`) and Ubuntu (`herdr-ubuntu`).
 - Do not publish Hyper-V, SMB, SSH, Mosh, RDP or KVM ports through the home router.
-- Restrict the Windows SMB firewall rule to the Tailscale CGNAT range and authenticate with the non-admin `HerdrBridge` account.
+- Issue #961 uses the host SSH endpoint and does not require an Ubuntu SMB mount. If the legacy SMB helper is separately commissioned, keep its firewall and `HerdrBridge` controls isolated from the #961 OneDrive/Excel route.
 - Cat6 is sufficient for the present home network.
 - Assign DHCP reservations to the MS-A2 and Comet.
 - Do not expose KVM, RDP, SSH or management ports directly to the internet.
@@ -231,9 +231,9 @@ Backblaze complements this system by protecting supported user data offsite. It 
 - [ ] Install native Ubuntu PowerShell 7 and migrate AMD64 tooling.
 - [ ] Install and test Herdr persistence.
 - [ ] Configure separate Windows and Ubuntu Tailscale nodes, SSH, Mosh and RDP.
-- [ ] Create and write-test the restricted SMB Excel exchange.
-- [ ] Sign in to OneDrive on Windows, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the tree Always keep on this device.
-- [ ] After the reviewed staging helper exists and passes its hydration, stability, hash and last-mile-isolation tests, complete a round-trip workbook review from laptop → OneDrive Inbox → staged SMB job → host-owned Excel job → OneDrive Outbox.
+- [ ] Sign in to OneDrive on Windows, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, mark the tree Always keep on this device, and record the host-owned runtime configuration outside Git.
+- [ ] Prove SSH transfer to `herdr-win` and OneDrive readiness under the designated interactive user.
+- [ ] After the reviewed staging helper exists and passes its hydration, stability, hash and last-mile-isolation tests, complete a round-trip workbook review from SSH → Windows OneDrive Inbox → configured local staging → host-owned local Excel job → OneDrive Outbox.
 - [ ] Port the Herdr coordination payload to Linux and pass its native-`pwsh` regression suite before enabling it.
 - [ ] Configure Comet, Fingerbot and independent KVM power.
 - [ ] Upload and boot-test recovery virtual media.

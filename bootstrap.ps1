@@ -110,7 +110,7 @@ function Install-WindowsBase {
         'astral-sh.uv'
     ) | ForEach-Object { Install-WingetPackage $_ }
 
-    # New-HerdrExchangeShare.ps1 owns creation and marking of C:\HerdrExchange.
+    # New-HerdrExchangeShare.ps1 owns the separately commissioned legacy SMB root; issue #961 uses the runtime-configured SSH-to-OneDrive route.
     # Pre-creating it here would make the later adoption guard reject a clean install.
     foreach ($directory in @('C:\dev', 'C:\HerdrTools')) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null

@@ -4,7 +4,7 @@
 
 Use two independent Tailscale nodes:
 
-- `herdr-win` — Windows host for RDP, Excel, SMB exchange and host administration.
+- `herdr-win` — Windows host for SSH, RDP, Excel, native OneDrive exchange and host administration; the legacy SMB exchange is separately commissioned only when explicitly needed.
 - `herdr-ubuntu` — Ubuntu Hyper-V VM for SSH, Mosh, Herdr, Codex and Claude.
 
 This is not the unsupported dual-Tailscale-inside-WSL arrangement. The VM is a separate operating system with its own virtual NIC and Tailscale tunnel. Do not forward any management port from the home router.
@@ -86,7 +86,7 @@ Once devices are named or tagged, use the current Tailscale policy editor and te
 
 - Laptop and phone to TCP 22 and the chosen Mosh UDP range on `herdr-ubuntu`.
 - Approved user devices to RDP on `herdr-win`.
-- `herdr-ubuntu` to TCP 445 on `herdr-win` for the restricted SMB exchange.
+- Do not open an Ubuntu-to-Windows SMB mount for issue #961; use the approved SSH-to-`herdr-win` handoff and the Windows runtime-configured OneDrive exchange. Any legacy SMB firewall rule remains outside this lane.
 - Administrative access to the Comet and Hostinger VPS to approved identities only.
 
 Do not copy a stale ACL example without validating the current policy syntax.

@@ -1,6 +1,7 @@
 Set-StrictMode -Version Latest
 
-. (Join-Path $PSScriptRoot 'HerdrReviewStaging.ps1')
+$script:HerdrReviewStagingScriptPath = Join-Path $PSScriptRoot 'HerdrReviewStaging.ps1'
+. $script:HerdrReviewStagingScriptPath
 
 function Assert-HerdrJsonProperties {
     [CmdletBinding()]
@@ -179,6 +180,82 @@ function Get-HerdrProcessIdentityProof {
     }
     catch {
         throw "Could not prove process identity for PID $ProcessId."
+    }
+}
+
+function Assert-HerdrOneDriveReady {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OneDriveExchangeRoot,
+        [Parameter(Mandatory)][string]$OneDriveAccount,
+        [Parameter(Mandatory)][object]$IdentityConfiguration,
+        [switch]$TestMode,
+        [scriptblock]$ReadyProbe
+    )
+
+    if ($null -ne $ReadyProbe -and -not $TestMode) {
+        throw 'OneDrive readiness probes are permitted only in explicit test mode.'
+    }
+    if ($TestMode) {
+        if ($null -eq $ReadyProbe) {
+            return [pscustomobject][ordered]@{ Status = 'test-mode-bypassed' }
+        }
+        $observed = & $ReadyProbe
+        if ($null -eq $observed -or ($observed -is [bool] -and -not $observed)) {
+            throw 'OneDrive readiness probe reported that the configured account is not ready.'
+        }
+        return $observed
+    }
+    if (-not $IsWindows) { throw 'OneDrive readiness proof is Windows-only.' }
+
+    $matchingProcess = $false
+    foreach ($process in @(Get-Process -Name OneDrive -ErrorAction SilentlyContinue)) {
+        try {
+            $proof = Get-HerdrProcessIdentityProof -ProcessId $process.Id
+            if ($proof.UserSid -ceq [string]$IdentityConfiguration.InteractiveUserSid -and
+                $proof.SessionId -eq [int]$IdentityConfiguration.InteractiveSessionId) {
+                $matchingProcess = $true
+                break
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    if (-not $matchingProcess) {
+        throw 'OneDrive is not running under the designated interactive Windows user and session.'
+    }
+
+    $accountsRoot = 'HKCU:\Software\Microsoft\OneDrive\Accounts'
+    $matchingAccount = $false
+    foreach ($accountKey in @(Get-ChildItem -LiteralPath $accountsRoot -ErrorAction SilentlyContinue)) {
+        try {
+            $accountProperties = Get-ItemProperty -LiteralPath $accountKey.PSPath -ErrorAction Stop
+            $accountNames = @(
+                $accountProperties.PSObject.Properties['UserEmail'],
+                $accountProperties.PSObject.Properties['UserName'],
+                $accountProperties.PSObject.Properties['AccountName']
+            ) | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Value) } |
+                ForEach-Object { [string]$_.Value }
+            $userFolderProperty = $accountProperties.PSObject.Properties['UserFolder']
+            if ($null -ne $userFolderProperty -and $accountNames -contains $OneDriveAccount -and
+                (Test-HerdrPathSameOrDescendant -Candidate $OneDriveExchangeRoot -Ancestor ([string]$userFolderProperty.Value))) {
+                $matchingAccount = $true
+                break
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    if (-not $matchingAccount) {
+        throw 'The configured OneDrive exchange root is not associated with a signed-in configured OneDrive account.'
+    }
+    [pscustomobject][ordered]@{
+        Status = 'ready'
+        Process = 'OneDrive'
+        Account = $OneDriveAccount
+        ExchangeRoot = $OneDriveExchangeRoot
     }
 }
 
@@ -517,7 +594,7 @@ function Assert-HerdrBridgeCannotWrite {
         $bridgeSid = Get-HerdrBridgeAccountSid -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid
         foreach ($path in $Paths) {
             $canonicalPath = Get-HerdrCanonicalPath -Path $path
-            if (-not (Test-Path -LiteralPath $canonicalPath -PathType Container)) {
+            if (-not (Test-Path -LiteralPath $canonicalPath -PathType Any)) {
                 throw "Host-owned path is missing: '$canonicalPath'."
             }
             try {
@@ -555,7 +632,7 @@ function Assert-HerdrBridgeCannotWrite {
     if ($groupSids.Count -eq 0) { throw 'Bridge account group membership is empty; refusing to continue.' }
     foreach ($path in $Paths) {
         $canonicalPath = Get-HerdrCanonicalPath -Path $path
-        if (-not (Test-Path -LiteralPath $canonicalPath -PathType Container)) {
+        if (-not (Test-Path -LiteralPath $canonicalPath -PathType Any)) {
             throw "Host-owned path is missing: '$canonicalPath'."
         }
         try {
@@ -682,9 +759,10 @@ function Invoke-HerdrExcelJob {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$JobPath,
-        [string]$ExchangeRoot = 'C:\HerdrExchange',
-        [string]$ReviewJobsRoot = 'C:\HerdrReviewJobs',
-        [string]$ToolsRoot = 'C:\HerdrTools',
+        [string]$RuntimeConfigurationPath,
+        [string]$ExchangeRoot,
+        [string]$ReviewJobsRoot,
+        [string]$ToolsRoot,
         [string]$OneDriveInboxRoot,
         [string]$OneDriveOutboxRoot,
         [string]$OneDriveArchiveRoot,
@@ -697,25 +775,73 @@ function Invoke-HerdrExcelJob {
         [scriptblock]$HostOwnedAccessProbe,
         [scriptblock]$ExcelInvoker,
         [scriptblock]$ExcelProcessProbe,
-        [scriptblock]$AfterExcelHook
+        [scriptblock]$AfterExcelHook,
+        [scriptblock]$OneDriveReadyProbe
     )
+
+    # A caller may invoke this script with the call operator, which gives a
+    # dot-sourced dependency its own transient script scope. Import the
+    # staging helper into this function scope so every helper used by the
+    # bounded job remains available.
+    . $script:HerdrReviewStagingScriptPath
+    $copyHerdrFileExclusive = Get-Command Copy-HerdrFileExclusive -CommandType Function -ErrorAction Stop
 
     if (-not $TestMode -and ($null -ne $InteractiveSessionProbe -or $null -ne $IdentityProbe -or
         $null -ne $HostOwnedAccessProbe -or $null -ne $ExcelInvoker -or $null -ne $ExcelProcessProbe -or
-        $null -ne $AfterExcelHook)) {
+        $null -ne $AfterExcelHook -or $null -ne $OneDriveReadyProbe)) {
         throw 'Test probes are permitted only in explicit test mode.'
     }
     if ($null -ne $InteractiveSessionProbe -and $null -ne $IdentityProbe) {
         throw 'Specify one interactive identity probe.'
+    }
+    $runtimeConfiguration = $null
+    if (-not $TestMode -or -not [string]::IsNullOrWhiteSpace($RuntimeConfigurationPath) -or
+        -not [string]::IsNullOrWhiteSpace($env:HERDR_WINDOWS_REVIEW_CONFIG)) {
+        $runtimeConfiguration = Get-HerdrRuntimeConfiguration -Path $RuntimeConfigurationPath -TestMode:$TestMode
+        $providedPaths = @(
+            [pscustomobject]@{ Name = 'exchange_root'; Provided = $ExchangeRoot; Configured = $runtimeConfiguration.ExchangeRoot },
+            [pscustomobject]@{ Name = 'review_jobs_root'; Provided = $ReviewJobsRoot; Configured = $runtimeConfiguration.ReviewJobsRoot },
+            [pscustomobject]@{ Name = 'tools_root'; Provided = $ToolsRoot; Configured = $runtimeConfiguration.ToolsRoot },
+            [pscustomobject]@{ Name = 'one_drive_inbox_root'; Provided = $OneDriveInboxRoot; Configured = $runtimeConfiguration.OneDriveInboxRoot },
+            [pscustomobject]@{ Name = 'one_drive_outbox_root'; Provided = $OneDriveOutboxRoot; Configured = $runtimeConfiguration.OneDriveOutboxRoot },
+            [pscustomobject]@{ Name = 'one_drive_archive_root'; Provided = $OneDriveArchiveRoot; Configured = $runtimeConfiguration.OneDriveArchiveRoot }
+        )
+        foreach ($pathRecord in $providedPaths) {
+            if (-not [string]::IsNullOrWhiteSpace($pathRecord.Provided) -and
+                -not (Get-HerdrCanonicalPath -Path $pathRecord.Provided).Equals($pathRecord.Configured, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Explicit $($pathRecord.Name) disagrees with host-owned runtime configuration."
+            }
+        }
+        $ExchangeRoot = $runtimeConfiguration.ExchangeRoot
+        $ReviewJobsRoot = $runtimeConfiguration.ReviewJobsRoot
+        $ToolsRoot = $runtimeConfiguration.ToolsRoot
+        $OneDriveInboxRoot = $runtimeConfiguration.OneDriveInboxRoot
+        $OneDriveOutboxRoot = $runtimeConfiguration.OneDriveOutboxRoot
+        $OneDriveArchiveRoot = $runtimeConfiguration.OneDriveArchiveRoot
+        if ([string]::IsNullOrWhiteSpace($ExpectedInteractiveUserSid)) { $ExpectedInteractiveUserSid = $runtimeConfiguration.DesignatedInteractiveUserSid }
+        if ($ExpectedInteractiveSessionId -lt 0) { $ExpectedInteractiveSessionId = $runtimeConfiguration.DesignatedInteractiveSessionId }
+        if ([string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) { $ExpectedBridgeAccountSid = $runtimeConfiguration.BridgeAccountSid }
+    }
+    if ([string]::IsNullOrWhiteSpace($ExchangeRoot) -or [string]::IsNullOrWhiteSpace($ReviewJobsRoot) -or
+        [string]::IsNullOrWhiteSpace($ToolsRoot) -or [string]::IsNullOrWhiteSpace($OneDriveInboxRoot)) {
+        throw 'Explicit roots are incomplete; use a complete host-owned runtime configuration.'
     }
     $identityConfiguration = Get-HerdrIdentityConfiguration `
         -ExpectedInteractiveUserSid $ExpectedInteractiveUserSid `
         -ExpectedInteractiveSessionId $ExpectedInteractiveSessionId `
         -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid `
         -TestMode:$TestMode
-    if ([string]::IsNullOrWhiteSpace($OneDriveInboxRoot)) { $OneDriveInboxRoot = Get-HerdrDefaultOneDriveInboxRoot }
+    if ($null -ne $runtimeConfiguration -and -not $TestMode) {
+        Assert-HerdrBridgeCannotWrite -Paths @($runtimeConfiguration.ConfigurationPath) `
+            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid | Out-Null
+    }
     if ([string]::IsNullOrWhiteSpace($OneDriveOutboxRoot)) { $OneDriveOutboxRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Outbox }
     if ([string]::IsNullOrWhiteSpace($OneDriveArchiveRoot)) { $OneDriveArchiveRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Archive }
+    if ($null -ne $runtimeConfiguration) {
+        Assert-HerdrOneDriveReady -OneDriveExchangeRoot $runtimeConfiguration.OneDriveExchangeRoot `
+            -OneDriveAccount $runtimeConfiguration.OneDriveAccount -IdentityConfiguration $identityConfiguration `
+            -TestMode:$TestMode -ReadyProbe $OneDriveReadyProbe | Out-Null
+    }
     $exchangeCanonical = Ensure-HerdrManagedDirectory -Path (Assert-HerdrConfiguredLocalPath -Path $ExchangeRoot) -Description 'Exchange root'
     $reviewCanonical = Assert-HerdrConfiguredLocalPath -Path $ReviewJobsRoot
     $toolsCanonical = Assert-HerdrConfiguredLocalPath -Path $ToolsRoot
@@ -784,7 +910,7 @@ function Invoke-HerdrExcelJob {
     $resultWorkingPath = Get-HerdrCanonicalPath -Path (Join-Path $reviewJobPath ('result' + $extension))
     $completed = $false
     try {
-        Copy-HerdrFileExclusive -SourcePath $manifest.StagedPath -DestinationPath $lastMilePath `
+        & $copyHerdrFileExclusive -SourcePath $manifest.StagedPath -DestinationPath $lastMilePath `
             -TrustedRoot (Join-Path (Join-Path $exchangeCanonical 'in') $job.JobId) `
             -ExpectedSourceIdentity $stageBefore -TrustedDestinationRoot $reviewJobPath | Out-Null
         $lastMileBefore = Get-HerdrFileSnapshot -Path $lastMilePath -TrustedRoot $reviewJobPath
@@ -805,14 +931,14 @@ function Invoke-HerdrExcelJob {
         $outboxJobPath = Ensure-HerdrManagedDirectory -Path $outboxJobPath `
             -TrustedRoot $outboxCanonical -Description 'Exchange output job directory'
         $resultPath = Get-HerdrCanonicalPath -Path (Join-Path $outboxJobPath ('result' + $extension))
-        Copy-HerdrFileExclusive -SourcePath $resultWorkingPath -DestinationPath $resultPath `
+        & $copyHerdrFileExclusive -SourcePath $resultWorkingPath -DestinationPath $resultPath `
             -TrustedRoot $reviewJobPath -ExpectedSourceIdentity $resultWorking -TrustedDestinationRoot $outboxJobPath | Out-Null
         $result = Get-HerdrFileSnapshot -Path $resultPath -TrustedRoot $outboxJobPath
         Assert-HerdrSnapshotContentEqual -Expected $resultWorking -Actual $result -Description 'Outbox result copy'
         $oneDriveOutboxJobPath = Ensure-HerdrManagedDirectory -Path $oneDriveOutboxJobPath `
             -TrustedRoot $oneDriveOutboxCanonical -Description 'OneDrive output job directory'
         $oneDriveResultPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath ('result' + $extension))
-        Copy-HerdrFileExclusive -SourcePath $resultPath -DestinationPath $oneDriveResultPath `
+        & $copyHerdrFileExclusive -SourcePath $resultPath -DestinationPath $oneDriveResultPath `
             -TrustedRoot $outboxJobPath -ExpectedSourceIdentity $result -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
         $oneDriveResult = Get-HerdrFileSnapshot -Path $oneDriveResultPath -TrustedRoot $oneDriveOutboxJobPath
         Assert-HerdrSnapshotContentEqual -Expected $result -Actual $oneDriveResult -Description 'OneDrive Outbox result copy'
@@ -874,7 +1000,7 @@ function Invoke-HerdrExcelJob {
         $json = $provenance | ConvertTo-Json -Depth 12 -Compress
         Write-HerdrAtomicText -Path $manifestOutputPath -Content $json -TrustedRoot $outboxJobPath | Out-Null
         $oneDriveManifestPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath 'provenance.json')
-        Copy-HerdrFileExclusive -SourcePath $manifestOutputPath -DestinationPath $oneDriveManifestPath `
+        & $copyHerdrFileExclusive -SourcePath $manifestOutputPath -DestinationPath $oneDriveManifestPath `
             -TrustedRoot $outboxJobPath -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
         $logRecord = [ordered]@{
             schema = 'herdr-excel-job-log-v1'

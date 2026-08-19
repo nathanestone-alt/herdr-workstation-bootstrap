@@ -21,17 +21,40 @@ function Assert-Throws([scriptblock]$Action, [string]$Expected, [string]$Name) {
     if (-not $thrown) { throw "$Name was accepted unexpectedly." }
 }
 
+function Write-TestJson([string]$Path, [object]$Value) {
+    [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-staging-test-$([Guid]::NewGuid().ToString('N'))"
-$inbox = Join-Path $root 'onedrive\Herdr Review Exchange\Inbox'
-$oneDriveOutbox = Join-Path $root 'onedrive\Herdr Review Exchange\Outbox'
-$oneDriveArchive = Join-Path $root 'onedrive\Herdr Review Exchange\Archive'
+$oneDriveExchange = Join-Path $root 'onedrive\Herdr Review Exchange'
+$inbox = Join-Path $oneDriveExchange 'Inbox'
+$oneDriveOutbox = Join-Path $oneDriveExchange 'Outbox'
+$oneDriveArchive = Join-Path $oneDriveExchange 'Archive'
 $exchange = Join-Path $root 'exchange'
+$reviewJobs = Join-Path $root 'review-jobs'
+$tools = Join-Path $root 'tools'
+$runtimeConfig = Join-Path $root 'runtime-config.json'
 $source = Join-Path $inbox 'review.xlsx'
 $secret = 'TEST-SECRET-MUST-NOT-LEAK'
 $sourceBytes = [Text.Encoding]::UTF8.GetBytes("Workbook fixture $secret`n")
 try {
     New-Item -ItemType Directory -Path $inbox, $oneDriveOutbox, $oneDriveArchive -Force | Out-Null
-    New-Item -ItemType Directory -Path $exchange -Force | Out-Null
+    New-Item -ItemType Directory -Path $exchange, $reviewJobs, $tools -Force | Out-Null
+    Write-TestJson -Path $runtimeConfig -Value ([ordered]@{
+        schema = 'herdr-windows-review-runtime-v1'
+        approved = $true
+        one_drive_exchange_root = $oneDriveExchange
+        one_drive_account = 'configured@example.invalid'
+        exchange_root = $exchange
+        review_jobs_root = $reviewJobs
+        tools_root = $tools
+        designated_interactive_user_sid = 'S-1-5-21-961-1001'
+        designated_interactive_session_id = 7
+        bridge_account_sid = 'S-1-5-21-961-1002'
+    })
+    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig -TestMode
+    Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
+    Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
 
     $result = Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' `
@@ -68,7 +91,7 @@ try {
     [IO.File]::WriteAllBytes($unstableSource, [Text.Encoding]::UTF8.GetBytes('stable-before'))
     Assert-Throws {
         Invoke-HerdrReviewStaging -SourcePath $unstableSource -JobId 'job-unstable' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0 `
-            -BetweenSourceReads { [IO.File]::WriteAllBytes($unstableSource, [Text.Encoding]::UTF8.GetBytes('changed-after')) }.GetNewClosure()
+            -BetweenSourceReads { param([string]$Path) [IO.File]::WriteAllBytes($Path, [Text.Encoding]::UTF8.GetBytes('changed-after')) }
     } 'unstable' 'stability gate'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-unstable'))) 'Unstable staging left a partial job directory.'
 
@@ -80,7 +103,7 @@ try {
     $cliSource = Join-Path $inbox 'cli.xlsx'
     [IO.File]::WriteAllBytes($cliSource, $sourceBytes)
     $cliOutput = & (Join-Path $PSScriptRoot '..\scripts\windows\Stage-HerdrReviewWorkbook.ps1') `
-        -SourcePath $cliSource -JobId 'job-cli' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange `
+        -SourcePath $cliSource -JobId 'job-cli' -RuntimeConfigurationPath $runtimeConfig -TestMode `
         -StabilityIntervalMilliseconds 0 2>&1 | Out-String
     Assert-True (-not $cliOutput.Contains($secret, [StringComparison]::Ordinal)) 'Staging stdout/stderr leaked workbook content.'
     $stagedFiles = @(Get-ChildItem -LiteralPath $exchange -File -Recurse -Filter '*.json' | ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
