@@ -20,15 +20,28 @@ prepare_fixture_repo() {
 write_fixture_commands() {
   local case_root="$1"
   local fake_bin="$case_root/bin"
-  mkdir -p "$fake_bin"
+  local trusted_bin="$case_root/trusted-bin"
+  mkdir -p "$fake_bin" "$trusted_bin"
 
   cat > "$fake_bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+original_path=''
+original_apt_get=''
+if [[ "${1:-}" == env ]]; then shift; fi
 while [[ $# -gt 0 && "$1" == *=* && "$1" != -* ]]; do
+  case "$1" in
+    PATH=*) original_path="${1#PATH=}" ;;
+    HERDR_TAILSCALE_REAL_APT_GET=*) original_apt_get="${1#HERDR_TAILSCALE_REAL_APT_GET=}" ;;
+  esac
   export "$1"
   shift
 done
+printf 'PATH=%s\nAPT=%s\n' "$original_path" "$original_apt_get" >> "${CASE_ROOT:?}/privileged-path.log"
+if [[ "$original_apt_get" == /usr/bin/apt-get ]]; then
+  export HERDR_TAILSCALE_REAL_APT_GET="${CASE_ROOT:?}/trusted-bin/apt-get"
+  export APT_SEAM_LOG="${CASE_ROOT:?}/trusted-apt.log"
+fi
 exec "$@"
 EOF
 
@@ -36,9 +49,10 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 case_root="${CASE_ROOT:?}"
-printf 'apt-get' >> "$case_root/apt.log"
-for arg in "$@"; do printf ' %q' "$arg" >> "$case_root/apt.log"; done
-printf '\n' >> "$case_root/apt.log"
+apt_log="${APT_SEAM_LOG:-$case_root/apt.log}"
+printf 'apt-get' >> "$apt_log"
+for arg in "$@"; do printf ' %q' "$arg" >> "$apt_log"; done
+printf '\n' >> "$apt_log"
 
 has_tailscale=0
 has_allow_downgrades=0
@@ -62,6 +76,8 @@ if (( has_tailscale == 1 )); then
   fi
 fi
 EOF
+
+  cp "$fake_bin/apt-get" "$trusted_bin/apt-get"
 
   cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
@@ -107,7 +123,15 @@ printf 'curl unexpectedly invoked\n' >> "${CASE_ROOT:?}/forbidden.log"
 exit 99
 EOF
 
+  cat > "$fake_bin/installer-helper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'caller-controlled installer helper unexpectedly invoked\n' >> "${CASE_ROOT:?}/forbidden.log"
+exit 98
+EOF
+
   chmod 0755 "$fake_bin"/*
+  chmod 0755 "$trusted_bin/apt-get"
 }
 
 run_case() {
@@ -122,13 +146,14 @@ run_case() {
   local fixture_repo="$case_root/repo"
   local home="$case_root/home"
   local output="$case_root/output.log"
+  local apt_log
   local status
 
   mkdir -p "$case_root" "$home"
   prepare_fixture_repo "$fixture_repo" "$bootstrap_source"
   write_fixture_commands "$case_root"
   printf '%s\n' "$initial_version" > "$case_root/tailscale.version"
-  printf '#!/bin/sh\nset -eu\nversion="${TAILSCALE_VERSION}"\nif [ "${CASE_MODE:-}" = arbitrary-installer ]; then version=9.99.9; fi\napt-get install -y "tailscale=$version" tailscale-archive-keyring\n' > "$case_root/installer.sh"
+  printf '#!/bin/sh\nset -eu\nversion="${TAILSCALE_VERSION}"\nif [ "${CASE_MODE:-}" = arbitrary-installer ]; then version=9.99.9; fi\nif [ "${CASE_MODE:-}" = hostile-path ] && command -v installer-helper >/dev/null 2>&1; then installer-helper; fi\napt-get install -y "tailscale=$version" tailscale-archive-keyring\n' > "$case_root/installer.sh"
   chmod 0755 "$case_root/installer.sh"
 
   set +e
@@ -175,16 +200,20 @@ run_case() {
     }
   fi
   if [[ "$expect_allow_downgrades" == yes ]]; then
-    [[ -f "$case_root/apt.log" ]] || {
+    [[ -f "$case_root/apt.log" || -f "$case_root/trusted-apt.log" ]] || {
       echo "$case_name did not invoke the package seam." >&2
       exit 1
     }
-    grep -Fq -- '--allow-downgrades' "$case_root/apt.log" || {
+    apt_log="$case_root/apt.log"
+    [[ -f "$case_root/trusted-apt.log" ]] && apt_log="$case_root/trusted-apt.log"
+    grep -Fq -- '--allow-downgrades' "$apt_log" || {
       echo "$case_name did not use the bounded apt downgrade option." >&2
       exit 1
       }
   else
-    if [[ -f "$case_root/apt.log" ]] && grep -Fq -- '--allow-downgrades' "$case_root/apt.log"; then
+    apt_log="$case_root/apt.log"
+    [[ -f "$case_root/trusted-apt.log" ]] && apt_log="$case_root/trusted-apt.log"
+    if [[ -f "$apt_log" ]] && grep -Fq -- '--allow-downgrades' "$apt_log"; then
       echo "$case_name unexpectedly used the downgrade option." >&2
       exit 1
     fi
@@ -207,6 +236,7 @@ run_case candidate-invalid-lock "$repo_root/scripts/ubuntu/bootstrap.sh" invalid
 run_case candidate-checksum-failure "$repo_root/scripts/ubuntu/bootstrap.sh" checksum-failure 1.103.0 23 no no
 run_case candidate-install-failure "$repo_root/scripts/ubuntu/bootstrap.sh" install-failure 1.103.0 71 no yes
 run_case candidate-post-mismatch "$repo_root/scripts/ubuntu/bootstrap.sh" post-mismatch 1.103.0 24 no yes
+run_case candidate-hostile-path "$repo_root/scripts/ubuntu/bootstrap.sh" hostile-path 1.103.0 0 yes yes
 
 exact_case="$test_root/candidate-exact"
 if [[ -f "$exact_case/apt.log" ]] && grep -Fq 'tailscale=' "$exact_case/apt.log"; then
@@ -217,5 +247,27 @@ if [[ -f "$exact_case/command.log" ]] && grep -Fq 'download_verified' "$exact_ca
   echo 'Already-exact Tailscale unexpectedly downloaded or installed a package.' >&2
   exit 1
 fi
+
+hostile_case="$test_root/candidate-hostile-path"
+if [[ -f "$hostile_case/apt.log" ]] && grep -Fq 'tailscale=' "$hostile_case/apt.log"; then
+  echo 'Hostile PATH selected the caller-controlled apt-get.' >&2
+  exit 1
+fi
+[[ -s "$hostile_case/trusted-apt.log" ]] || {
+  echo 'Hostile PATH did not use the hermetic trusted apt seam.' >&2
+  exit 1
+}
+grep -Fq 'PATH=' "$hostile_case/privileged-path.log" || {
+  echo 'Hostile PATH case did not record the privileged PATH.' >&2
+  exit 1
+}
+grep -Eq 'PATH=.*/usr/sbin:/usr/bin:/sbin:/bin$' "$hostile_case/privileged-path.log" || {
+  echo 'Hostile PATH case propagated an unexpected privileged PATH.' >&2
+  exit 1
+}
+grep -Fq 'APT=/usr/bin/apt-get' "$hostile_case/privileged-path.log" || {
+  echo 'Hostile PATH case did not resolve the trusted system apt-get.' >&2
+  exit 1
+}
 
 echo 'Tailscale locked-version downgrade regression tests passed.'

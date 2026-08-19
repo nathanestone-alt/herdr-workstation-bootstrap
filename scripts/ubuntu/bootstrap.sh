@@ -452,6 +452,8 @@ install_locked_tailscale() (
   local tailscale_temp_dir
   local installer
   local apt_get_shim
+  local trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
+  local resolved_apt_get
   local real_apt_get
   local installer_status
 
@@ -463,8 +465,11 @@ install_locked_tailscale() (
   trap 'rm -rf -- "$tailscale_temp_dir"' EXIT
   installer="$tailscale_temp_dir/install.sh"
   apt_get_shim="$tailscale_temp_dir/apt-get"
-  real_apt_get="$(command -v apt-get || true)"
-  [[ "$real_apt_get" == /* && -x "$real_apt_get" ]] || {
+  resolved_apt_get="$(PATH="$trusted_path" command -v apt-get || true)"
+  real_apt_get="$(realpath -e -- "$resolved_apt_get" 2>/dev/null || true)"
+  [[ "$resolved_apt_get" == '/usr/bin/apt-get' &&
+     "$real_apt_get" == '/usr/bin/apt-get' &&
+     -x "$real_apt_get" ]] || {
     echo 'Could not resolve the system apt-get executable.' >&2
     exit 24
   }
@@ -501,7 +506,7 @@ EOF
   chmod 0755 "$apt_get_shim"
 
   if sudo env \
-    PATH="$tailscale_temp_dir:$PATH" \
+    PATH="$tailscale_temp_dir:$trusted_path" \
     HERDR_TAILSCALE_REAL_APT_GET="$real_apt_get" \
     TAILSCALE_VERSION="$TAILSCALE_VERSION" \
     sh "$installer"; then
