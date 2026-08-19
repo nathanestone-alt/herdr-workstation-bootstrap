@@ -26,6 +26,8 @@ Coordinate existing agents without hard-coding workspace, tab, pane, terminal, o
 ## Guardrails
 
 1. Verify `HERDR_ENV=1` before any Herdr control command using the agent's native host-shell tool. Never make this decision inside context-mode, an MCP server, a sandboxed executor, or a detached helper because those subprocesses may strip pane-scoped `HERDR_*` variables. If such a subprocess reports them missing, recheck directly; stop only when the direct host-shell check fails.
+
+   For registration and any pane/agent operation that requires live pane metadata, make an explicit host-access preflight by running `herdr pane get <live-pane-id>` from that native host shell; `HERDR_ENV=1` alone is not proof that pane access is available. If the preflight returns `PermissionDenied` or `Operation not permitted`, classify the attempt as `host_access_unavailable`, do not issue or retry registration from the same sandbox, and obtain host-level execution before retrying the preflight. Run the authorized initialization command only after the preflight succeeds. If a legacy attempt already failed before that preflight, allow at most one host-level retry, then stop and report that no session identity was returned.
 2. Run `herdr --help` and the relevant command group when command syntax has not been established in the current turn.
 3. Discover live IDs from Herdr JSON. Never persist or predict an ID. The reviewed 0.8.0 preview still lets `--current` fall back to UI focus when `HERDR_PANE_ID` is absent, so require the native workspace/tab/pane IDs and use the explicit pane ID; never use `--current` as identity recovery.
 4. Read a target pane before waiting for new output or recovering input.
@@ -327,6 +329,24 @@ KiB; the completion event records that hash and a retry fails if the file at
 the same path changed. A crash that leaves only a current-format
 `request_reserved` event resumes the same workflow and relay identity rather
 than remaining permanently stranded.
+
+### Report the native execution profile
+
+Before a newly launched or restored worker accepts a tracked review, report its
+selected execution profile from the worker's native dispatch configuration:
+
+```powershell
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
+  -Action report-profile -Provider openai -Model gpt-5.6-luna `
+  -ReasoningEffort max -ServiceTier priority
+```
+
+Use the exact provider, model, reasoning effort, and service tier selected for
+that worker; the example reflects the default Luna Max/priority route. The
+action proves the caller's live pane and native session, stores a
+session-bound Herdr metadata report, and fails closed if Herdr cannot expose
+the exact values. Workflow preflight reads this native report (or equivalent
+native agent fields) and never infers execution profile from UI text.
 
 If a reviewer produced a durable verdict but `complete` was refused during a temporary native-session proof gap, never fabricate completion or close the ledger from pane identity alone. Prefer having the original target retry `complete` after its exact native session is restored. When that is impractical, only the dynamically discovered `Coordination` pane may run `-Action reconcile-completion`, and only while all of these proofs agree:
 

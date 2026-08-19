@@ -295,9 +295,7 @@ function Test-AgentProcessLease {
 function Test-CurrentProcessDescendsFrom {
     param([Parameter(Mandatory)][int]$AncestorProcessId)
 
-    if ($AncestorProcessId -le 0 -or
-        -not $IsWindows -or
-        -not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+    if ($AncestorProcessId -le 0) {
         return $false
     }
     $cursor = [int]$PID
@@ -310,16 +308,38 @@ function Test-CurrentProcessDescendsFrom {
             return $false
         }
         $seen[$cursor] = $true
-        try {
-            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $cursor" -ErrorAction Stop
+        if ($IsWindows) {
+            if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+                return $false
+            }
+            try {
+                $process = Get-CimInstance Win32_Process -Filter "ProcessId = $cursor" -ErrorAction Stop
+            }
+            catch {
+                return $false
+            }
+            if ($null -eq $process) {
+                return $false
+            }
+            $cursor = [int]$process.ParentProcessId
         }
-        catch {
-            return $false
+        else {
+            $statusPath = Join-Path "/proc" "$cursor/status"
+            if (-not (Test-Path -LiteralPath $statusPath)) {
+                return $false
+            }
+            try {
+                $status = [IO.File]::ReadAllText($statusPath)
+            }
+            catch {
+                return $false
+            }
+            $parentMatch = [regex]::Match($status, '(?m)^PPid:\s+(\d+)\s*$')
+            if (-not $parentMatch.Success) {
+                return $false
+            }
+            $cursor = [int]$parentMatch.Groups[1].Value
         }
-        if ($null -eq $process) {
-            return $false
-        }
-        $cursor = [int]$process.ParentProcessId
     }
     return $false
 }
@@ -982,10 +1002,19 @@ function Start-QueuedPaneWatcher {
             "-ExpectedAgentPid", "$($TargetProcessLease.agent_pid)"
         )
     }
+    $streamPathStem = $ResultLogPath
+    if (-not [string]::IsNullOrWhiteSpace($TrackedToken)) {
+        $safeToken = [regex]::Replace($TrackedToken, '[^A-Za-z0-9_-]', '')
+        if (-not [string]::IsNullOrWhiteSpace($safeToken)) {
+            $streamPathStem = "$ResultLogPath.$safeToken"
+        }
+    }
     $startParameters = @{
         FilePath = $pwsh
         ArgumentList = $arguments
         PassThru = $true
+        RedirectStandardOutput = "$streamPathStem.stdout"
+        RedirectStandardError = "$streamPathStem.stderr"
     }
     if ($IsWindows) {
         $startParameters['WindowStyle'] = 'Hidden'

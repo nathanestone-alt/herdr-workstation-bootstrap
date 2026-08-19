@@ -24,6 +24,9 @@ regression_tests=(
   'payload/agents-skills/herdr-coordination/scripts/test_herdr_skill_compatibility.ps1'
   'payload/agents-skills/herdr-coordination/scripts/test_herdr_workflow.ps1'
   'payload/agents-skills/herdr-coordination/scripts/test_herdr_workflow_stress.ps1'
+  'payload/agents-skills/herdr-coordination/scripts/test_herdr_workflow_empty_ledger.ps1'
+  'payload/agents-skills/herdr-coordination/scripts/test_herdr_workflow_profile_reporting.ps1'
+  'payload/agents-skills/herdr-coordination/scripts/test_ubuntu_portability.ps1'
   'payload/agents-skills/st-herdr-dispatch/scripts/test_st_herdr_dispatch.ps1'
 )
 
@@ -1275,6 +1278,27 @@ revalidate_source_and_stage() {
   verify_payload_roots "$stage_root/agents-skills" "$stage_root/claude-skills" staged
 }
 
+run_herdr_portability_manifest() {
+  local manifest_path="$payload_root/agents-skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1"
+  local manifest_output=''
+  local manifest_status=0
+
+  [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || {
+    fail_closed "herdr-coordination Ubuntu portability manifest is missing: $manifest_path"
+  }
+  manifest_output="$(pwsh -NoProfile -File "$manifest_path" 2>&1)" || manifest_status=$?
+  if (( manifest_status != 0 )); then
+    echo "BLOCKED: herdr-coordination Ubuntu portability manifest failed (exit $manifest_status)." >&2
+    echo "Run: pwsh -NoProfile -File $manifest_path" >&2
+    if [[ -n "$manifest_output" ]]; then
+      printf '%s\n' "$manifest_output" | tail -n 8 >&2
+    else
+      echo 'Manifest produced no diagnostic output.' >&2
+    fi
+    exit 30
+  fi
+}
+
 main() {
   validate_destination_safety
   fence_open_directory "$state_dir" state_dir_fd
@@ -1289,11 +1313,7 @@ main() {
   validate_managed_toolchain
 
   if [[ -d "$payload_root/agents-skills/herdr-coordination" ]]; then
-    if grep -RqsE 'C:\\|USERPROFILE|-WindowStyle|@echo off|\.cmd\b' "$payload_root/agents-skills/herdr-coordination"; then
-      echo 'BLOCKED: herdr-coordination still contains Windows-specific behavior.' >&2
-      echo 'Port it and run its regression suite under native Ubuntu pwsh before installing the agents skill payload.' >&2
-      exit 30
-    fi
+    run_herdr_portability_manifest
   fi
 
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'

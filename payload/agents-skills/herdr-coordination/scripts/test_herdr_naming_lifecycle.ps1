@@ -22,6 +22,7 @@ try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 $helperPath = Join-Path $PSScriptRoot "herdr_coordination.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-naming-lifecycle-$([Guid]::NewGuid().ToString('N'))"
 $mockBin = Join-Path $testRoot "bin"
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
 $statePath = Join-Path $testRoot "mock-state.json"
 $callsPath = Join-Path $testRoot "mock-calls.log"
 $null = New-Item -ItemType Directory -Path $mockBin -Force
@@ -271,18 +272,26 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
 '@
     $mockScriptPath = Join-Path $mockBin "mock_herdr.ps1"
     [IO.File]::WriteAllText($mockScriptPath, $mockScript, [Text.UTF8Encoding]::new($false))
-    # Shim BOTH command surfaces the helper can reach. herdr_coordination.ps1
-    # prefers "rtk proxy herdr ..." when rtk is on PATH and only falls back to
-    # "herdr ...", so mocking herdr alone would leave the rtk path depending on
-    # a real rtk being installed and its proxy being a raw passthrough. Owning
-    # both names means no invocation can escape to a live Herdr, whether or not
-    # rtk exists on the machine running the test. %* is forwarded verbatim so
-    # non-ASCII subtitle text survives the hop.
-    $mockCmd = "@echo off`r`npwsh -NoProfile -File `"%~dp0mock_herdr.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
-    [IO.File]::WriteAllText((Join-Path $mockBin "herdr.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
-    [IO.File]::WriteAllText((Join-Path $mockBin "rtk.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+    # Shim both command surfaces the helper can reach. On Unix the mock itself
+    # is an executable PowerShell script; Windows retains a .cmd launcher for
+    # the native command lookup performed by PowerShell 7.
+    if ($isWindowsPlatform) {
+        $mockCmd = "@echo off`r`npwsh -NoProfile -File `"%~dp0mock_herdr.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+        [IO.File]::WriteAllText((Join-Path $mockBin "herdr.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText((Join-Path $mockBin "rtk.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+    }
+    else {
+        $portableMock = "#!/usr/bin/env pwsh`n$mockScript`n"
+        foreach ($commandName in @("herdr", "rtk")) {
+            $commandPath = Join-Path $mockBin $commandName
+            [IO.File]::WriteAllText($commandPath, $portableMock, [Text.UTF8Encoding]::new($false))
+            & chmod +x $commandPath
+            if ($LASTEXITCODE -ne 0) { throw "Unable to mark the naming mock executable: $commandPath" }
+        }
+    }
 
-    $env:PATH = "$mockBin;$oldPath"
+    $pwshDirectory = Split-Path -Parent (Get-Command pwsh -ErrorAction Stop).Source
+    $env:PATH = [string]::Join([IO.Path]::PathSeparator, @($mockBin, $pwshDirectory))
     $env:HERDR_TEST_STATE = $statePath
     $env:HERDR_TEST_CALLS = $callsPath
 

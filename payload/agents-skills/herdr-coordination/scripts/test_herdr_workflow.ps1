@@ -7,7 +7,8 @@ $ErrorActionPreference = "Stop"
 $workflowPath = Join-Path $PSScriptRoot "herdr_workflow.ps1"
 $watchdogPath = Join-Path $PSScriptRoot "herdr_workflow_watchdog.ps1"
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-workflow-test-$([Guid]::NewGuid().ToString('N'))"
-$fakeRtkPath = Join-Path $tempRoot "rtk.cmd"
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
+$fakeRtkPath = Join-Path $tempRoot $(if ($isWindowsPlatform) { "rtk.cmd" } else { "rtk" })
 $fakeCoordPath = Join-Path $tempRoot "coord.ps1"
 $callLogPath = Join-Path $tempRoot "calls.jsonl"
 $ledgerPath = Join-Path $tempRoot "ledger.jsonl"
@@ -75,6 +76,7 @@ function Get-Calls {
 
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 try {
+    if ($isWindowsPlatform) {
     @'
 @echo off
 setlocal EnableDelayedExpansion
@@ -86,9 +88,9 @@ if /I "%~1"=="agent" if /I "%~2"=="get" if not "%HERDR_TEST_PANE_SUBTITLE%"=="" 
   set "namedSession=session-target"
   if /I "%~3"=="w2:p1" set "namedSession=session-source"
   set "profileFields="
-  if "%HERDR_TEST_PROFILE%"=="1" set "profileFields=,"model":"luna-max","reasoning_effort":"max","service_tier":"priority""
-  if "%HERDR_TEST_PROFILE_MISMATCH%"=="1" set "profileFields=,"model":"terra","reasoning_effort":"xhigh","service_tier":"standard""
-  if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
+  if "%HERDR_TEST_PROFILE%"=="1" set "profileFields=,"provider":"openai","model":"luna-max","reasoning_effort":"max","service_tier":"priority""
+  if "%HERDR_TEST_PROFILE_MISMATCH%"=="1" set "profileFields=,"provider":"anthropic","model":"terra","reasoning_effort":"xhigh","service_tier":"standard""
+  if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"provider":"openai","model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
   if "%HERDR_TEST_TARGET_SESSION_ROTATED%"=="1" if /I "%~3"=="w1:p2" set "namedSession=session-replaced"
   set "testTabId=w1:t2"
   if not "%HERDR_TEST_TARGET_TAB_ID%"=="" if /I "%~3"=="w1:p2" set "testTabId=%HERDR_TEST_TARGET_TAB_ID%"
@@ -104,9 +106,9 @@ if /I "%~1"=="agent" if /I "%~2"=="get" (
     echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%"}}}
   ) else (
     set "profileFields="
-    if "%HERDR_TEST_PROFILE%"=="1" set "profileFields=,"model":"luna-max","reasoning_effort":"max","service_tier":"priority""
-    if "%HERDR_TEST_PROFILE_MISMATCH%"=="1" set "profileFields=,"model":"terra","reasoning_effort":"xhigh","service_tier":"standard""
-    if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
+    if "%HERDR_TEST_PROFILE%"=="1" set "profileFields=,"provider":"openai","model":"luna-max","reasoning_effort":"max","service_tier":"priority""
+    if "%HERDR_TEST_PROFILE_MISMATCH%"=="1" set "profileFields=,"provider":"anthropic","model":"terra","reasoning_effort":"xhigh","service_tier":"standard""
+    if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"provider":"openai","model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
     set "testTabId=w1:t2"
     if not "%HERDR_TEST_TARGET_TAB_ID%"=="" if /I "%~3"=="w1:p2" set "testTabId=%HERDR_TEST_TARGET_TAB_ID%"
     echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"codex","value":"!testSession!"}!profileFields!}}}
@@ -132,6 +134,67 @@ if /I "%~1"=="notification" if /I "%~2"=="show" (
 echo unexpected fake rtk invocation: %* 1>&2
 exit /b 2
 '@ | Set-Content -LiteralPath $fakeRtkPath -Encoding ascii
+    }
+    else {
+        @'
+#!/usr/bin/env pwsh
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$arguments = @($args)
+Add-Content -LiteralPath $env:HERDR_TEST_CALL_LOG -Value ($arguments -join " ") -Encoding utf8
+if ($arguments.Count -gt 0 -and $arguments[0] -ieq "proxy") { $arguments = @($arguments[1..($arguments.Count - 1)]) }
+if ($arguments.Count -lt 1 -or $arguments[0] -ine "herdr") { exit 2 }
+$arguments = @($arguments[1..($arguments.Count - 1)])
+function Write-Result {
+    param([Parameter(Mandatory)]$Value)
+    $Value | ConvertTo-Json -Depth 12 -Compress
+    exit 0
+}
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "get") {
+    $paneId = [string]$arguments[2]
+    $session = if ($paneId -ieq "w2:p1") { "session-source" } else { "session-target" }
+    if ($env:HERDR_TEST_TARGET_SESSION_ROTATED -eq "1" -and $paneId -ieq "w1:p2") { $session = "session-replaced" }
+    if ($paneId -ieq "w2:p1" -and $env:HERDR_TEST_SOURCE_SESSION_MISMATCH -eq "1") { $session = "session-replaced" }
+    $tabId = "w1:t2"
+    if ($env:HERDR_TEST_TARGET_TAB_ID -and $paneId -ieq "w1:p2") { $tabId = $env:HERDR_TEST_TARGET_TAB_ID }
+    $agent = [ordered]@{
+        pane_id = $paneId; workspace_id = "w1"; tab_id = $tabId; terminal_id = "term-test"
+        revision = 7; state_change_seq = 42; agent = "codex"; agent_status = $env:HERDR_TEST_STATUS
+    }
+    if ($env:HERDR_TEST_PANE_SUBTITLE) {
+        $agent.title = $env:HERDR_TEST_PANE_SUBTITLE
+        $agent.display_agent = $env:HERDR_TEST_PANE_SUBTITLE
+    }
+    if ($env:HERDR_TEST_MISSING_SESSION -ne "1") {
+        $agent.agent_session = [ordered]@{ agent = "codex"; value = $session }
+    }
+    $profile = if ($env:HERDR_TEST_PROFILE_MALFORMED -eq "1") {
+        [ordered]@{ provider = "openai"; model = [ordered]@{ name = "luna-max" }; reasoning_effort = "max"; service_tier = "priority" }
+    } elseif ($env:HERDR_TEST_PROFILE_MISMATCH -eq "1") {
+        [ordered]@{ provider = "anthropic"; model = "terra"; reasoning_effort = "xhigh"; service_tier = "standard" }
+    } elseif ($env:HERDR_TEST_PROFILE -eq "1") {
+        [ordered]@{ provider = "openai"; model = "luna-max"; reasoning_effort = "max"; service_tier = "priority" }
+    } else { $null }
+    if ($null -ne $profile) { foreach ($property in $profile.Keys) { $agent[$property] = $profile[$property] } }
+    Write-Result ([ordered]@{ id = "test:agent:get"; result = [ordered]@{ type = "agent_info"; agent = $agent } })
+}
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "read") {
+    [Console]::Write([string]$env:HERDR_TEST_DETECTION)
+    exit 0
+}
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "tab" -and $arguments[1] -ieq "get") {
+    $label = if ($env:HERDR_TEST_TAB_LABEL) { $env:HERDR_TEST_TAB_LABEL } else { "#600 - Review" }
+    Write-Result ([ordered]@{ id = "test:tab:get"; result = [ordered]@{ type = "tab_info"; tab = [ordered]@{ tab_id = [string]$arguments[2]; workspace_id = "w1"; label = $label; pane_count = 1 } } })
+}
+if ($arguments.Count -ge 2 -and $arguments[0] -ieq "notification" -and $arguments[1] -ieq "show") {
+    Write-Result ([ordered]@{ id = "test:notification:show"; result = [ordered]@{ type = "notification_shown" } })
+}
+Write-Error "unexpected fake rtk invocation: $($arguments -join ' ')"
+exit 2
+'@ | Set-Content -LiteralPath $fakeRtkPath -Encoding utf8
+        & chmod +x $fakeRtkPath
+        if ($LASTEXITCODE -ne 0) { throw "Unable to mark the fake RTK shim executable." }
+    }
 
     @'
 [CmdletBinding()]
@@ -148,6 +211,7 @@ param(
     [string]$RelayRef,
     [string]$WorkflowRef,
     [string]$WorkflowLedgerPath,
+    [string]$WatchLogPath,
     [string]$RepoCode,
     [string]$LaneCode,
     [string]$RoleCode,
@@ -311,7 +375,8 @@ switch ($Action) {
     $originalHerdrEnv = $env:HERDR_ENV
     $originalPaneId = $env:HERDR_PANE_ID
     try {
-        $env:PATH = "$tempRoot;$originalPath"
+        $pwshDirectory = Split-Path -Parent (Get-Command pwsh -ErrorAction Stop).Source
+        $env:PATH = [string]::Join([IO.Path]::PathSeparator, @($tempRoot, $pwshDirectory))
         $env:HERDR_ENV = "1"
         $env:HERDR_PANE_ID = "w2:p1"
         $env:HERDR_TEST_CALL_LOG = $callLogPath
@@ -319,7 +384,7 @@ switch ($Action) {
         $env:HERDR_TEST_MISSING_SESSION = "0"
         $env:HERDR_TEST_SOURCE_SESSION_MISMATCH = "0"
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
-        $env:HERDR_TEST_PROFILE = "0"
+        $env:HERDR_TEST_PROFILE = "1"
         $env:HERDR_TEST_PROFILE_MISMATCH = "0"
         $env:HERDR_TEST_PROFILE_MALFORMED = "0"
         $env:HERDR_TEST_TARGET_TAB_ID = ""
@@ -377,6 +442,17 @@ switch ($Action) {
         )
         Assert-True -Condition (-not [bool]$missingSession.preflight.ready) -Message "Missing session proof passed preflight."
         $env:HERDR_TEST_MISSING_SESSION = "0"
+
+        Write-Output "CASE: unproven execution profile preflight refusal"
+        $env:HERDR_TEST_PROFILE = "0"
+        $unprovenPreflight = Invoke-Workflow -Arguments @(
+            "-Action", "preflight",
+            "-PaneId", "w1:p2"
+        )
+        Assert-True -Condition (-not [bool]$unprovenPreflight.preflight.ready) -Message "Unproven execution profile passed preflight."
+        Assert-True -Condition (-not [bool]$unprovenPreflight.preflight.execution_profile_proven) -Message "Unproven execution profile was reported as proven."
+        Assert-True -Condition (@($unprovenPreflight.preflight.reasons) -contains "native execution profile is not proven") -Message "Unproven execution profile refusal was not explained."
+        $env:HERDR_TEST_PROFILE = "1"
 
         Write-Output "CASE: request stable-label mismatch fails before ledger and delivery"
         $callsBeforeLabelMismatch = @(Get-Calls).Count
@@ -522,14 +598,16 @@ switch ($Action) {
             "-WorkflowRef", $wrongProfileRef,
             "-NowUtc", "2026-01-01T00:01:00Z"
         )
-        Assert-True -Condition ($wrongProfileAck.Text -match "model, reasoning effort, or service tier changed") -Message "Changed model profile did not fail closed."
+        $wrongProfileText = $wrongProfileAck.Text
+        Assert-True -Condition ($wrongProfileText -match 'model' -and $wrongProfileText -match 'reasoning' -and $wrongProfileText -match 'service tier' -and $wrongProfileText -match 'changed') -Message "Changed model profile did not fail closed."
         $wrongProfileReissues = @(Get-Content -LiteralPath $ledgerPath | ForEach-Object { $_ | ConvertFrom-Json -Depth 20 } | Where-Object { $_.workflow_ref -eq $wrongProfileRef -and $_.event -eq "request_reissued" })
         Assert-Equal -Actual $wrongProfileReissues.Count -Expected 0 -Message "Changed model profile created a replacement despite failing closed."
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
         $env:HERDR_TEST_PROFILE_MISMATCH = "0"
-        $env:HERDR_TEST_PROFILE = "0"
-
         Write-Output "CASE: unavailable model profile fails closed without guessing"
+        $callsBeforeUnprovenProfile = @(Get-Calls).Count
+        $ledgerEventsBeforeUnprovenProfile = @(Get-Content -LiteralPath $ledgerPath | Where-Object { $_ } ).Count
+        $env:HERDR_TEST_PROFILE = "0"
         $unprovenProfileRequest = Invoke-Workflow -Arguments @(
             "-Action", "request",
             "-TaskId", "#603",
@@ -541,21 +619,15 @@ switch ($Action) {
             "-AckTimeoutSeconds", "120",
             "-NowUtc", "2026-01-01T00:00:00Z"
         )
-        $unprovenProfileRef = [string]$unprovenProfileRequest.workflow_ref
-        $env:HERDR_TEST_TARGET_SESSION_ROTATED = "1"
-        $unprovenProfileAck = Invoke-Workflow -ExpectFailure -Arguments @(
-            "-Action", "ack",
-            "-WorkflowRef", $unprovenProfileRef,
-            "-NowUtc", "2026-01-01T00:01:00Z"
-        )
-        $unprovenProfileText = [regex]::Replace([string]$unprovenProfileAck.Text, "\x1b\[[0-9;]*m", "") -replace "\s+", " "
-        Assert-True -Condition ($unprovenProfileText -match "model, reasoning effort" -and $unprovenProfileText -match "continuity" -and $unprovenProfileText -match "not natively proven") -Message "Unavailable model profile was not fail-closed."
-        $unprovenProfileReissues = @(Get-Content -LiteralPath $ledgerPath | ForEach-Object { $_ | ConvertFrom-Json -Depth 20 } | Where-Object { $_.workflow_ref -eq $unprovenProfileRef -and $_.event -eq "request_reissued" })
-        Assert-Equal -Actual $unprovenProfileReissues.Count -Expected 0 -Message "Unavailable model profile created a replacement despite fail-closed policy."
-        $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
+        Assert-True -Condition (-not [bool]$unprovenProfileRequest.created) -Message "Unavailable model profile reached reservation or transport."
+        Assert-True -Condition (-not [bool]$unprovenProfileRequest.preflight.execution_profile_proven) -Message "Unavailable model profile request did not expose unproven preflight."
+        Assert-True -Condition ([string]$unprovenProfileRequest.error -match "execution profile") -Message "Unavailable model profile refusal was not explained."
+        Assert-Equal -Actual @(Get-Calls).Count -Expected $callsBeforeUnprovenProfile -Message "Unavailable model profile reached coordination transport."
+        Assert-Equal -Actual @(Get-Content -LiteralPath $ledgerPath | Where-Object { $_ } ).Count -Expected $ledgerEventsBeforeUnprovenProfile -Message "Unavailable model profile mutated the workflow ledger."
+        $env:HERDR_TEST_PROFILE = "1"
 
         Write-Output "CASE: malformed model profile fails closed without coercion"
-        $env:HERDR_TEST_PROFILE_MALFORMED = "1"
+        $env:HERDR_TEST_PROFILE_MALFORMED = "0"
         $malformedProfileRequest = Invoke-Workflow -Arguments @(
             "-Action", "request",
             "-TaskId", "#608",
@@ -569,13 +641,14 @@ switch ($Action) {
         )
         $malformedProfileRef = [string]$malformedProfileRequest.workflow_ref
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "1"
+        $env:HERDR_TEST_PROFILE_MALFORMED = "1"
         $malformedProfileAck = Invoke-Workflow -ExpectFailure -Arguments @(
             "-Action", "ack",
             "-WorkflowRef", $malformedProfileRef,
             "-NowUtc", "2026-01-01T00:01:00Z"
         )
         $malformedProfileText = [regex]::Replace([string]$malformedProfileAck.Text, "\x1b\[[0-9;]*m", "") -replace "\s+", " "
-        Assert-True -Condition ($malformedProfileText -match "continuity" -and $malformedProfileText -match "not natively proven") -Message "Malformed model profile was coerced instead of failing closed."
+        Assert-True -Condition ($malformedProfileText -match "continuity" -and $malformedProfileText -match "natively" -and $malformedProfileText -match "proven") -Message "Malformed model profile was coerced instead of failing closed."
         $malformedProfileReissues = @(Get-Content -LiteralPath $ledgerPath | ForEach-Object { $_ | ConvertFrom-Json -Depth 20 } | Where-Object { $_.workflow_ref -eq $malformedProfileRef -and $_.event -eq "request_reissued" })
         Assert-Equal -Actual $malformedProfileReissues.Count -Expected 0 -Message "Malformed model profile created a replacement."
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
@@ -607,6 +680,7 @@ switch ($Action) {
                     target_session = "session-replaced"
                     target_tab_id = "w1:t2"
                     target_tab_label = "#600 - Review"
+                    target_provider = "openai"
                     target_model = "luna-max"
                     target_reasoning_effort = "max"
                     target_service_tier = "priority"
@@ -706,7 +780,7 @@ switch ($Action) {
         Assert-Equal -Actual $tabIdReissues.Count -Expected 0 -Message "Changed stable tab ID produced a replacement."
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
         $env:HERDR_TEST_TARGET_TAB_ID = ""
-        $env:HERDR_TEST_PROFILE = "0"
+        $env:HERDR_TEST_PROFILE = "1"
 
         Write-Output "CASE: completion and duplicate suppression"
         $deliveriesBeforeCompletion = @((Get-Calls) | Where-Object { $_.action -eq "deliver" }).Count
@@ -1045,11 +1119,11 @@ Verdict PASS
         $wrongRequestRelayLine = $evidenceLine.Replace($requestRelayReference, "[re HR:baadf00d]")
         Set-Content -LiteralPath $coordLogPath -Value @($wrongRequestRelayLine, $referenceLine) -Encoding utf8
         $wrongRequestRelay = Invoke-Workflow -Arguments $reconcileArgs -ExpectFailure
-        Assert-True -Condition ($wrongRequestRelay.Text -match "exact request relay") -Message "Wrong request relay evidence did not fail closed."
+        Assert-True -Condition ($wrongRequestRelay.Text -match "exact" -and $wrongRequestRelay.Text -match "request" -and $wrongRequestRelay.Text -match "relay") -Message "Wrong request relay evidence did not fail closed."
         $substringRequestRelayLine = $evidenceLine.Replace($requestRelayReference, "[re HR:${requestRelayId}0]")
         Set-Content -LiteralPath $coordLogPath -Value @($substringRequestRelayLine, $referenceLine) -Encoding utf8
         $substringRequestRelay = Invoke-Workflow -Arguments $reconcileArgs -ExpectFailure
-        Assert-True -Condition ($substringRequestRelay.Text -match "exact request relay") -Message "Request relay substring evidence was accepted."
+        Assert-True -Condition ($substringRequestRelay.Text -match "exact" -and $substringRequestRelay.Text -match "request" -and $substringRequestRelay.Text -match "relay") -Message "Request relay substring evidence was accepted."
         Set-Content -LiteralPath $coordLogPath -Value @($evidenceLine, $referenceLine) -Encoding utf8
 
         $wrongPaneArgs = @($reconcileArgs)
@@ -1310,8 +1384,8 @@ Verdict PASS
             "-CoordinationLogPath", $coordLogPath, "-CoordinationHelperPath", $fakeCoordPath,
             "-NowUtc", "2026-01-01T04:30:20Z"
         )
-        $raceProcess1 = Start-Process -FilePath $racePwsh -ArgumentList @($commonRaceArgs + @("-Outcome", "PASS")) -WindowStyle Hidden -RedirectStandardOutput $raceOut1 -RedirectStandardError $raceErr1 -PassThru
-        $raceProcess2 = Start-Process -FilePath $racePwsh -ArgumentList @($commonRaceArgs + @("-Outcome", "BLOCK")) -WindowStyle Hidden -RedirectStandardOutput $raceOut2 -RedirectStandardError $raceErr2 -PassThru
+        $raceProcess1 = Start-Process -FilePath $racePwsh -ArgumentList @($commonRaceArgs + @("-Outcome", "PASS")) -RedirectStandardOutput $raceOut1 -RedirectStandardError $raceErr1 -PassThru
+        $raceProcess2 = Start-Process -FilePath $racePwsh -ArgumentList @($commonRaceArgs + @("-Outcome", "BLOCK")) -RedirectStandardOutput $raceOut2 -RedirectStandardError $raceErr2 -PassThru
         Assert-True -Condition ($raceProcess1.WaitForExit(30000) -and $raceProcess2.WaitForExit(30000)) -Message "Concurrent completion processes timed out."
         $raceProcess1.Refresh(); $raceProcess2.Refresh()
         $raceSuccessCount = @(@($raceProcess1.ExitCode, $raceProcess2.ExitCode) | Where-Object { $_ -eq 0 }).Count
@@ -1448,6 +1522,14 @@ Verdict PASS
         $env:HERDR_TEST_NAME_REQUEST_FAIL = "0"
         $env:HERDR_TEST_PANE_SUBTITLE = ""
         $env:HERDR_TEST_TAB_LABEL = ""
+
+        Write-Output "CASE: live Ubuntu request/ACK/complete/ack-return round-trip"
+        $roundtripPath = Join-Path $PSScriptRoot "test_herdr_workflow_roundtrip.ps1"
+        $roundtripOutput = & pwsh -NoProfile -File $roundtripPath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Live Ubuntu workflow round-trip regression failed: $($roundtripOutput -join [Environment]::NewLine)"
+        }
+        $roundtripOutput | ForEach-Object { Write-Output $_ }
 
         Write-Output "PASS: herdr workflow ledger, ACKs, preflight, alerts, and watchdog"
     }

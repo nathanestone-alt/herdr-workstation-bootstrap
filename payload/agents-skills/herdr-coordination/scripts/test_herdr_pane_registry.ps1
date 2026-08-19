@@ -205,7 +205,7 @@ try {
 Import-Module '$modulePath' -Force
 Add-HerdrPaneRegistryEvent -RegistryPath '$($race.Registry)' -ReceiptPath '$($race.Receipts)' -Fields ([ordered]@{ action='metadata-update'; reason='concurrent-$i' }) | Out-Null
 "@
-        Start-Process pwsh -ArgumentList @("-NoProfile", "-Command", $command) -PassThru -WindowStyle Hidden
+        Start-Process pwsh -ArgumentList @("-NoProfile", "-Command", $command) -PassThru
     }
     $commands | Wait-Process
     foreach ($process in $commands) {

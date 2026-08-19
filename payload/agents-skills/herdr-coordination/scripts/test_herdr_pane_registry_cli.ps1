@@ -8,6 +8,7 @@ $registryScript = Join-Path $PSScriptRoot "herdr_pane_registry.ps1"
 $coordinationScript = Join-Path $PSScriptRoot "herdr_coordination.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-pane-registry-cli-$([Guid]::NewGuid().ToString('N'))"
 $mockBin = Join-Path $testRoot "bin"
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
 $null = New-Item -ItemType Directory -Path $mockBin -Force
 $registryPath = Join-Path $testRoot "registry.jsonl"
 $statePath = Join-Path $testRoot "mock-state.json"
@@ -90,6 +91,9 @@ $ErrorActionPreference = "Stop"
 $statePath = $env:HERDR_TEST_STATE
 $state = Get-Content -Raw $statePath | ConvertFrom-Json -Depth 16
 $arguments = @($args)
+while ($arguments.Count -gt 0 -and @("proxy", "herdr") -contains $arguments[0]) {
+    $arguments = @($arguments[1..($arguments.Count - 1)])
+}
 
 function Save-State {
     [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 16), [Text.UTF8Encoding]::new($false))
@@ -178,10 +182,23 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
 '@
     $mockScriptPath = Join-Path $mockBin "mock_herdr.ps1"
     [IO.File]::WriteAllText($mockScriptPath, $mockScript, [Text.UTF8Encoding]::new($false))
-    $mockCmd = "@echo off`r`npwsh -NoProfile -File `"%~dp0mock_herdr.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
-    [IO.File]::WriteAllText((Join-Path $mockBin "herdr.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+    if ($isWindowsPlatform) {
+        $mockCmd = "@echo off`r`npwsh -NoProfile -File `"%~dp0mock_herdr.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+        [IO.File]::WriteAllText((Join-Path $mockBin "herdr.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText((Join-Path $mockBin "rtk.cmd"), $mockCmd, [Text.ASCIIEncoding]::new())
+    }
+    else {
+        $portableMock = "#!/usr/bin/env pwsh`n$mockScript`n"
+        foreach ($commandName in @("herdr", "rtk")) {
+            $commandPath = Join-Path $mockBin $commandName
+            [IO.File]::WriteAllText($commandPath, $portableMock, [Text.UTF8Encoding]::new($false))
+            & chmod +x $commandPath
+            if ($LASTEXITCODE -ne 0) { throw "Unable to mark the pane-registry mock executable: $commandPath" }
+        }
+    }
 
-    $env:PATH = "$mockBin;$oldPath"
+    $pwshDirectory = Split-Path -Parent (Get-Command pwsh -ErrorAction Stop).Source
+    $env:PATH = [string]::Join([IO.Path]::PathSeparator, @($mockBin, $pwshDirectory))
     $env:HERDR_TEST_STATE = $statePath
     $env:HERDR_TEST_AGENT_PID = [string]$PID
 

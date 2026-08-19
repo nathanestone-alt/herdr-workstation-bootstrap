@@ -78,6 +78,18 @@ printf 'herdr %s\\n' '$herdr_version'
 EOF
   cat > "$home/.local/bin/pwsh" <<EOF
 #!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == '-NoProfile' && "\${2:-}" == '-File' ]]; then
+  manifest_path="\${3:-}"
+  if [[ -n "\${HERDR_TEST_PWSH_FILE_LOG:-}" ]]; then
+    printf '%s\n' "\$*" >> "\$HERDR_TEST_PWSH_FILE_LOG"
+  fi
+  if [[ "\${HERDR_TEST_PWSH_FILE_RESULT:-pass}" == 'fail' ]]; then
+    printf 'fixture manifest failure: %s\n' "\$manifest_path" >&2
+    exit 17
+  fi
+  exit 0
+fi
 printf '%s\\n' '$powershell_version'
 EOF
   cat > "$home/.local/bin/dpkg-query" <<'EOF'
@@ -128,6 +140,28 @@ make_fixture() {
   git -C "$fixture_root" config user.email 'issue-961@example.invalid'
   git -C "$fixture_root" add -A
   git -C "$fixture_root" commit -qm 'fixture source'
+}
+
+make_herdr_fixture() {
+  local relative_path
+  local file_hash
+  make_fixture
+  cp -a "$repo_root/payload/agents-skills/herdr-coordination" "$fixture_root/payload/agents-skills/"
+  {
+    printf '%s\n' '# Issue #961 fixture manifest with the canonical herdr-coordination payload.'
+    while IFS= read -r relative_path; do
+      relative_path="agents-skills/$relative_path"
+      file_hash="$(sha256sum "$fixture_root/payload/$relative_path" | awk '{print $1}')"
+      printf '%s  %s\n' "$file_hash" "$relative_path"
+    done < <(find "$fixture_root/payload/agents-skills" -type f -printf '%P\n' | LC_ALL=C sort)
+    while IFS= read -r relative_path; do
+      relative_path="claude-skills/$relative_path"
+      file_hash="$(sha256sum "$fixture_root/payload/$relative_path" | awk '{print $1}')"
+      printf '%s  %s\n' "$file_hash" "$relative_path"
+    done < <(find "$fixture_root/payload/claude-skills" -type f -printf '%P\n' | LC_ALL=C sort)
+  } > "$fixture_root/config/payload-manifest.sha256"
+  git -C "$fixture_root" add -A
+  git -C "$fixture_root" commit -qm 'canonical herdr payload fixture'
 }
 
 new_home() {
@@ -246,6 +280,97 @@ expect_receipt_blocked() {
   expect_blocked "$case_name" "$home" "$expected_text" "$path_prefix"
   assert_sentinels "$home"
   assert_no_transaction_residue "$home"
+}
+
+assert_payload_manifest_parity() {
+  local expected_paths="$test_root/payload-manifest.expected.paths"
+  local actual_paths="$test_root/payload-manifest.actual.paths"
+  local file_hash
+  local relative_path
+  local actual_hash
+  {
+    find "$repo_root/payload/agents-skills" -type f -printf 'agents-skills/%P\n'
+    find "$repo_root/payload/claude-skills" -type f -printf 'claude-skills/%P\n'
+  } | LC_ALL=C sort > "$expected_paths"
+  awk 'NF == 2 && $1 !~ /^#/ { print $2 }' "$repo_root/config/payload-manifest.sha256" |
+    LC_ALL=C sort > "$actual_paths"
+  cmp -s "$expected_paths" "$actual_paths" || {
+    echo 'Payload manifest paths do not exactly match the installable payload.' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    exit 1
+  }
+  while read -r file_hash relative_path; do
+    actual_hash="$(sha256sum "$repo_root/payload/$relative_path" | awk '{print $1}')"
+    [[ "$actual_hash" == "$file_hash" ]] || {
+      echo "Payload manifest hash mismatch: $relative_path" >&2
+      exit 1
+    }
+  done < <(awk 'NF == 2 && $1 !~ /^#/ { print $1, $2 }' "$repo_root/config/payload-manifest.sha256")
+}
+
+run_portability_regression_cases() {
+  local portability_root="$test_root/herdr-portability"
+  local scripts_root="$portability_root/scripts"
+  local pass_output="$test_root/herdr-portability-pass.out"
+  local failure_output="$test_root/herdr-portability-mutation.out"
+  local status
+  command -v pwsh >/dev/null 2>&1 || {
+    echo 'pwsh is required for the Herdr portability regression cases.' >&2
+    exit 1
+  }
+  mkdir -p "$portability_root"
+  cp -a "$repo_root/payload/agents-skills/herdr-coordination/scripts" "$portability_root/"
+  grep -Fq '@echo off' "$scripts_root/test_herdr_workflow.ps1"
+  grep -Fq '$isWindowsPlatform' "$scripts_root/test_herdr_workflow.ps1"
+  pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$pass_output" 2>&1 || {
+    cat "$pass_output" >&2
+    echo 'Canonical Ubuntu portability payload unexpectedly failed.' >&2
+    exit 1
+  }
+  grep -Fq 'PASS: Ubuntu portability scan' "$pass_output"
+  printf '%s\n' "Write-Output 'C:\\deliberately-nonportable'" >> "$scripts_root/herdr_workflow.ps1"
+  set +e
+  pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$failure_output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || {
+    cat "$failure_output" >&2
+    echo 'Nonportable production-script mutation unexpectedly passed.' >&2
+    exit 1
+  }
+  grep -Fq 'contains a drive-rooted Windows path in production code' "$failure_output"
+}
+
+run_herdr_manifest_gate_case() {
+  local case_name="$1"
+  local result="$2"
+  local home
+  local output="$test_root/$case_name.out"
+  local invocation_log="$test_root/$case_name.pwsh.log"
+  local status
+  make_herdr_fixture
+  home="$(new_home "$case_name")"
+  if [[ "$result" == 'fail' ]]; then
+    make_sentinels "$home"
+  fi
+  set +e
+  HERDR_TEST_PWSH_FILE_RESULT="$result" \
+  HERDR_TEST_PWSH_FILE_LOG="$invocation_log" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  if [[ "$result" == 'pass' ]]; then
+    [[ "$status" == 0 ]] || { cat "$output" >&2; exit 1; }
+    grep -Fqx -- "-NoProfile -File $fixture_root/payload/agents-skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1" "$invocation_log"
+    [[ -f "$home/.agents/skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1" ]] || exit 1
+  else
+    [[ "$status" == 30 ]] || { cat "$output" >&2; exit 1; }
+    grep -Fq 'BLOCKED: herdr-coordination Ubuntu portability manifest failed' "$output"
+    grep -Fq 'fixture manifest failure' "$output"
+    assert_sentinels "$home"
+    assert_no_transaction_residue "$home"
+  fi
 }
 
 make_restore_mv_shim() {
@@ -406,6 +531,14 @@ run_payload_committed_signal_case() {
   [[ "$residue_count" -le 2 ]] || { echo "$case_name left unbounded residue." >&2; exit 1; }
 }
 
+# The bundled canonical payload passes its native scan, a production mutation
+# is rejected, guarded Windows fixtures remain allowed, and the hash manifest
+# remains an exact authority for the installable payload.
+assert_payload_manifest_parity
+run_portability_regression_cases
+run_herdr_manifest_gate_case herdr-manifest-pass pass
+run_herdr_manifest_gate_case herdr-manifest-fail fail
+
 # Signals before the durable commit restore the complete old transaction.
 run_payload_signal_case signal-before-commit before-commit
 run_payload_signal_case signal-after-agents-commit after-agents-commit
@@ -485,7 +618,7 @@ grep -Fqx 'installed_payload_file_count=2' "$receipt"
 grep -Fqx 'tool.uv=uv 0.12.5 (x86_64-unknown-linux-gnu)' "$receipt"
 grep -Fqx 'tool.python3.13=Python 3.13.15' "$receipt"
 grep -Fqx 'tool.py-3.13=Python 3.13.15' "$receipt"
-grep -Fqx 'regression_test_count=10' "$receipt"
+grep -Fqx 'regression_test_count=13' "$receipt"
 grep -Fq 'source_payload_sha256.agents-skills/demo/SKILL.md=' "$receipt"
 grep -Fq 'installed_payload_sha256.claude-skills/demo/SKILL.md=' "$receipt"
 ! grep -Eiq 'timestamp|hostname|LOCAL-COMMISSIONING-LOG' "$receipt"

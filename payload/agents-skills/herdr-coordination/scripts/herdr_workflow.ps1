@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("preflight", "request", "ack", "complete", "ack-return", "reconcile-return-read", "reconcile-completion", "status", "scan")]
+    [ValidateSet("preflight", "report-profile", "request", "ack", "complete", "ack-return", "reconcile-return-read", "reconcile-completion", "status", "scan")]
     [string]$Action,
 
     [string]$TaskId,
@@ -13,6 +13,10 @@ param(
     [string]$ArtifactSha256,
     [string]$WorkflowRef,
     [string]$Outcome,
+    [string]$Provider,
+    [string]$Model,
+    [string]$ReasoningEffort,
+    [string]$ServiceTier,
     [string]$EvidenceRelayRef,
     [string]$EvidenceAckRef,
     [string]$ExpectedSourceSession,
@@ -264,6 +268,10 @@ function Invoke-HerdrJson {
 function Invoke-CoordinationHelper {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
+    $effectiveArguments = @($Arguments)
+    if ($effectiveArguments -notcontains "-WatchLogPath") {
+        $effectiveArguments += @("-WatchLogPath", $WatchLogPath)
+    }
     $pwsh = Get-Command pwsh -CommandType Application -ErrorAction Stop |
         Select-Object -First 1
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -275,7 +283,7 @@ function Invoke-CoordinationHelper {
     $utf8 = [Text.UTF8Encoding]::new($false)
     $startInfo.StandardOutputEncoding = $utf8
     $startInfo.StandardErrorEncoding = $utf8
-    foreach ($argument in @("-NoProfile", "-File", $CoordinationHelperPath) + $Arguments) {
+    foreach ($argument in @("-NoProfile", "-File", $CoordinationHelperPath) + $effectiveArguments) {
         [void]$startInfo.ArgumentList.Add([string]$argument)
     }
 
@@ -712,6 +720,14 @@ function Get-Preflight {
         }
     }
 
+    $executionProfile = Get-WorkflowExecutionProfile `
+        -TargetPaneId $TargetPaneId `
+        -Agent $agent `
+        -SessionId $sessionId
+    if (-not [bool]$executionProfile.execution_profile_proven) {
+        $reasons.Add("native execution profile is not proven")
+    }
+
     return [pscustomobject]@{
         ready = $reasons.Count -eq 0
         pane_id = $TargetPaneId
@@ -721,12 +737,12 @@ function Get-Preflight {
         status = $status
         session_id = $sessionId
         session_agent = $sessionKind
-        model = Get-OptionalProfileString -Object $agent -Name "model"
-        reasoning_effort = Get-OptionalProfileString -Object $agent -Name "reasoning_effort"
-        service_tier = Get-OptionalProfileString -Object $agent -Name "service_tier"
-        execution_profile_proven = $null -ne (Get-OptionalProfileString -Object $agent -Name "model") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "reasoning_effort") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "service_tier")
+        provider = $executionProfile.provider
+        model = $executionProfile.model
+        reasoning_effort = $executionProfile.reasoning_effort
+        service_tier = $executionProfile.service_tier
+        execution_profile_source = $executionProfile.source
+        execution_profile_proven = [bool]$executionProfile.execution_profile_proven
         working_queue = $status -eq "working"
         detection_scope = if ($interactiveRegion.prompt_marker_found) {
             "after_final_prompt_marker"
@@ -818,6 +834,7 @@ function Get-TaskViews {
                     error = $null
                     ack_deadline_utc = [string]$requestReissue.ack_deadline_utc
                     superseded_relay_ref = [string]$requestReissue.superseded_relay_ref
+                    target_provider = [string]$requestReissue.target_provider
                     target_model = [string]$requestReissue.target_model
                     target_reasoning_effort = [string]$requestReissue.target_reasoning_effort
                     target_service_tier = [string]$requestReissue.target_service_tier
@@ -865,6 +882,7 @@ function Get-TaskViews {
             target_tab_label = Get-OptionalPropertyString -Object $reserved -Name "target_tab_label"
             target_tab_id = Get-OptionalPropertyString -Object $reserved -Name "target_tab_id"
             target_agent = Get-OptionalPropertyString -Object $reserved -Name "target_agent"
+            target_provider = Get-OptionalProfileString -Object $reserved -Name "target_provider"
             target_model = Get-OptionalProfileString -Object $reserved -Name "target_model"
             target_reasoning_effort = Get-OptionalProfileString -Object $reserved -Name "target_reasoning_effort"
             target_service_tier = Get-OptionalProfileString -Object $reserved -Name "target_service_tier"
@@ -884,6 +902,14 @@ function Get-TaskViews {
         })
     }
     return @($views)
+}
+
+function Get-WorkflowViews {
+    $events = @(Get-LedgerEvents)
+    if ($events.Count -eq 0) {
+        return @()
+    }
+    return @(Get-TaskViews -Events $events)
 }
 
 function Get-WorkflowByRef {
@@ -926,6 +952,10 @@ function Get-WorkflowTargetProof {
         $sessionKind -ne $agentKind) {
         throw "Workflow target pane $TargetPaneId lacks matching native agent-session proof."
     }
+    $executionProfile = Get-WorkflowExecutionProfile `
+        -TargetPaneId $TargetPaneId `
+        -Agent $agent `
+        -SessionId $session
     return [pscustomobject]@{
         pane_id = $TargetPaneId
         agent = $agentKind
@@ -936,12 +966,12 @@ function Get-WorkflowTargetProof {
         revision = [long]$agent.revision
         state_change_seq = [long]$agent.state_change_seq
         status = [string]$agent.agent_status
-        model = Get-OptionalProfileString -Object $agent -Name "model"
-        reasoning_effort = Get-OptionalProfileString -Object $agent -Name "reasoning_effort"
-        service_tier = Get-OptionalProfileString -Object $agent -Name "service_tier"
-        execution_profile_proven = $null -ne (Get-OptionalProfileString -Object $agent -Name "model") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "reasoning_effort") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "service_tier")
+        provider = $executionProfile.provider
+        model = $executionProfile.model
+        reasoning_effort = $executionProfile.reasoning_effort
+        service_tier = $executionProfile.service_tier
+        execution_profile_source = $executionProfile.source
+        execution_profile_proven = [bool]$executionProfile.execution_profile_proven
     }
 }
 
@@ -1045,21 +1075,24 @@ function Reserve-WorkflowRequestReissue {
             [string]::IsNullOrWhiteSpace($message)) {
             throw "Workflow $($Workflow.workflow_ref) lacks rotation-safe target tab, relay, or message provenance; reissue is refused."
         }
+        $expectedProvider = Get-OptionalPropertyString -Object $Workflow -Name "target_provider"
         $expectedModel = Get-OptionalPropertyString -Object $Workflow -Name "target_model"
         $expectedEffort = Get-OptionalPropertyString -Object $Workflow -Name "target_reasoning_effort"
         $expectedTier = Get-OptionalPropertyString -Object $Workflow -Name "target_service_tier"
         $profileProven = (Get-OptionalPropertyString -Object $Workflow -Name "target_execution_profile_proven") -eq "True"
         if (-not $profileProven -or
+            [string]::IsNullOrWhiteSpace($expectedProvider) -or
             [string]::IsNullOrWhiteSpace($expectedModel) -or
             [string]::IsNullOrWhiteSpace($expectedEffort) -or
             [string]::IsNullOrWhiteSpace($expectedTier) -or
             -not [bool]$LiveProof.execution_profile_proven) {
-            throw "Workflow $($Workflow.workflow_ref) cannot safely rebind a rotated session because model, reasoning effort, and service tier continuity are not natively proven; restore the user-selected profile and retry."
+            throw "Workflow $($Workflow.workflow_ref) cannot safely rebind a rotated session because provider, model, reasoning effort, and service tier continuity are not natively proven; restore the user-selected profile and retry."
         }
-        if ([string]$LiveProof.model -cne $expectedModel -or
+        if ([string]$LiveProof.provider -cne $expectedProvider -or
+            [string]$LiveProof.model -cne $expectedModel -or
             [string]$LiveProof.reasoning_effort -cne $expectedEffort -or
             [string]$LiveProof.service_tier -cne $expectedTier) {
-            throw "Workflow $($Workflow.workflow_ref) target model, reasoning effort, or service tier changed during session rotation; user action is required and no replacement was sent."
+            throw "Workflow $($Workflow.workflow_ref) target provider, model, reasoning effort, or service tier changed during session rotation; user action is required and no replacement was sent."
         }
         if ([string]$LiveProof.agent -ne [string]$current.target_agent -or
             [string]$LiveProof.tab_id -ne $targetTabId -or
@@ -1089,6 +1122,7 @@ function Reserve-WorkflowRequestReissue {
             target_session = [string]$LiveProof.session_id
             target_tab_id = [string]$LiveProof.tab_id
             target_tab_label = [string]$LiveProof.tab_label
+            target_provider = $expectedProvider
             target_model = $expectedModel
             target_reasoning_effort = $expectedEffort
             target_service_tier = $expectedTier
@@ -1142,6 +1176,7 @@ function Complete-WorkflowRequestReissue {
             target_session = [string]$Reservation.target_session
             target_tab_id = [string]$Reservation.target_tab_id
             target_tab_label = [string]$Reservation.target_tab_label
+            target_provider = [string]$Reservation.target_provider
             target_model = [string]$Reservation.target_model
             target_reasoning_effort = [string]$Reservation.target_reasoning_effort
             target_service_tier = [string]$Reservation.target_service_tier
@@ -1293,6 +1328,132 @@ function Get-OptionalProfileString {
         return $null
     }
     return $value
+}
+
+function Get-WorkflowTokenString {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $containers = [Collections.Generic.List[object]]::new()
+    $containers.Add($Object)
+    foreach ($containerPropertyName in @("tokens", "metadata")) {
+        $containerProperty = $Object.PSObject.Properties[$containerPropertyName]
+        if ($containerProperty -and $null -ne $containerProperty.Value) {
+            $containers.Add($containerProperty.Value)
+            $nestedTokens = $containerProperty.Value.PSObject.Properties["tokens"]
+            if ($nestedTokens -and $null -ne $nestedTokens.Value) {
+                $containers.Add($nestedTokens.Value)
+            }
+        }
+    }
+
+    foreach ($container in $containers) {
+        if ($container -is [Collections.IDictionary] -and $container.Contains($Name)) {
+            $value = $container[$Name]
+            if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+                return ([string]$value).Trim()
+            }
+        }
+        $property = $container.PSObject.Properties[$Name]
+        if ($property -and $property.Value -is [string] -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim()
+        }
+    }
+    return $null
+}
+
+function Get-WorkflowExecutionProfile {
+    param(
+        [Parameter(Mandatory)][string]$TargetPaneId,
+        [Parameter(Mandatory)]$Agent,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId
+    )
+
+    $directValues = [ordered]@{
+        provider = Get-OptionalProfileString -Object $Agent -Name "provider"
+        model = Get-OptionalProfileString -Object $Agent -Name "model"
+        reasoning_effort = Get-OptionalProfileString -Object $Agent -Name "reasoning_effort"
+        service_tier = Get-OptionalProfileString -Object $Agent -Name "service_tier"
+    }
+    $directInvalid = $false
+    foreach ($name in @("provider", "model", "reasoning_effort", "service_tier")) {
+        $property = $Agent.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value -and $property.Value -isnot [string]) {
+            $directInvalid = $true
+        }
+    }
+    $directMissing = @($directValues.Values | Where-Object { [string]::IsNullOrWhiteSpace([string]$_) }).Count
+    $directComplete = $directMissing -eq 0
+
+    $pane = $null
+    if (-not $directComplete -or $directInvalid) {
+        try {
+            $paneResponse = Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)
+            if ($paneResponse -and $paneResponse.PSObject.Properties["result"] -and
+                $paneResponse.result -and $paneResponse.result.PSObject.Properties["pane"]) {
+                $pane = $paneResponse.result.pane
+            }
+        }
+        catch {
+            # Older Herdr runtimes may not expose pane metadata. Direct native
+            # agent fields remain usable; missing metadata is otherwise fail-closed.
+            $pane = $null
+        }
+    }
+
+    $reportedValues = [ordered]@{
+        provider = Get-WorkflowTokenString -Object $pane -Name "execution_provider"
+        model = Get-WorkflowTokenString -Object $pane -Name "execution_model"
+        reasoning_effort = Get-WorkflowTokenString -Object $pane -Name "execution_reasoning_effort"
+        service_tier = Get-WorkflowTokenString -Object $pane -Name "execution_service_tier"
+    }
+    $reportedSession = Get-WorkflowTokenString -Object $pane -Name "execution_profile_session"
+    $reportedAgent = Get-WorkflowTokenString -Object $pane -Name "execution_profile_agent"
+    $reportedSource = Get-WorkflowTokenString -Object $pane -Name "execution_profile_source"
+
+    $values = [ordered]@{}
+    $conflict = $false
+    foreach ($name in @("provider", "model", "reasoning_effort", "service_tier")) {
+        $directValue = [string]$directValues[$name]
+        $reportedValue = [string]$reportedValues[$name]
+        if (-not [string]::IsNullOrWhiteSpace($directValue) -and
+            -not [string]::IsNullOrWhiteSpace($reportedValue) -and
+            $directValue -cne $reportedValue) {
+            $conflict = $true
+        }
+        $values[$name] = if (-not [string]::IsNullOrWhiteSpace($directValue)) {
+            $directValue
+        }
+        else {
+            $reportedValues[$name]
+        }
+    }
+
+    $reportedMissing = @($reportedValues.Values | Where-Object { [string]::IsNullOrWhiteSpace([string]$_) }).Count
+    $reportedComplete = $reportedMissing -eq 0
+    $metadataBound = $reportedComplete -and
+        $reportedSource -ceq "herdr-workflow" -and
+        $reportedSession -ceq $SessionId -and
+        $reportedAgent -ceq [string]$Agent.agent
+    $proven = -not $directInvalid -and -not $conflict -and ($directComplete -or $metadataBound)
+
+    return [pscustomobject]@{
+        provider = [string]$values.provider
+        model = [string]$values.model
+        reasoning_effort = [string]$values.reasoning_effort
+        service_tier = [string]$values.service_tier
+        source = if ($metadataBound) { "herdr-workflow" } elseif ($directComplete) { "herdr-agent" } else { $null }
+        reported_session = $reportedSession
+        reported_agent = $reportedAgent
+        execution_profile_proven = $proven
+    }
 }
 
 function Test-ContainsOrdinalIgnoreCase {
@@ -1579,6 +1740,10 @@ function Get-WorkflowSourceProof {
         [string]::IsNullOrWhiteSpace([string]$tab.label)) {
         throw "Workflow request source pane $SourcePaneId lacks a resolvable stable tab label."
     }
+    $executionProfile = Get-WorkflowExecutionProfile `
+        -TargetPaneId $SourcePaneId `
+        -Agent $agent `
+        -SessionId $session
     return [pscustomobject]@{
         pane_id = $SourcePaneId
         agent = $agentKind
@@ -1587,12 +1752,12 @@ function Get-WorkflowSourceProof {
         state_change_seq = [long]$agent.state_change_seq
         tab_id = $tabId
         tab_label = [string]$tab.label
-        model = Get-OptionalProfileString -Object $agent -Name "model"
-        reasoning_effort = Get-OptionalProfileString -Object $agent -Name "reasoning_effort"
-        service_tier = Get-OptionalProfileString -Object $agent -Name "service_tier"
-        execution_profile_proven = $null -ne (Get-OptionalProfileString -Object $agent -Name "model") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "reasoning_effort") -and
-            $null -ne (Get-OptionalProfileString -Object $agent -Name "service_tier")
+        provider = $executionProfile.provider
+        model = $executionProfile.model
+        reasoning_effort = $executionProfile.reasoning_effort
+        service_tier = $executionProfile.service_tier
+        execution_profile_source = $executionProfile.source
+        execution_profile_proven = [bool]$executionProfile.execution_profile_proven
         subtitle = Get-AgentWorkSubtitle -Agent $agent
     }
 }
@@ -1681,6 +1846,7 @@ function Reserve-WorkflowRequest {
                 throw "Duplicate workflow request refused because its completion timeout differs from the original reservation."
             }
             if ([string]$existing[0].target_tab_id -ne [string]$Preflight.tab_id -or
+                [string]$existing[0].target_provider -cne [string]$Preflight.provider -or
                 [string]$existing[0].target_model -cne [string]$Preflight.model -or
                 [string]$existing[0].target_reasoning_effort -cne [string]$Preflight.reasoning_effort -or
                 [string]$existing[0].target_service_tier -cne [string]$Preflight.service_tier -or
@@ -1747,6 +1913,7 @@ function Reserve-WorkflowRequest {
             target_session = [string]$Preflight.session_id
             target_tab_id = [string]$Preflight.tab_id
             target_tab_label = [string]$Preflight.tab_label
+            target_provider = [string]$Preflight.provider
             target_model = [string]$Preflight.model
             target_reasoning_effort = [string]$Preflight.reasoning_effort
             target_service_tier = [string]$Preflight.service_tier
@@ -2231,6 +2398,72 @@ function Invoke-CompletionReturn {
 $NowUtc = $NowUtc.ToUniversalTime()
 
 switch ($Action) {
+    "report-profile" {
+        $callerPane = [string]$env:HERDR_PANE_ID
+        if ([string]::IsNullOrWhiteSpace($callerPane)) {
+            throw "Execution-profile reporting requires HERDR_PANE_ID from the native Herdr environment."
+        }
+        foreach ($profileValue in @($Provider, $Model, $ReasoningEffort, $ServiceTier)) {
+            if ([string]::IsNullOrWhiteSpace($profileValue) -or $profileValue -match '[\r\n]') {
+                throw "Execution-profile reporting requires non-empty single-line provider, model, reasoning effort, and service tier values."
+            }
+        }
+
+        $agentResponse = Invoke-HerdrJson -Arguments @("agent", "get", $callerPane)
+        $agent = $agentResponse.result.agent
+        if ([string]$agent.pane_id -ne $callerPane) {
+            throw "Execution-profile reporting resolved a different caller pane than $callerPane."
+        }
+        $agentKind = [string]$agent.agent
+        $sessionId = Get-AgentSessionId -Agent $agent
+        $sessionKind = Get-AgentSessionKind -Agent $agent
+        if ([string]::IsNullOrWhiteSpace($agentKind) -or
+            [string]::IsNullOrWhiteSpace($sessionId) -or
+            $sessionKind -ne $agentKind) {
+            throw "Execution-profile reporting requires matching native agent-session proof."
+        }
+        $null = Assert-WorkflowCallerProof `
+            -PaneId $callerPane `
+            -Agent $agentKind `
+            -Session $sessionId
+
+        $metadataArguments = @(
+            "pane", "report-metadata", $callerPane,
+            "--source", "herdr-workflow",
+            "--token", "execution_provider=$Provider",
+            "--token", "execution_model=$Model",
+            "--token", "execution_reasoning_effort=$ReasoningEffort",
+            "--token", "execution_service_tier=$ServiceTier",
+            "--token", "execution_profile_source=herdr-workflow",
+            "--token", "execution_profile_session=$sessionId",
+            "--token", "execution_profile_agent=$agentKind"
+        )
+        $null = Invoke-HerdrJson -Arguments $metadataArguments
+        $reported = Get-WorkflowExecutionProfile `
+            -TargetPaneId $callerPane `
+            -Agent $agent `
+            -SessionId $sessionId
+        if (-not [bool]$reported.execution_profile_proven -or
+            [string]$reported.provider -cne $Provider -or
+            [string]$reported.model -cne $Model -or
+            [string]$reported.reasoning_effort -cne $ReasoningEffort -or
+            [string]$reported.service_tier -cne $ServiceTier) {
+            throw "Herdr did not expose the exact reported execution profile for the current native session: provider='$($reported.provider)' model='$($reported.model)' reasoning='$($reported.reasoning_effort)' tier='$($reported.service_tier)' source='$($reported.source)' reported_session='$($reported.reported_session)' reported_agent='$($reported.reported_agent)'."
+        }
+
+        [ordered]@{
+            action = "report-profile"
+            pane_id = $callerPane
+            agent = $agentKind
+            session_id = $sessionId
+            provider = $Provider
+            model = $Model
+            reasoning_effort = $ReasoningEffort
+            service_tier = $ServiceTier
+            execution_profile_source = $reported.source
+            execution_profile_proven = $true
+        } | ConvertTo-Json -Depth 10
+    }
     "preflight" {
         if ([string]::IsNullOrWhiteSpace($PaneId)) {
             throw "-PaneId is required for preflight."
@@ -2453,6 +2686,7 @@ switch ($Action) {
             target_session = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_session"
             target_tab_id = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_tab_id"
             target_tab_label = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_tab_label"
+            target_provider = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_provider"
             target_model = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_model"
             target_reasoning_effort = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_reasoning_effort"
             target_service_tier = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_service_tier"
@@ -3141,8 +3375,7 @@ switch ($Action) {
         } | ConvertTo-Json -Depth 20
     }
     "status" {
-        $events = Get-LedgerEvents
-        $views = Get-TaskViews -Events $events
+        $views = @(Get-WorkflowViews)
         if (-not [string]::IsNullOrWhiteSpace($WorkflowRef)) {
             $views = @($views | Where-Object { $_.workflow_ref -eq $WorkflowRef })
         }
@@ -3153,8 +3386,7 @@ switch ($Action) {
         } | ConvertTo-Json -Depth 20
     }
     "scan" {
-        $events = Get-LedgerEvents
-        $views = Get-TaskViews -Events $events
+        $views = @(Get-WorkflowViews)
         $newAlerts = [Collections.Generic.List[object]]::new()
         foreach ($workflow in $views) {
             $alertKind = $null

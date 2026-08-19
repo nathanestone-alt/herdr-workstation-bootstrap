@@ -1,15 +1,260 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$HomePath,
+    [switch]$SkipLiveChecks
+)
 
 $ErrorActionPreference = "Stop"
-$reviewedVersion = "0.8.0-preview.2026-08-04-d78e3d3b5126"
+$reviewedVersion = "0.8.0"
+$reviewedSkillVersion = "0.8.0-preview.2026-08-04-d78e3d3b5126"
 $failures = [System.Collections.Generic.List[string]]::new()
+$blockers = [System.Collections.Generic.List[string]]::new()
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
+$builtinSkill = ""
 
 function Add-Failure {
     param([Parameter(Mandatory)][string]$Message)
-    $failures.Add($Message)
+    $null = $failures.Add($Message)
 }
 
+function Add-Blocker {
+    param([Parameter(Mandatory)][string]$Message)
+    $null = $blockers.Add($Message)
+}
+
+function Resolve-HomeDirectory {
+    param([string]$ExplicitPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        try {
+            $explicitFullPath = [IO.Path]::GetFullPath($ExplicitPath)
+        }
+        catch {
+            throw "Explicit home path is invalid: $ExplicitPath"
+        }
+        if (-not (Test-Path -LiteralPath $explicitFullPath -PathType Container)) {
+            throw "Explicit home path is not a directory: $explicitFullPath"
+        }
+        return $explicitFullPath
+    }
+
+    foreach ($candidate in @($env:HOME, $env:USERPROFILE, [Environment]::GetFolderPath("UserProfile"))) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
+            continue
+        }
+        try {
+            $fullCandidate = [IO.Path]::GetFullPath([string]$candidate)
+        }
+        catch {
+            continue
+        }
+        if (Test-Path -LiteralPath $fullCandidate -PathType Container) {
+            return $fullCandidate
+        }
+    }
+
+    throw "Unable to resolve a usable user home directory. Set HOME or USERPROFILE, or pass -HomePath explicitly."
+}
+
+function Get-JsonStringValues {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return
+    }
+    if ($Value -is [string]) {
+        Write-Output ([string]$Value)
+        return
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($entry in $Value.GetEnumerator()) {
+            Get-JsonStringValues -Value $entry.Value
+        }
+        return
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            Get-JsonStringValues -Value $item
+        }
+        return
+    }
+    foreach ($property in $Value.PSObject.Properties) {
+        Get-JsonStringValues -Value $property.Value
+    }
+}
+
+function Convert-HookPath {
+    param(
+        [Parameter(Mandatory)][string]$Candidate,
+        [Parameter(Mandatory)][string]$HomeDirectory,
+        [Parameter(Mandatory)][string]$ConfigurationPath
+    )
+
+    $path = $Candidate.Trim()
+    $path = $path.Replace('$HOME', $HomeDirectory)
+    $path = $path.Replace('%USERPROFILE%', $HomeDirectory)
+    if ($isWindowsPlatform) {
+        $path = $path.Replace('/', '\')
+    }
+
+    try {
+        if ([IO.Path]::IsPathRooted($path)) {
+            return [IO.Path]::GetFullPath($path)
+        }
+        return [IO.Path]::GetFullPath((Join-Path -Path (Split-Path -Parent $ConfigurationPath) -ChildPath $path))
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ConfiguredHerdrHookPaths {
+    param(
+        [Parameter(Mandatory)][ValidateSet("claude", "codex")][string]$Agent,
+        [Parameter(Mandatory)][string]$HomeDirectory
+    )
+
+    $configPaths = if ($Agent -eq "claude") {
+        @(
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".claude") -ChildPath "settings.json"),
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".claude") -ChildPath "settings.local.json")
+        )
+    }
+    else {
+        @(
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".codex") -ChildPath "hooks.json"),
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".codex") -ChildPath "config.json")
+        )
+    }
+
+    $pathPattern = '(?i)(?:"(?<double>[^"]*herdr[^"\r\n]+\.(?:sh|ps1|mjs|cmd|bat))"|''(?<single>[^''\r\n]*herdr[^''\r\n]+\.(?:sh|ps1|mjs|cmd|bat))''|(?<bare>[^\s"'']+herdr[^\s"'']+\.(?:sh|ps1|mjs|cmd|bat)))'
+    foreach ($configurationPath in $configPaths) {
+        if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
+            continue
+        }
+
+        try {
+            $configuration = Get-Content -Raw -LiteralPath $configurationPath | ConvertFrom-Json
+        }
+        catch {
+            Add-Blocker "Unable to parse installed $Agent hook configuration: $configurationPath ($($_.Exception.Message))"
+            continue
+        }
+
+        foreach ($value in @(Get-JsonStringValues -Value $configuration)) {
+            foreach ($match in [regex]::Matches([string]$value, $pathPattern)) {
+                $rawPath = $null
+                foreach ($groupName in @("double", "single", "bare")) {
+                    if ($match.Groups[$groupName].Success) {
+                        $rawPath = $match.Groups[$groupName].Value
+                        break
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($rawPath)) {
+                    continue
+                }
+                $resolvedPath = Convert-HookPath -Candidate $rawPath -HomeDirectory $HomeDirectory -ConfigurationPath $configurationPath
+                if ($resolvedPath -and (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+                    Write-Output $resolvedPath
+                }
+            }
+        }
+    }
+}
+
+function Get-InstalledHerdrHookPaths {
+    param(
+        [Parameter(Mandatory)][ValidateSet("claude", "codex")][string]$Agent,
+        [Parameter(Mandatory)][string]$HomeDirectory
+    )
+
+    $roots = if ($Agent -eq "claude") {
+        @(
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".claude") -ChildPath "hooks"),
+            (Join-Path -Path $HomeDirectory -ChildPath ".claude")
+        )
+    }
+    else {
+        @(
+            (Join-Path -Path (Join-Path -Path $HomeDirectory -ChildPath ".codex") -ChildPath "hooks"),
+            (Join-Path -Path $HomeDirectory -ChildPath ".codex")
+        )
+    }
+
+    $allCandidates = @(
+        Get-ConfiguredHerdrHookPaths -Agent $Agent -HomeDirectory $HomeDirectory
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+        $allCandidates += @(Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)herdr-agent-(?:state|session)' } |
+            Select-Object -ExpandProperty FullName)
+    }
+
+    $seen = @{}
+    foreach ($candidate in $allCandidates) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate) -or
+            -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            continue
+        }
+        $fullCandidate = [IO.Path]::GetFullPath([string]$candidate)
+        $key = if ($isWindowsPlatform) { $fullCandidate.ToLowerInvariant() } else { $fullCandidate }
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            Write-Output $fullCandidate
+        }
+    }
+}
+
+function Select-HerdrHookPath {
+    param(
+        [Parameter(Mandatory)][string[]]$Candidates,
+        [Parameter(Mandatory)][string]$Agent
+    )
+
+    $preferredName = if ($Agent -eq "claude") { "state-async|state" } else { "session-refresh|state" }
+    $preferred = @($Candidates | Where-Object { (Split-Path -Leaf $_) -match "(?i)herdr-agent-($preferredName)" })
+    if ($preferred.Count -gt 0) {
+        return $preferred[0]
+    }
+    return $Candidates[0]
+}
+
+function Test-ManagedHookContract {
+    param(
+        [Parameter(Mandatory)][string]$HookPath,
+        [Parameter(Mandatory)][ValidateSet("claude", "codex")][string]$Agent
+    )
+
+    $content = Get-Content -Raw -LiteralPath $HookPath
+    $isManaged = $content -match '(?i)installed by herdr|managed by herdr|HERDR_INTEGRATION_ID='
+    if ($isManaged) {
+        if ($content -notmatch "HERDR_INTEGRATION_ID=$Agent" -or
+            $content -notmatch 'HERDR_INTEGRATION_VERSION=7') {
+            Add-Failure "Installed $Agent hook is not marked as the reviewed Herdr v7 integration: $HookPath"
+        }
+        if ($content -notmatch 'report_agent_session|report-agent-session' -or
+            $content -notmatch 'session_id|agent_session_id' -or
+            $content -notmatch 'transcript_path') {
+            Add-Failure "Installed $Agent hook does not preserve native session/transcript provenance: $HookPath"
+        }
+    }
+    elseif ($Agent -eq "claude") {
+        if ($content -notmatch 'spawnSync\(' -or $content -notmatch 'report-agent-session') {
+            Add-Failure "Claude refresh wrapper does not use the bounded direct reporter: $HookPath"
+        }
+        if ($content -match 'detached\s*:\s*true') {
+            Add-Failure "Claude refresh wrapper still uses the lossy detached reporter path: $HookPath"
+        }
+    }
+    elseif ($content -notmatch 'transcript_path') {
+        Add-Failure "Codex refresh hook does not forward the transcript path required by integration v7: $HookPath"
+    }
+}
+
+if (-not $SkipLiveChecks) {
 if ($env:HERDR_ENV -ne "1") {
     Add-Failure "HERDR_ENV is not 1; compatibility must be checked from a Herdr-managed pane."
 }
@@ -20,8 +265,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $currentVersion = $currentVersionText -replace "^herdr\s+", ""
-if ($currentVersion -ne $reviewedVersion) {
-    Add-Failure "Herdr version $currentVersion has not been reviewed; expected $reviewedVersion."
+$reviewedRuntimeVersions = @(
+    $reviewedVersion,
+    "$reviewedVersion-preview.2026-08-04-d78e3d3b5126"
+)
+if ($reviewedRuntimeVersions -notcontains $currentVersion) {
+    Add-Failure "Herdr version $currentVersion has not been reviewed; expected one of $($reviewedRuntimeVersions -join ', ')."
 }
 
 $builtinSkill = (& herdr --skill 2>&1 | Out-String)
@@ -60,30 +309,60 @@ foreach ($paneCommand in @("report-agent-session", "report-metadata", "wait-outp
         Add-Failure "Herdr pane command surface is missing $paneCommand."
     }
 }
+}
 
-$homePath = [Environment]::GetFolderPath("UserProfile")
+try {
+    $homePath = Resolve-HomeDirectory -ExplicitPath $HomePath
+}
+catch {
+    Write-Output "HERDR SKILL COMPATIBILITY: BLOCK"
+    Write-Output "- $($_.Exception.Message)"
+    exit 2
+}
+
+$agentsRoot = Join-Path -Path $homePath -ChildPath ".agents"
+$agentsSkillsRoot = Join-Path -Path $agentsRoot -ChildPath "skills"
+$claudeRoot = Join-Path -Path $homePath -ChildPath ".claude"
+$claudeSkillsRoot = Join-Path -Path $claudeRoot -ChildPath "skills"
 $skillPaths = @(
-    (Join-Path $homePath ".agents\skills\herdr\SKILL.md"),
-    (Join-Path $homePath ".claude\skills\herdr\SKILL.md"),
-    (Join-Path $homePath ".agents\skills\herdr-coordination\SKILL.md")
+    (Join-Path -Path (Join-Path -Path $agentsSkillsRoot -ChildPath "herdr") -ChildPath "SKILL.md"),
+    (Join-Path -Path (Join-Path -Path $claudeSkillsRoot -ChildPath "herdr") -ChildPath "SKILL.md"),
+    (Join-Path -Path (Join-Path -Path $agentsSkillsRoot -ChildPath "herdr-coordination") -ChildPath "SKILL.md")
 )
-$reviewMarker = "Compatibility reviewed for Herdr " + [char]96 + $reviewedVersion + [char]96
-
-foreach ($skillPath in $skillPaths) {
-    if (-not (Test-Path -LiteralPath $skillPath)) {
-        Add-Failure "Missing Herdr-related skill: $skillPath"
+$reviewMarker = "Compatibility reviewed for Herdr " + [char]96 + $reviewedSkillVersion + [char]96
+$controlSkillSources = [System.Collections.Generic.List[object]]::new()
+for ($index = 0; $index -lt $skillPaths.Count; $index++) {
+    $skillPath = $skillPaths[$index]
+    if (Test-Path -LiteralPath $skillPath -PathType Leaf) {
+        $content = Get-Content -Raw -LiteralPath $skillPath
+        if ($index -eq 2 -and $content -notmatch [regex]::Escape($reviewMarker)) {
+            Add-Failure "Skill is not pinned to the reviewed Herdr version: $skillPath"
+        }
+        if ($index -lt 2) {
+            $controlSkillSources.Add([pscustomobject]@{
+                    Path = $skillPath
+                    Content = $content
+                    Bundled = $false
+                })
+        }
         continue
     }
 
-    $content = Get-Content -Raw -LiteralPath $skillPath
-    if ($content -notmatch [regex]::Escape($reviewMarker)) {
-        Add-Failure "Skill is not pinned to the reviewed Herdr version: $skillPath"
+    if ($index -lt 2 -and -not [string]::IsNullOrWhiteSpace($builtinSkill)) {
+        $controlSkillSources.Add([pscustomobject]@{
+                Path = "herdr --skill (bundled runtime)"
+                Content = $builtinSkill
+                Bundled = $true
+            })
+        continue
     }
+
+    Add-Failure "Missing Herdr-related skill: $skillPath"
 }
 
-$controlSkillPaths = $skillPaths[0..1]
-foreach ($skillPath in $controlSkillPaths) {
-    $content = Get-Content -Raw -LiteralPath $skillPath
+foreach ($source in $controlSkillSources) {
+    $skillPath = [string]$source.Path
+    $content = [string]$source.Content
     if ($content -match "(?m)^\s*herdr wait(?:\s|$)") {
         Add-Failure "Obsolete top-level herdr wait syntax remains in $skillPath"
     }
@@ -96,30 +375,38 @@ foreach ($skillPath in $controlSkillPaths) {
             Add-Failure "Current command form '$pattern' is missing from $skillPath"
         }
     }
-    if ($content -notlike "*herdr_coordination.ps1*") {
-        Add-Failure "Tracked coordination overlay is missing from $skillPath"
-    }
-    if ($content -notmatch 'agent_prompted.+proves only.+terminal transport' -or
-        $content -notmatch 'require `state_change_seq` to advance') {
-        Add-Failure "No-wait agent_prompted false-success containment is missing from $skillPath"
-    }
-    if ($content -notmatch "native host-shell tool" -or
-        $content -notmatch "missing value inside such a subprocess is not evidence") {
-        Add-Failure "Sandboxed HERDR_ENV false-negative containment is missing from $skillPath"
-    }
-    if ($content -notmatch '`--current` still falls back to the UI-focused pane' -or
-        $content -notmatch 'Never invoke `--current` as a recovery path') {
-        Add-Failure "Caller-less --current UI-focus fallback containment is missing from $skillPath"
+    if (-not [bool]$source.Bundled) {
+        if ($content -notlike "*herdr_coordination.ps1*") {
+            Add-Failure "Tracked coordination overlay is missing from $skillPath"
+        }
+        if ($content -notmatch 'agent_prompted.+proves only.+terminal transport' -or
+            $content -notmatch 'require `state_change_seq` to advance') {
+            Add-Failure "No-wait agent_prompted false-success containment is missing from $skillPath"
+        }
+        if ($content -notmatch "native host-shell tool" -or
+            $content -notmatch "missing value inside such a subprocess is not evidence") {
+            Add-Failure "Sandboxed HERDR_ENV false-negative containment is missing from $skillPath"
+        }
+        if ($content -notmatch '`--current` still falls back to the UI-focused pane' -or
+            $content -notmatch 'Never invoke `--current` as a recovery path') {
+            Add-Failure "Caller-less --current UI-focus fallback containment is missing from $skillPath"
+        }
     }
 }
 
-$coordinationSkillContent = Get-Content -Raw -LiteralPath $skillPaths[2]
+$coordinationSkillContent = ""
+if (Test-Path -LiteralPath $skillPaths[2] -PathType Leaf) {
+    $coordinationSkillContent = Get-Content -Raw -LiteralPath $skillPaths[2]
+}
 if ($coordinationSkillContent -notmatch 'Omitting `--wait` still returns only the unproven `agent_prompted` transport receipt' -or
     $coordinationSkillContent -notmatch 'proof-bound Enter recovery') {
     Add-Failure "Coordination skill is missing no-wait false-success containment."
 }
 if ($coordinationSkillContent -notmatch "native host-shell tool" -or
-    $coordinationSkillContent -notmatch "subprocesses may strip pane-scoped") {
+    $coordinationSkillContent -notmatch "subprocesses may strip pane-scoped" -or
+    $coordinationSkillContent -notmatch "host-access preflight" -or
+    $coordinationSkillContent -notmatch "PermissionDenied" -or
+    $coordinationSkillContent -notmatch "do not issue or retry registration from the same sandbox") {
     Add-Failure "Coordination skill is missing sandboxed HERDR_ENV false-negative containment."
 }
 if ($coordinationSkillContent -notmatch '`--current` fall back to UI focus' -or
@@ -141,10 +428,12 @@ if ($coordinationSkillContent -notmatch 'PANE NAMING REQUEST' -or
     $coordinationSkillContent -notmatch 'A pane requests naming changes; it does not rename itself') {
     Add-Failure "Coordination skill is missing coordinator-owned canonical naming and work-subtitle guidance."
 }
-$coordinationHelperContent = Get-Content -Raw -LiteralPath (Join-Path (Split-Path $skillPaths[2]) "scripts\herdr_coordination.ps1")
-$workflowHelperContent = Get-Content -Raw -LiteralPath (Join-Path (Split-Path $skillPaths[2]) "scripts\herdr_workflow.ps1")
-$registryHelperPath = Join-Path (Split-Path $skillPaths[2]) "scripts\herdr_pane_registry.ps1"
-$registryModulePath = Join-Path (Split-Path $skillPaths[2]) "scripts\HerdrPaneRegistry.psm1"
+$coordinationSkillRoot = Split-Path -Parent $skillPaths[2]
+$coordinationScriptsRoot = Join-Path -Path $coordinationSkillRoot -ChildPath "scripts"
+$coordinationHelperContent = Get-Content -Raw -LiteralPath (Join-Path -Path $coordinationScriptsRoot -ChildPath "herdr_coordination.ps1")
+$workflowHelperContent = Get-Content -Raw -LiteralPath (Join-Path -Path $coordinationScriptsRoot -ChildPath "herdr_workflow.ps1")
+$registryHelperPath = Join-Path -Path $coordinationScriptsRoot -ChildPath "herdr_pane_registry.ps1"
+$registryModulePath = Join-Path -Path $coordinationScriptsRoot -ChildPath "HerdrPaneRegistry.psm1"
 if (-not (Test-Path -LiteralPath $registryHelperPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $registryModulePath -PathType Leaf)) {
     Add-Failure "Coordination skill is missing the durable pane-registry helper or module."
@@ -195,10 +484,17 @@ if ($workflowHelperContent -notmatch 'Assert-WorkflowCallerProof' -or
     Add-Failure "Workflow helper is missing caller-process proof, tab continuity, atomic ACK/completion gating, artifact snapshots, or reservation recovery."
 }
 
-$contextModeVersions = Join-Path $homePath ".codex\plugins\cache\context-mode\context-mode"
+$codexRoot = Join-Path -Path $homePath -ChildPath ".codex"
+$contextModeRoot = Join-Path -Path (Join-Path -Path $codexRoot -ChildPath "plugins") -ChildPath "cache"
+$contextModeRoot = Join-Path -Path $contextModeRoot -ChildPath "context-mode"
+$contextModeVersions = Join-Path -Path $contextModeRoot -ChildPath "context-mode"
 $contextModeSkill = Get-ChildItem -LiteralPath $contextModeVersions -Directory -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTimeUtc -Descending |
-    ForEach-Object { Join-Path $_.FullName "skills\context-mode\SKILL.md" } |
+    ForEach-Object {
+        $versionSkills = Join-Path -Path $_.FullName -ChildPath "skills"
+        $versionContextMode = Join-Path -Path $versionSkills -ChildPath "context-mode"
+        Join-Path -Path $versionContextMode -ChildPath "SKILL.md"
+    } |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
     Select-Object -First 1
 if (-not $contextModeSkill) {
@@ -206,46 +502,42 @@ if (-not $contextModeSkill) {
 }
 else {
     $contextModeContent = Get-Content -Raw -LiteralPath $contextModeSkill
-    if ($contextModeContent -notmatch "native host-shell tool" -or
-        $contextModeContent -notmatch "initial inside/outside-Herdr safety decision") {
+    if ($contextModeContent -match '(?i)\bherdr\b' -and
+        ($contextModeContent -notmatch "native host-shell tool" -or
+         $contextModeContent -notmatch "initial inside/outside-Herdr safety decision")) {
         Add-Failure "Context-mode skill does not preserve native Herdr environment authority: $contextModeSkill"
     }
 }
 
-$integrationStatus = (& herdr integration status 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0) {
-    Add-Failure "herdr integration status failed."
-}
-foreach ($agentKind in @("claude", "codex")) {
-    if ($integrationStatus -notmatch "(?m)^$agentKind`: current \(v7\)") {
-        Add-Failure "$agentKind integration is not current at the reviewed v7 schema."
+$integrationStatus = $null
+if (-not $SkipLiveChecks) {
+    $integrationStatus = (& herdr integration status 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        Add-Failure "herdr integration status failed."
+    }
+    foreach ($agentKind in @("claude", "codex")) {
+        if ($integrationStatus -notmatch "(?m)^$agentKind`: current \(v7\)") {
+            Add-Failure "$agentKind integration is not current at the reviewed v7 schema."
+        }
     }
 }
 
-$claudeWrapper = Join-Path $homePath ".claude\hooks\herdr-agent-state-async.mjs"
-if (-not (Test-Path -LiteralPath $claudeWrapper -PathType Leaf)) {
-    Add-Failure "Missing Claude session-refresh wrapper: $claudeWrapper"
+$claudeHookCandidates = @(Get-InstalledHerdrHookPaths -Agent "claude" -HomeDirectory $homePath)
+if ($claudeHookCandidates.Count -eq 0) {
+    Add-Blocker "Unable to resolve the installed Claude Herdr hook from the platform integration configuration or managed hook directory under $claudeRoot."
 }
 else {
-    $claudeWrapperContent = Get-Content -Raw -LiteralPath $claudeWrapper
-    if ($claudeWrapperContent -notmatch 'spawnSync\(' -or
-        $claudeWrapperContent -notmatch 'report-agent-session') {
-        Add-Failure "Claude refresh wrapper does not use the bounded direct reporter."
-    }
-    if ($claudeWrapperContent -match 'detached\s*:\s*true') {
-        Add-Failure "Claude refresh wrapper still uses the lossy detached reporter path."
-    }
+    $claudeWrapper = Select-HerdrHookPath -Candidates $claudeHookCandidates -Agent "claude"
+    Test-ManagedHookContract -HookPath $claudeWrapper -Agent "claude"
 }
 
-$codexRefresh = Join-Path $homePath ".codex\herdr-agent-session-refresh.ps1"
-if (-not (Test-Path -LiteralPath $codexRefresh -PathType Leaf)) {
-    Add-Failure "Missing Codex session-refresh hook: $codexRefresh"
+$codexHookCandidates = @(Get-InstalledHerdrHookPaths -Agent "codex" -HomeDirectory $homePath)
+if ($codexHookCandidates.Count -eq 0) {
+    Add-Blocker "Unable to resolve the installed Codex Herdr hook from the platform integration configuration or managed hook directory under $codexRoot."
 }
 else {
-    $codexRefreshContent = Get-Content -Raw -LiteralPath $codexRefresh
-    if ($codexRefreshContent -notmatch 'transcript_path') {
-        Add-Failure "Codex refresh hook does not forward the transcript path required by integration v7."
-    }
+    $codexRefresh = Select-HerdrHookPath -Candidates $codexHookCandidates -Agent "codex"
+    Test-ManagedHookContract -HookPath $codexRefresh -Agent "codex"
 }
 
 foreach ($testName in @("test_codex_session_refresh.ps1", "test_claude_session_refresh.ps1")) {
@@ -262,7 +554,7 @@ foreach ($registryTestName in @("test_herdr_pane_registry.ps1", "test_herdr_pane
     }
 }
 
-$coordinationScript = Join-Path $homePath ".agents\skills\herdr-coordination\scripts\herdr_coordination.ps1"
+$coordinationScript = Join-Path -Path $coordinationScriptsRoot -ChildPath "herdr_coordination.ps1"
 if (-not (Test-Path -LiteralPath $coordinationScript)) {
     Add-Failure "Missing coordination transport: $coordinationScript"
 } else {
@@ -276,6 +568,14 @@ if (-not (Test-Path -LiteralPath $coordinationScript)) {
     if ($coordinationContent -match '"wait",\s*"agent-status"') {
         Add-Failure "Coordination transport still contains obsolete wait agent-status syntax."
     }
+}
+
+if ($blockers.Count -gt 0) {
+    Write-Output "HERDR SKILL COMPATIBILITY: BLOCK"
+    foreach ($blocker in $blockers) {
+        Write-Output "- $blocker"
+    }
+    exit 2
 }
 
 if ($failures.Count -gt 0) {

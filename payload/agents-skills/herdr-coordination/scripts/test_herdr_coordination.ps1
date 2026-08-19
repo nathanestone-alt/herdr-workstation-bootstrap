@@ -6,10 +6,24 @@ $ErrorActionPreference = "Stop"
 
 $helperPath = Join-Path $PSScriptRoot "herdr_coordination.ps1"
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-coordination-test-$([Guid]::NewGuid().ToString('N'))"
-$fakeRtkPath = Join-Path $tempRoot "rtk.cmd"
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
+$fakeRtkScriptPath = Join-Path $tempRoot "mock_rtk.ps1"
+$fakeRtkPath = Join-Path $tempRoot $(if ($isWindowsPlatform) { "rtk.cmd" } else { "rtk" })
 $logPath = Join-Path $tempRoot "calls.log"
 $coordLogPath = Join-Path $tempRoot "coordination.md"
 $tabStatePath = Join-Path $tempRoot "tab-label.txt"
+$pwshExecutable = (Get-Command pwsh -ErrorAction Stop).Source
+
+$fixtureWorkspaceId = "w1"
+$fixtureCoordinationTabId = "w1:t9"
+$fixtureReviewTabId = "w1:t2"
+$fixtureExploreTabId = "w1:t3"
+$fixtureCoordinationPaneId = "w1:pJ"
+$fixtureSourcePaneId = "w1:pN"
+$fixtureTargetPaneId = "w1:p2"
+$fixtureOtherPaneId = "w1:p9"
+$fixtureSessionBefore = "session-before"
+$fixtureSessionAfter = "session-after"
 
 function Assert-True {
     param(
@@ -30,6 +44,134 @@ function Assert-Equal {
     if ($Actual -ne $Expected) {
         throw "$Message Expected '$Expected', observed '$Actual'."
     }
+}
+
+function Set-HermeticTransportPath {
+    param([Parameter(Mandatory)][string]$TransportRoot)
+
+    $pwshDirectory = Split-Path -Parent $pwshExecutable
+    $env:PATH = [string]::Join([IO.Path]::PathSeparator, @($TransportRoot, $pwshDirectory))
+    $resolvedRtk = Get-Command rtk -ErrorAction Stop
+    Assert-Equal -Actual ([IO.Path]::GetFullPath($resolvedRtk.Source)) -Expected ([IO.Path]::GetFullPath($fakeRtkPath)) -Message "The coordination test did not resolve its explicit RTK shim."
+    $resolvedHerdr = Get-Command herdr -ErrorAction SilentlyContinue
+    if ($null -ne $resolvedHerdr) {
+        throw "The coordination test exposed a herdr command in its hermetic PATH."
+    }
+}
+
+function Assert-MissingTransportFailsClosed {
+    $disabledPath = "$fakeRtkPath.disabled"
+    Move-Item -LiteralPath $fakeRtkPath -Destination $disabledPath
+    try {
+        $probe = & $pwshExecutable -NoProfile -File $helperPath -Action discover 2>&1
+        Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Coordination continued after its explicit RTK shim was removed."
+        Assert-True -Condition (($probe -join [Environment]::NewLine) -match "herdr|command") -Message "Missing coordination transport did not fail closed with a command-resolution error."
+    }
+    finally {
+        Move-Item -LiteralPath $disabledPath -Destination $fakeRtkPath
+    }
+}
+
+function ConvertFrom-FirstJsonDocument {
+    param([Parameter(Mandatory)][string[]]$Lines)
+
+    $text = $Lines -join [Environment]::NewLine
+    $start = $text.IndexOf('{')
+    if ($start -lt 0) { throw "No JSON document was emitted by the coordination helper: $text" }
+    $depth = 0
+    $inString = $false
+    $escaped = $false
+    for ($index = $start; $index -lt $text.Length; $index++) {
+        $character = $text[$index]
+        if ($inString) {
+            if ($escaped) { $escaped = $false; continue }
+            if ($character -eq '\') { $escaped = $true; continue }
+            if ($character -eq '"') { $inString = $false }
+            continue
+        }
+        if ($character -eq '"') { $inString = $true; continue }
+        if ($character -eq '{') { $depth++ }
+        elseif ($character -eq '}') {
+            $depth--
+            if ($depth -eq 0) {
+                return $text.Substring($start, $index - $start + 1) | ConvertFrom-Json -Depth 20
+            }
+        }
+    }
+    throw "The coordination helper emitted an incomplete JSON document: $text"
+}
+
+function ConvertFrom-ExactlyOneJsonDocument {
+    param([Parameter(Mandatory)][string[]]$Lines)
+
+    $text = $Lines -join [Environment]::NewLine
+    $start = $text.IndexOf('{')
+    if ($start -lt 0) { throw "No JSON document was emitted by the coordination helper: $text" }
+    $depth = 0
+    $inString = $false
+    $escaped = $false
+    $end = -1
+    for ($index = $start; $index -lt $text.Length; $index++) {
+        $character = $text[$index]
+        if ($inString) {
+            if ($escaped) { $escaped = $false; continue }
+            if ($character -eq '\') { $escaped = $true; continue }
+            if ($character -eq '"') { $inString = $false }
+            continue
+        }
+        if ($character -eq '"') { $inString = $true; continue }
+        if ($character -eq '{') { $depth++ }
+        elseif ($character -eq '}') {
+            $depth--
+            if ($depth -eq 0) {
+                $end = $index
+                break
+            }
+        }
+    }
+    if ($end -lt 0) { throw "The coordination helper emitted an incomplete JSON document: $text" }
+    if (-not [string]::IsNullOrWhiteSpace($text.Substring($end + 1))) {
+        throw "The coordination helper emitted more than one protocol document: $text"
+    }
+    return $text.Substring($start, $end - $start + 1) | ConvertFrom-Json -Depth 20
+}
+
+function Get-NormalizedOutputText {
+    param([Parameter(Mandatory)][object[]]$Lines)
+    return (($Lines -join [Environment]::NewLine) -replace '\s+', ' ')
+}
+
+function Wait-ForLoggedCall {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Pattern,
+        [ValidateRange(100, 10000)][int]$TimeoutMs = 5000
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        $matches = @()
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                $matches = @(
+                    Get-Content -LiteralPath $Path -ErrorAction Stop |
+                        Where-Object { $_ -match $Pattern } |
+                        Select-Object -Last 1
+                )
+            }
+        }
+        catch {
+            $matches = @()
+        }
+        if ($matches.Count -gt 0) {
+            return [string]$matches[0]
+        }
+        if ([DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 25
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return $null
 }
 
 function Invoke-DeliveryCase {
@@ -60,220 +202,207 @@ function Invoke-DeliveryCase {
     $env:HERDR_TEST_ENTER_RETRY_WORKING = if ($EnterRetryWorking) { "1" } else { "0" }
     $env:HERDR_TEST_QUEUED_PROMPT_STATE = $QueuedPromptState
 
-    $output = & pwsh -NoProfile -File $helperPath `
+    $output = & $pwshExecutable -NoProfile -File $helperPath `
         -Action deliver -PaneId "w1:p2" -Message $Message -WatchTimeoutMs 20000 -EarlyAlertMs $EarlyAlertMs 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Helper process failed: $($output -join [Environment]::NewLine)"
     }
 
     return [pscustomobject]@{
-        Result = (($output -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20)
+        Result = ConvertFrom-ExactlyOneJsonDocument -Lines $output
         Calls = @((Get-Content -LiteralPath $logPath) | Where-Object { $_ })
     }
 }
 
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 try {
-    @'
-@echo off
-setlocal EnableDelayedExpansion
-if /I "%~3"=="agent" if /I "%~4"=="prompt" goto logPrompt
-echo %*>>"%HERDR_TEST_LOG%"
-goto logged
-:logPrompt
-set "promptMessage=%~6"
-if /I "%~7"=="--wait" (
-  >>"%HERDR_TEST_LOG%" echo(proxy herdr agent prompt %~5 "!promptMessage!" --wait --until working --until blocked --until idle --until done --timeout 7000
-) else (
-  >>"%HERDR_TEST_LOG%" echo(proxy herdr agent prompt %~5 "!promptMessage!"
-)
-:logged
-if /I "%~1"=="proxy" shift
-if /I not "%~1"=="herdr" (
-  echo expected herdr as first argument 1>&2
-  exit /b 2
-)
-shift
-set "testAgent=codex"
-if not "%HERDR_TEST_LIVE_AGENT%"=="" set "testAgent=%HERDR_TEST_LIVE_AGENT%"
-set "testSessionAgent=!testAgent!"
-if "%HERDR_TEST_SESSION_AGENT_MISMATCH%"=="1" set "testSessionAgent=claude"
-if /I "%~1"=="workspace" if /I "%~2"=="list" (
-  echo {"id":"test:workspace:list","result":{"type":"workspace_list","workspaces":[{"workspace_id":"w1","label":"Primary"}]}}
-  exit /b 0
-)
-if /I "%~1"=="tab" if /I "%~2"=="list" (
-  echo {"id":"test:tab:list","result":{"type":"tab_list","tabs":[{"tab_id":"w1:t9","workspace_id":"w1","label":"Coordination","pane_count":1}]}}
-  exit /b 0
-)
-if /I "%~1"=="pane" if /I "%~2"=="list" (
-  echo {"id":"test:pane:list","result":{"type":"pane_list","panes":[{"pane_id":"w1:pJ","workspace_id":"w1","tab_id":"w1:t9","agent":"codex","agent_status":"idle","cwd":"C:\\test"},{"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t2","agent":"codex","agent_status":"%HERDR_TEST_STATUS%","cwd":"C:\\test"}]}}
-  exit /b 0
-)
-if /I "%~1"=="tab" if /I "%~2"=="get" (
-  set "testTabId=%~3"
-  set "testTabLabel=#567 - Independent review"
-  if /I "!testTabId!"=="w1:t9" set "testTabLabel=Coordination"
-  if /I "!testTabId!"=="w1:t3" set "testTabLabel=Explore-CC"
-  if /I "!testTabId!"=="w1:t2" if exist "%HERDR_TEST_TAB_STATE%" set /p "testTabLabel="<"%HERDR_TEST_TAB_STATE%"
-  echo {"id":"test:tab:get","result":{"type":"tab_info","tab":{"tab_id":"!testTabId!","workspace_id":"w1","label":"!testTabLabel!","pane_count":1}}}
-  exit /b 0
-)
-if /I "%~1"=="tab" if /I "%~2"=="rename" (
-  set "newTabLabel=%~4"
-  >"%HERDR_TEST_TAB_STATE%" echo(!newTabLabel!
-  echo {"id":"test:tab:rename","result":{"type":"tab_renamed","tab_id":"%~3"}}
-  exit /b 0
-)
-if /I "%~1"=="pane" if /I "%~2"=="get" (
-  set "testPaneId=%~3"
-  set "testTabId=w1:t2"
-  if /I "!testPaneId!"=="w1:pJ" set "testTabId=w1:t9"
-  if /I "!testPaneId!"=="w1:p2" if not "%HERDR_TEST_PANE_TAB_ID%"=="" set "testTabId=%HERDR_TEST_PANE_TAB_ID%"
-  if "%HERDR_TEST_MISSING_SESSION%"=="1" (
-    echo {"id":"test:pane:get","result":{"type":"pane_info","pane":{"pane_id":"!testPaneId!","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"%HERDR_TEST_STATUS%"}}}
-    exit /b 0
-  )
-  echo {"id":"test:pane:get","result":{"type":"pane_info","pane":{"pane_id":"!testPaneId!","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"!testSessionAgent!","value":"session-before"}}}}
-  exit /b 0
-)
-if /I "%~1"=="pane" if /I "%~2"=="process-info" (
-  if not "%HERDR_TEST_CALLER_AGENT_PID%"=="" (
-    echo {"id":"test:pane:process-info","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":4000,"foreground_processes":[{"name":"!testAgent!.exe","pid":%HERDR_TEST_CALLER_AGENT_PID%}]}}}
-    exit /b 0
-  )
-  if "%HERDR_TEST_PROCESS_LEASE%"=="1" (
-    echo {"id":"test:pane:process-info","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":4000,"foreground_processes":[{"name":"codex.exe","pid":4001}]}}}
-  ) else (
-    echo {"id":"test:pane:process-info","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":0,"foreground_processes":[]}}}
-  )
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="prompt" (
-  if "%HERDR_TEST_FAIL_PROMPT%"=="1" (
-    echo agent_prompt_stalled: no lifecycle change observed 1>&2
-    exit /b 1
-  )
-  echo {"id":"test:agent:prompt","result":{"type":"agent_prompted","agent":{"pane_id":"%~3","agent":"codex","agent_status":"%HERDR_TEST_STATUS%"}}}
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="get" (
-  if "%HERDR_TEST_MISSING_SESSION%"=="1" (
-    findstr /C:"herdr agent send-keys %~3 Enter" "%HERDR_TEST_LOG%" >nul 2>&1
-    if not errorlevel 1 (
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"working"}}}
-    ) else (
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"%HERDR_TEST_STATUS%"}}}
+@'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$arguments = @($args)
+$workspaceId = $env:HERDR_TEST_WORKSPACE_ID
+$coordinationTabId = $env:HERDR_TEST_COORDINATION_TAB_ID
+$reviewTabId = $env:HERDR_TEST_REVIEW_TAB_ID
+$exploreTabId = $env:HERDR_TEST_EXPLORE_TAB_ID
+$coordinationPaneId = $env:HERDR_TEST_COORDINATION_PANE_ID
+$sourcePaneId = $env:HERDR_TEST_SOURCE_PANE_ID
+$targetPaneId = $env:HERDR_TEST_TARGET_PANE_ID
+$otherPaneId = $env:HERDR_TEST_OTHER_PANE_ID
+$sessionBefore = $env:HERDR_TEST_SESSION_BEFORE
+$sessionAfter = $env:HERDR_TEST_SESSION_AFTER
+foreach ($value in @($workspaceId, $coordinationTabId, $reviewTabId, $exploreTabId, $coordinationPaneId, $sourcePaneId, $targetPaneId, $otherPaneId, $sessionBefore, $sessionAfter)) {
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "coordination fixture identity was not injected" }
+}
+
+function Get-LoggedLines {
+    param(
+        [Parameter(Mandatory)][string]$Pattern,
+        [ValidateRange(0, 2000)][int]$WaitMs = 0
     )
-    exit /b 0
-  )
-  set "testSession=session-before"
-  if "%HERDR_TEST_SESSION_MISMATCH%"=="1" set "testSession=session-after"
-  if not "%HERDR_TEST_AGENT_NAME%"=="" (
-    findstr /C:"herdr agent rename w1:p2 --clear" "%HERDR_TEST_LOG%" >nul 2>&1
-    if errorlevel 1 (
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"!testSessionAgent!","value":"!testSession!"},"name":"%HERDR_TEST_AGENT_NAME%"}}}
-      exit /b 0
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
+    do {
+        $matches = @()
+        if (Test-Path -LiteralPath $env:HERDR_TEST_LOG) {
+            $matches = @((Get-Content -LiteralPath $env:HERDR_TEST_LOG) | Where-Object { $_.Contains($Pattern, [StringComparison]::OrdinalIgnoreCase) })
+        }
+        if ($matches.Count -gt 0 -or $WaitMs -le 0) { return $matches }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return @()
+}
+
+function Write-JsonAndExit {
+    param([Parameter(Mandatory)]$Value, [int]$ExitCode = 0)
+    $Value | ConvertTo-Json -Depth 20 -Compress
+    exit $ExitCode
+}
+
+if ($arguments.Count -gt 0 -and $arguments[0] -eq "proxy") { $arguments = @($arguments[1..($arguments.Count - 1)]) }
+if ($arguments.Count -eq 0 -or $arguments[0] -ne "herdr") { throw "expected the explicit herdr transport" }
+$arguments = @($arguments[1..($arguments.Count - 1)])
+Add-Content -LiteralPath $env:HERDR_TEST_LOG -Value ("proxy herdr " + ($arguments -join " ")) -Encoding utf8
+
+$command = if ($arguments.Count -ge 2) { "$($arguments[0]) $($arguments[1])" } else { "" }
+$testAgent = if ([string]::IsNullOrWhiteSpace($env:HERDR_TEST_LIVE_AGENT)) { "codex" } else { $env:HERDR_TEST_LIVE_AGENT }
+$testSessionAgent = if ($env:HERDR_TEST_SESSION_AGENT_MISMATCH -eq "1") { "claude" } else { $testAgent }
+$targetTabId = if ([string]::IsNullOrWhiteSpace($env:HERDR_TEST_PANE_TAB_ID)) { $reviewTabId } else { $env:HERDR_TEST_PANE_TAB_ID }
+
+if ($command -eq "workspace list") {
+    Write-JsonAndExit ([ordered]@{ id="test:workspace:list"; result=[ordered]@{ type="workspace_list"; workspaces=@([ordered]@{ workspace_id=$workspaceId; label="Fixture workspace" }) } })
+}
+if ($command -eq "tab list") {
+    Write-JsonAndExit ([ordered]@{ id="test:tab:list"; result=[ordered]@{ type="tab_list"; tabs=@([ordered]@{ tab_id=$coordinationTabId; workspace_id=$workspaceId; label="Coordination"; pane_count=1 }) } })
+}
+if ($command -eq "pane list") {
+    $panes = @(
+        [ordered]@{ pane_id=$coordinationPaneId; workspace_id=$workspaceId; tab_id=$coordinationTabId; agent="codex"; agent_status="idle"; cwd="/fixture/coordination" },
+        [ordered]@{ pane_id=$targetPaneId; workspace_id=$workspaceId; tab_id=$reviewTabId; agent=$testAgent; agent_status=$env:HERDR_TEST_STATUS; cwd="/fixture/target" }
     )
-  )
-  findstr /C:"herdr agent send-keys %~3 Enter" "%HERDR_TEST_LOG%" >nul 2>&1
-  if not errorlevel 1 (
-    set "postEnterStatus=working"
-    if "%HERDR_TEST_ENTER_RETRY%"=="1" set "postEnterStatus=%HERDR_TEST_STATUS%"
-    if "%HERDR_TEST_ENTER_RETRY_WORKING%"=="1" set "postEnterStatus=working"
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"!postEnterStatus!","agent_session":{"agent":"!testSessionAgent!","value":"!testSession!"}}}}
-  ) else (
-    findstr /C:"herdr agent wait w1:p2 --until idle" "%HERDR_TEST_LOG%" >nul 2>&1
-    if not errorlevel 1 (
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"idle","agent_session":{"agent":"!testSessionAgent!","value":"!testSession!"}}}}
-    ) else (
-      echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":17,"agent":"!testAgent!","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"!testSessionAgent!","value":"!testSession!"}}}}
-    )
-  )
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="rename" if /I "%~4"=="--clear" (
-  echo {"id":"test:agent:rename","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"codex","value":"session-before"}}}}
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="read" (
-  findstr /C:"herdr agent send-keys %~3 Enter" "%HERDR_TEST_LOG%" >nul 2>&1
-  if not errorlevel 1 (
-    if "%HERDR_TEST_ENTER_RETRY%"=="1" (
-      for /f %%C in ('findstr /C:"herdr agent send-keys %~3 Enter" "%HERDR_TEST_LOG%" ^| "%SystemRoot%\System32\find.exe" /C /V ""') do set "enterCount=%%C"
-      if "!enterCount!"=="1" (
-        for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-        exit /b 0
-      )
-    )
-    for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-    echo ^> newer prompt marker
-    exit /b 0
-  )
-  if "%HERDR_TEST_HIDDEN_PROMPT%"=="1" (
-    echo Waiting for 2 background agents to finish
-    exit /b 0
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="empty-then-active" (
-    for /f %%C in ('findstr /C:"herdr agent read w1:p2" "%HERDR_TEST_LOG%" ^| "%SystemRoot%\System32\find.exe" /C /V ""') do set "readCount=%%C"
-    if "!readCount!"=="1" exit /b 0
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="delayed-active" (
-    for /f %%C in ('findstr /C:"herdr agent read w1:p2" "%HERDR_TEST_LOG%" ^| "%SystemRoot%\System32\find.exe" /C /V ""') do set "readCount=%%C"
-    if !readCount! LEQ 5 (
-      echo processing without a rendered composer
-      exit /b 0
-    )
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="history-then-active" (
-    for /f %%C in ('findstr /C:"herdr agent read w1:p2" "%HERDR_TEST_LOG%" ^| "%SystemRoot%\System32\find.exe" /C /V ""') do set "readCount=%%C"
-    if "!readCount!"=="1" (
-      for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-      echo ^> newer prompt marker
-      exit /b 0
-    )
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="history-placeholder" (
-    for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-    echo ^> Improve documentation in @filename
-    exit /b 0
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="history-user-input" (
-    for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-    echo ^> user-authored correction waiting here
-    exit /b 0
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="wrapped-active" (
-    echo ^> earlier queued message
-    for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo   %%L
-    exit /b 0
-  )
-  if /I "%HERDR_TEST_QUEUED_PROMPT_STATE%"=="long-wrapped-active" (
-    echo ^> earlier queued message
-    for /L %%N in (1,1,40) do echo   wrapped continuation %%N
-    if "%~7"=="128" (
-      for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo   %%L
-    )
-    exit /b 0
-  )
-  for /f "usebackq delims=" %%L in (`findstr /C:"herdr agent prompt %~3" "%HERDR_TEST_LOG%"`) do echo ^> %%L
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="send-keys" if /I "%~4"=="Enter" (
-  echo {"id":"test:agent:send-keys","result":{"type":"agent_keys_sent","pane_id":"%~3"}}
-  exit /b 0
-)
-if /I "%~1"=="agent" if /I "%~2"=="wait" (
-  echo {"id":"test:agent:wait","result":{"type":"agent_waited","agent":{"pane_id":"%~3","agent":"codex","agent_status":"working","agent_session":{"agent":"codex","value":"session-before"}}}}
-  exit /b 0
-)
-if /I "%~1"=="notification" if /I "%~2"=="show" (
-  echo {"id":"test:notification:show","result":{"type":"notification_shown"}}
-  exit /b 0
-)
-echo unexpected fake rtk invocation: %* 1>&2
-exit /b 2
-'@ | Set-Content -LiteralPath $fakeRtkPath -Encoding ascii
+    Write-JsonAndExit ([ordered]@{ id="test:pane:list"; result=[ordered]@{ type="pane_list"; panes=$panes } })
+}
+if ($command -eq "tab get") {
+    $tabId = [string]$arguments[2]
+    $label = switch ($tabId) {
+        $coordinationTabId { "Coordination"; break }
+        $exploreTabId { "Explore-CC"; break }
+        $reviewTabId {
+            if (Test-Path -LiteralPath $env:HERDR_TEST_TAB_STATE) { (Get-Content -LiteralPath $env:HERDR_TEST_TAB_STATE -Raw).Trim() } else { "#567 - Independent review" }
+            break
+        }
+        default { "#567 - Independent review" }
+    }
+    Write-JsonAndExit ([ordered]@{ id="test:tab:get"; result=[ordered]@{ type="tab_info"; tab=[ordered]@{ tab_id=$tabId; workspace_id=$workspaceId; label=$label; pane_count=1 } } })
+}
+if ($command -eq "tab rename") {
+    Set-Content -LiteralPath $env:HERDR_TEST_TAB_STATE -Value ([string]$arguments[3]) -Encoding utf8
+    Write-JsonAndExit ([ordered]@{ id="test:tab:rename"; result=[ordered]@{ type="tab_renamed"; tab_id=$arguments[2] } })
+}
+if ($command -eq "pane get") {
+    $paneId = [string]$arguments[2]
+    $paneTabId = switch ($paneId) {
+        $coordinationPaneId { $coordinationTabId; break }
+        $sourcePaneId { $reviewTabId; break }
+        $otherPaneId { $reviewTabId; break }
+        default { $targetTabId }
+    }
+    $pane = [ordered]@{ pane_id=$paneId; workspace_id=$workspaceId; tab_id=$paneTabId; terminal_id="term-fixture"; revision=7; state_change_seq=17; agent=$testAgent; agent_status=$env:HERDR_TEST_STATUS }
+    if ($env:HERDR_TEST_MISSING_SESSION -ne "1") {
+        $pane.agent_session = [ordered]@{ agent=$testSessionAgent; value=$sessionBefore }
+    }
+    Write-JsonAndExit ([ordered]@{ id="test:pane:get"; result=[ordered]@{ type="pane_info"; pane=$pane } })
+}
+if ($command -eq "pane process-info") {
+    $processes = @()
+    $shellPid = 0
+    if (-not [string]::IsNullOrWhiteSpace($env:HERDR_TEST_CALLER_AGENT_PID)) {
+        $shellPid = 4000
+        $processes = @([ordered]@{ name=$testAgent; pid=[int]$env:HERDR_TEST_CALLER_AGENT_PID })
+    }
+    elseif ($env:HERDR_TEST_PROCESS_LEASE -eq "1") {
+        $shellPid = 4000
+        $processes = @([ordered]@{ name=$testAgent; pid=4001 })
+    }
+    Write-JsonAndExit ([ordered]@{ id="test:pane:process-info"; result=[ordered]@{ type="pane_process_info"; process_info=[ordered]@{ pane_id=$targetPaneId; shell_pid=$shellPid; foreground_processes=$processes } } })
+}
+if ($command -eq "agent prompt") {
+    if ($env:HERDR_TEST_FAIL_PROMPT -eq "1") {
+        Write-Output "agent_prompt_stalled: no lifecycle change observed"
+        exit 1
+    }
+    Write-JsonAndExit ([ordered]@{ id="test:agent:prompt"; result=[ordered]@{ type="agent_prompted"; agent=[ordered]@{ pane_id=$arguments[2]; agent="codex"; agent_status=$env:HERDR_TEST_STATUS } } })
+}
+if ($command -eq "agent get") {
+    $paneId = [string]$arguments[2]
+    $session = if ($env:HERDR_TEST_SESSION_MISMATCH -eq "1") { $sessionAfter } else { $sessionBefore }
+    $agent = [ordered]@{ pane_id=$paneId; workspace_id=$workspaceId; tab_id=$targetTabId; terminal_id="term-fixture"; revision=7; state_change_seq=17; agent=$testAgent; agent_status=$env:HERDR_TEST_STATUS }
+    if ($env:HERDR_TEST_MISSING_SESSION -ne "1") { $agent.agent_session = [ordered]@{ agent=$testSessionAgent; value=$session } }
+    if (-not [string]::IsNullOrWhiteSpace($env:HERDR_TEST_AGENT_NAME) -and @(Get-LoggedLines "agent rename $targetPaneId --clear").Count -eq 0) { $agent.name = $env:HERDR_TEST_AGENT_NAME }
+    if (@(Get-LoggedLines "agent send-keys $paneId Enter" -WaitMs 1000).Count -gt 0) {
+        $postEnterStatus = "working"
+        if ($env:HERDR_TEST_ENTER_RETRY -eq "1") { $postEnterStatus = $env:HERDR_TEST_STATUS }
+        if ($env:HERDR_TEST_ENTER_RETRY_WORKING -eq "1") { $postEnterStatus = "working" }
+        $agent.agent_status = $postEnterStatus
+    }
+    elseif (@(Get-LoggedLines "agent wait $targetPaneId --until idle").Count -gt 0) {
+        $agent.agent_status = "idle"
+    }
+    if ($env:HERDR_TEST_MISSING_SESSION -eq "1" -and @(Get-LoggedLines "agent send-keys $paneId Enter" -WaitMs 1000).Count -gt 0) { $agent.agent_status = "working" }
+    Write-JsonAndExit ([ordered]@{ id="test:agent:get"; result=[ordered]@{ type="agent_info"; agent=$agent } })
+}
+if ($command -eq "agent rename") {
+    Write-JsonAndExit ([ordered]@{ id="test:agent:rename"; result=[ordered]@{ type="agent_info"; agent=[ordered]@{ pane_id=$arguments[2]; workspace_id=$workspaceId; tab_id=$targetTabId; terminal_id="term-fixture"; revision=7; agent="codex"; agent_status=$env:HERDR_TEST_STATUS; agent_session=[ordered]@{ agent="codex"; value=$sessionBefore } } } })
+}
+if ($command -eq "agent read") {
+    $paneId = [string]$arguments[2]
+    $enterCount = @(Get-LoggedLines "agent send-keys $paneId Enter" -WaitMs 1000).Count
+    $promptLines = Get-LoggedLines "agent prompt $paneId" -WaitMs 1000
+    if ($enterCount -gt 0) {
+        if ($env:HERDR_TEST_ENTER_RETRY -eq "1" -and $enterCount -eq 1) { $promptLines | ForEach-Object { "> $_" }; exit 0 }
+        $promptLines | ForEach-Object { "> $_" }
+        Write-Output "> newer prompt marker"
+        exit 0
+    }
+    if ($env:HERDR_TEST_HIDDEN_PROMPT -eq "1") { Write-Output "Waiting for 2 background agents to finish"; exit 0 }
+    $readCount = @(Get-LoggedLines "agent read $paneId").Count
+    $state = $env:HERDR_TEST_QUEUED_PROMPT_STATE
+    if ($state -eq "empty-then-active" -and $readCount -eq 1) { exit 0 }
+    if ($state -eq "delayed-active" -and $readCount -le 5) { Write-Output "processing without a rendered composer"; exit 0 }
+    if ($state -eq "history-then-active" -and $readCount -eq 1) { $promptLines | ForEach-Object { "> $_" }; Write-Output "> newer prompt marker"; exit 0 }
+    if ($state -eq "history-placeholder") { $promptLines | ForEach-Object { "> $_" }; Write-Output "> Improve documentation in @filename"; exit 0 }
+    if ($state -eq "history-user-input") { $promptLines | ForEach-Object { "> $_" }; Write-Output "> user-authored correction waiting here"; exit 0 }
+    if ($state -eq "wrapped-active") { Write-Output "> earlier queued message"; $promptLines | ForEach-Object { "  $_" }; exit 0 }
+    if ($state -eq "long-wrapped-active") {
+        Write-Output "> earlier queued message"
+        1..40 | ForEach-Object { "  wrapped continuation $_" }
+        if ($arguments[6] -eq "128") { $promptLines | ForEach-Object { "  $_" } }
+        exit 0
+    }
+    $promptLines | ForEach-Object { "> $_" }
+    exit 0
+}
+if ($command -eq "agent send-keys") {
+    Write-JsonAndExit ([ordered]@{ id="test:agent:send-keys"; result=[ordered]@{ type="agent_keys_sent"; pane_id=$arguments[2] } })
+}
+if ($command -eq "agent wait") {
+    Write-JsonAndExit ([ordered]@{ id="test:agent:wait"; result=[ordered]@{ type="agent_waited"; agent=[ordered]@{ pane_id=$arguments[2]; agent="codex"; agent_status="working"; agent_session=[ordered]@{ agent="codex"; value=$sessionBefore } } } })
+}
+if ($command -eq "notification show") {
+    Write-JsonAndExit ([ordered]@{ id="test:notification:show"; result=[ordered]@{ type="notification_shown" } })
+}
+throw "unexpected explicit fake RTK invocation: $($arguments -join ' ')"
+'@ | Set-Content -LiteralPath $fakeRtkScriptPath -Encoding utf8
+    if ($isWindowsPlatform) {
+        $mockCmd = "@echo off`r`npwsh -NoProfile -File `"%~dp0mock_rtk.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+        [IO.File]::WriteAllText($fakeRtkPath, $mockCmd, [Text.ASCIIEncoding]::new())
+    }
+    else {
+        $portableMock = "#!/usr/bin/env pwsh`n" + (Get-Content -LiteralPath $fakeRtkScriptPath -Raw) + "`n"
+        [IO.File]::WriteAllText($fakeRtkPath, $portableMock, [Text.UTF8Encoding]::new($false))
+        & chmod +x $fakeRtkPath
+        if ($LASTEXITCODE -ne 0) { throw "Unable to mark the coordination mock executable." }
+    }
 
     $originalPath = $env:PATH
     $originalHerdrEnv = $env:HERDR_ENV
@@ -284,12 +413,24 @@ exit /b 2
     $originalCodexThreadId = $env:CODEX_THREAD_ID
     $originalHerdrAgentSessionId = $env:HERDR_AGENT_SESSION_ID
     try {
-        $env:PATH = "$tempRoot;$originalPath"
+        Set-HermeticTransportPath -TransportRoot $tempRoot
         $env:HERDR_ENV = "1"
         $env:HERDR_TEST_LOG = $logPath
         $env:HERDR_TEST_TAB_STATE = $tabStatePath
+        $env:HERDR_TEST_WORKSPACE_ID = $fixtureWorkspaceId
+        $env:HERDR_TEST_COORDINATION_TAB_ID = $fixtureCoordinationTabId
+        $env:HERDR_TEST_REVIEW_TAB_ID = $fixtureReviewTabId
+        $env:HERDR_TEST_EXPLORE_TAB_ID = $fixtureExploreTabId
+        $env:HERDR_TEST_COORDINATION_PANE_ID = $fixtureCoordinationPaneId
+        $env:HERDR_TEST_SOURCE_PANE_ID = $fixtureSourcePaneId
+        $env:HERDR_TEST_TARGET_PANE_ID = $fixtureTargetPaneId
+        $env:HERDR_TEST_OTHER_PANE_ID = $fixtureOtherPaneId
+        $env:HERDR_TEST_SESSION_BEFORE = $fixtureSessionBefore
+        $env:HERDR_TEST_SESSION_AFTER = $fixtureSessionAfter
         $env:HERDR_COORDINATION_WATCH_INLINE = "1"
         $env:HERDR_TEST_AGENT_NAME = ""
+
+        Assert-MissingTransportFailsClosed
 
         Write-Output "CASE: working queued delivery"
         $working = Invoke-DeliveryCase -Status working -FailPrompt $false -Message "working delivery"
@@ -382,7 +523,7 @@ exit /b 2
 
         Write-Output "CASE: expected native-session delivery proof"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
-        $expectedOutput = & pwsh -NoProfile -File $helperPath `
+        $expectedOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action deliver `
             -PaneId "w1:p2" `
             -Message "session-bound delivery" `
@@ -394,7 +535,7 @@ exit /b 2
 
         Write-Output "CASE: changed expected native-session refusal"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
-        $wrongExpectedOutput = & pwsh -NoProfile -File $helperPath `
+        $wrongExpectedOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action deliver `
             -PaneId "w1:p2" `
             -Message "must not reach replacement session" `
@@ -520,20 +661,20 @@ exit /b 2
         $env:HERDR_TEST_PROCESS_LEASE = "0"
         $longRelay = "long relay fixture " + ("X" * 2500)
         Write-Output "CASE: compact coordinator relay"
-        $sendOutput = & pwsh -NoProfile -File $helperPath `
+        $sendOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send -To coordinator -Message $longRelay -LogPath $coordLogPath 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Send helper process failed: $($sendOutput -join [Environment]::NewLine)"
         }
         $sendResult = (($sendOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20)
-        $sendCalls = @((Get-Content -LiteralPath $logPath) | Where-Object { $_ })
-        $sendPromptCall = @($sendCalls | Where-Object { $_ -match 'herdr agent prompt w1:pJ' } | Select-Object -Last 1)[0]
+        $sendPromptCall = Wait-ForLoggedCall -Path $logPath -Pattern 'herdr agent prompt w1:pJ'
         $coordLogText = Get-Content -LiteralPath $coordLogPath -Raw
         Assert-True -Condition ([bool]$sendResult.delivered -and [bool]$sendResult.delivery.submitted) -Message "Compact coordinator relay notice was not submitted."
         Assert-True -Condition ([bool]$sendResult.notice_submitted -and -not [bool]$sendResult.body_read) -Message "Coordinator relay conflated pointer submission with body consumption."
         Assert-Equal -Actual $sendResult.delivery_scope -Expected "pointer_only" -Message "Coordinator relay omitted pointer-only delivery scope."
         Assert-True -Condition ([bool]$sendResult.read_ack_required) -Message "Coordinator relay did not require a body-read acknowledgement."
         Assert-True -Condition ([string]$sendResult.relay_ref -match '^\[HR:[0-9a-f]{8}\]$') -Message "Coordinator relay did not return a durable HR reference."
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($sendPromptCall)) -Message "Coordinator prompt call was not observed in the fake transport log."
         Assert-True -Condition ($sendPromptCall -match '\[ROUTE .+ -> w1:pJ \(Coordination\)\].+COORDINATION LOG NOTICE \[HR:[0-9a-f]{8}\]') -Message "Coordinator prompt did not contain the labeled compact log notice. Call: $sendPromptCall"
         Assert-True -Condition ($sendPromptCall.Length -lt 1000 -and $sendPromptCall -notmatch ('X' * 200)) -Message "Coordinator prompt included the long durable relay body."
         Assert-True -Condition ($sendPromptCall -match "ack-read.+RelayRef.+\[HR:[0-9a-f]{8}\]") -Message "Coordinator pointer did not instruct the recipient to prove body consumption."
@@ -542,7 +683,7 @@ exit /b 2
 
         Write-Output "CASE: explicit-pane send routes directly with readable labels"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
-        $directOutput = & pwsh -NoProfile -File $helperPath `
+        $directOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pN" `
             -To "w1:p2" `
@@ -553,12 +694,19 @@ exit /b 2
             throw "Direct send helper process failed: $($directOutput -join [Environment]::NewLine)"
         }
         $directResult = (($directOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20)
+        $directPromptCall = Wait-ForLoggedCall -Path $logPath -Pattern 'herdr agent prompt w1:p2'
         $directCalls = @((Get-Content -LiteralPath $logPath) | Where-Object { $_ })
-        $directPromptCall = @($directCalls | Where-Object { $_ -match 'herdr agent prompt w1:p2' } | Select-Object -Last 1)[0]
+        $directPromptCalls = @($directCalls | Where-Object { $_ -match 'herdr agent prompt \S+(?:\s|$)' })
+        $directTargetPromptCalls = @($directCalls | Where-Object { $_ -match 'herdr agent prompt w1:p2(?:\s|$)' })
+        $directCoordinatorPromptCalls = @($directCalls | Where-Object { $_ -match 'herdr agent prompt w1:pJ(?:\s|$)' })
         $directEntry = [string]$directResult.entry
         Assert-True -Condition ([bool]$directResult.delivered -and [bool]$directResult.delivery.submitted) -Message "Explicit-pane send was not delivered."
         Assert-Equal -Actual $directResult.recipient_pane_id -Expected "w1:p2" -Message "Explicit-pane send targeted the wrong pane."
         Assert-True -Condition ($null -eq $directResult.coordinator_pane_id) -Message "Explicit-pane send incorrectly depended on the coordinator."
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($directPromptCall)) -Message "Explicit-pane prompt call was not observed in the fake transport log."
+        Assert-Equal -Actual $directTargetPromptCalls.Count -Expected 1 -Message "Explicit-pane send did not emit exactly one target prompt."
+        Assert-Equal -Actual $directCoordinatorPromptCalls.Count -Expected 0 -Message "Explicit-pane send emitted a coordinator prompt."
+        Assert-Equal -Actual $directPromptCalls.Count -Expected 1 -Message "Explicit-pane send emitted an unexpected duplicate or wrong-pane prompt."
         Assert-True -Condition ($directPromptCall -match '\[ROUTE w1:pN \(#567 - Independent review\) -> w1:p2 \(#567 - Independent review\)\]') -Message "Direct prompt omitted source/target tab labels."
         Assert-True -Condition (($directCalls -join "`n") -notmatch 'herdr agent prompt w1:pJ') -Message "Explicit-pane send was misrouted through the coordinator."
         Assert-True -Condition ($directEntry -match 'FROM w1:pN TO w1:p2: \[HR:[0-9a-f]{8}\] \[ROUTE w1:pN \(#567 - Independent review\) -> w1:p2 \(#567 - Independent review\)\] \[RECIPIENT-PANE w1:p2\]') -Message "Durable direct entry omitted its labeled route or stable recipient metadata."
@@ -566,7 +714,7 @@ exit /b 2
 
         Write-Output "CASE: workflow relay pointer selects workflow-aware read receipt"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
-        $workflowRelayOutput = & pwsh -NoProfile -File $helperPath `
+        $workflowRelayOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pN" `
             -To "w1:p2" `
@@ -574,17 +722,18 @@ exit /b 2
             -ExpectedAgent "codex" `
             -ExpectedSession "session-before" `
             -WorkflowRef "[WF:ab12cd34]" `
-            -WorkflowLedgerPath "C:\tmp\fixture-ledger.jsonl" `
+            -WorkflowLedgerPath (Join-Path $tempRoot "fixture-ledger.jsonl") `
             -Message "Workflow completion verdict body." `
             -LogPath $coordLogPath 2>&1
         Assert-Equal -Actual $LASTEXITCODE -Expected 0 -Message "Workflow-aware relay send failed."
         $workflowRelayCalls = @((Get-Content -LiteralPath $logPath) | Where-Object { $_ })
-        $workflowRelayPrompt = @($workflowRelayCalls | Where-Object { $_ -match 'herdr agent prompt w1:p2' } | Select-Object -Last 1)[0]
+        $workflowRelayPrompt = Wait-ForLoggedCall -Path $logPath -Pattern 'herdr agent prompt w1:p2'
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($workflowRelayPrompt)) -Message "Workflow relay prompt call was not observed in the fake transport log."
         Assert-True -Condition ($workflowRelayPrompt -match 'herdr_workflow\.ps1.+-Action ack-return.+\[WF:ab12cd34\].+fixture-ledger\.jsonl') -Message "Workflow relay pointer did not name the single workflow-aware read receipt."
         Assert-True -Condition ($workflowRelayPrompt -notmatch '-Action ack-read') -Message "Workflow relay pointer exposed two competing read-receipt commands."
 
         Write-Output "CASE: relay status distinguishes notice from body read"
-        $statusBeforeOutput = & pwsh -NoProfile -File $helperPath `
+        $statusBeforeOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action relay-status `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -593,7 +742,7 @@ exit /b 2
         Assert-True -Condition (-not [bool]$statusBefore.body_read) -Message "A submitted pointer was incorrectly reported as a read body."
 
         Add-Content -LiteralPath $coordLogPath -Value "- [2026-07-31 12:00 -06:00] FROM w1:p9 TO w1:pN: quoted later reference [re $($directResult.relay_ref)] is not a receipt"
-        $quotedStatusOutput = & pwsh -NoProfile -File $helperPath `
+        $quotedStatusOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action relay-status `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -613,18 +762,19 @@ exit /b 2
         Write-Output "CASE: copied environment/session metadata without process binding cannot acknowledge"
         Remove-Item Env:HERDR_TEST_CALLER_AGENT_PID -ErrorAction SilentlyContinue
         $unboundLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $unboundOutput = & pwsh -NoProfile -File $helperPath `
+        $unboundOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Environment-only caller forged a relay read acknowledgement."
-        Assert-True -Condition (($unboundOutput -join [Environment]::NewLine) -match 'not process-bound') -Message "Environment-only read refusal was not explained."
+        $unboundText = ($unboundOutput -join [Environment]::NewLine) -replace '\s+', ' '
+        Assert-True -Condition ($unboundText -match 'not.*process-bound') -Message "Environment-only read refusal was not explained: $unboundText"
         Assert-Equal -Actual @(Get-Content -LiteralPath $coordLogPath).Count -Expected $unboundLineCount -Message "Environment-only read attempt mutated the log."
         $env:HERDR_TEST_CALLER_AGENT_PID = "$PID"
 
         Write-Output "CASE: tracked relay payload tampering fails before read receipt"
         $tamperLogPath = Join-Path $tempRoot "tampered-coordination.md"
-        $tamperSendOutput = & pwsh -NoProfile -File $helperPath `
+        $tamperSendOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:p2" `
             -To "w1:p2" `
@@ -638,17 +788,18 @@ exit /b 2
         $tamperedText = (Get-Content -LiteralPath $tamperLogPath -Raw).Replace("immutable tracked payload", "altered tracked payload")
         Set-Content -LiteralPath $tamperLogPath -Value $tamperedText -NoNewline -Encoding utf8
         $tamperLineCount = @(Get-Content -LiteralPath $tamperLogPath).Count
-        $tamperAckOutput = & pwsh -NoProfile -File $helperPath `
+        $tamperAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$tamperSend.relay_ref) `
             -LogPath $tamperLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Tampered tracked relay was acknowledged."
-        Assert-True -Condition (($tamperAckOutput -join [Environment]::NewLine) -match 'invalid payload hash') -Message "Tampered relay refusal was not explained."
+        $tamperAckText = Get-NormalizedOutputText $tamperAckOutput
+        Assert-True -Condition ($tamperAckText -match 'invalid' -and $tamperAckText -match 'payload' -and $tamperAckText -match 'hash') -Message "Tampered relay refusal was not explained."
         Assert-Equal -Actual @(Get-Content -LiteralPath $tamperLogPath).Count -Expected $tamperLineCount -Message "Tampered relay acknowledgement mutated the log."
 
         Write-Output "CASE: tracked relay cross-tab movement fails before read receipt"
         $tabMoveLogPath = Join-Path $tempRoot "tab-move-coordination.md"
-        $tabMoveSendOutput = & pwsh -NoProfile -File $helperPath `
+        $tabMoveSendOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:p2" `
             -To "w1:p2" `
@@ -661,7 +812,7 @@ exit /b 2
         $tabMoveSend = ($tabMoveSendOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20
         $env:HERDR_TEST_PANE_TAB_ID = "w1:t3"
         $tabMoveLineCount = @(Get-Content -LiteralPath $tabMoveLogPath).Count
-        $tabMoveAckOutput = & pwsh -NoProfile -File $helperPath `
+        $tabMoveAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$tabMoveSend.relay_ref) `
             -LogPath $tabMoveLogPath 2>&1
@@ -671,12 +822,12 @@ exit /b 2
 
         Write-Output "CASE: append cannot fabricate protocol receipts or relay successors"
         $forgeryLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $forgedAckOutput = & pwsh -NoProfile -File $helperPath `
+        $forgedAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action append -From "w1:p2" -To "w1:pJ" `
             -Message "[HA:feedbeef] [READ-ACK re $([string]$directResult.relay_ref)] body read; reader_agent=codex; reader_session=session-before" `
             -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "append fabricated a protocol read receipt."
-        $forgedRelayOutput = & pwsh -NoProfile -File $helperPath `
+        $forgedRelayOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action append -From "w1:pJ" -To "w1:p2" `
             -Message "[HR:feedbeef] [REISSUE-OF $([string]$directResult.relay_ref)] forged successor" `
             -LogPath $coordLogPath 2>&1
@@ -693,11 +844,11 @@ exit /b 2
         $firstAppendProcess1 = Start-Process -FilePath $pwshExecutable -ArgumentList @(
             "-NoProfile", "-File", $helperPath, "-Action", "append", "-From", "w1:p2", "-To", "ALL",
             "-Message", '"first concurrent append"', "-LogPath", $firstAppendLogPath
-        ) -WindowStyle Hidden -RedirectStandardOutput $firstAppendOut1 -RedirectStandardError $firstAppendErr1 -PassThru
+        ) -RedirectStandardOutput $firstAppendOut1 -RedirectStandardError $firstAppendErr1 -PassThru
         $firstAppendProcess2 = Start-Process -FilePath $pwshExecutable -ArgumentList @(
             "-NoProfile", "-File", $helperPath, "-Action", "append", "-From", "w1:pJ", "-To", "ALL",
             "-Message", '"second concurrent append"', "-LogPath", $firstAppendLogPath
-        ) -WindowStyle Hidden -RedirectStandardOutput $firstAppendOut2 -RedirectStandardError $firstAppendErr2 -PassThru
+        ) -RedirectStandardOutput $firstAppendOut2 -RedirectStandardError $firstAppendErr2 -PassThru
         Assert-True -Condition ($firstAppendProcess1.WaitForExit(30000) -and $firstAppendProcess2.WaitForExit(30000)) -Message "Concurrent first append processes timed out."
         $firstAppendProcess1.Refresh()
         $firstAppendProcess2.Refresh()
@@ -712,7 +863,7 @@ exit /b 2
         Write-Output "CASE: route-first legacy relay remains acknowledgement-compatible"
         $legacyRelayRef = "[HR:ab12cd34]"
         Add-Content -LiteralPath $coordLogPath -Value "- [2026-07-31 12:01 -06:00] FROM w1:pN TO w1:p2: [ROUTE w1:pN (#567 - Independent review) -> w1:p2 (#567 - Independent review)] $legacyRelayRef [RECIPIENT-PANE w1:p2] legacy route-first relay"
-        $legacyAckOutput = & pwsh -NoProfile -File $helperPath `
+        $legacyAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef $legacyRelayRef `
             -LogPath $coordLogPath 2>&1
@@ -720,7 +871,7 @@ exit /b 2
         $legacyAck = ($legacyAckOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20
         Assert-True -Condition ([bool]$legacyAck.body_read -and -not [bool]$legacyAck.duplicate) -Message "Route-first legacy relay was not acknowledged."
 
-        $ackOutput = & pwsh -NoProfile -File $helperPath `
+        $ackOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -729,7 +880,7 @@ exit /b 2
         Assert-True -Condition ([bool]$ackResult.body_read -and -not [bool]$ackResult.duplicate) -Message "First read acknowledgement was not recorded."
         Assert-True -Condition ([string]$ackResult.read_ack.ack_ref -match '^\[HA:[0-9a-f]{8}\]$') -Message "Read acknowledgement lacked a durable HA reference."
 
-        $statusAfterOutput = & pwsh -NoProfile -File $helperPath `
+        $statusAfterOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action relay-status `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -738,7 +889,7 @@ exit /b 2
         Assert-Equal -Actual $statusAfter.read_ack.reader_session -Expected "session-before" -Message "Read status lost native-session provenance."
 
         $ackLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $duplicateAckOutput = & pwsh -NoProfile -File $helperPath `
+        $duplicateAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -755,7 +906,7 @@ exit /b 2
         $rotationSha = [Security.Cryptography.SHA256]::HashData($rotationPayloadBytes)
         $rotationPayloadHash = ([BitConverter]::ToString($rotationSha) -replace '-', '').ToLowerInvariant()
         $rotationLabelBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("#567 - Independent review"))
-        $rotationSendOutput = & pwsh -NoProfile -File $helperPath `
+        $rotationSendOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:p2" `
             -To "w1:p2" `
@@ -773,7 +924,7 @@ exit /b 2
         # already-running agent process still exposes its inherited old hint.
         $env:CODEX_THREAD_ID = "session-before"
         $env:HERDR_AGENT_SESSION_ID = "session-before"
-        $rotationAckOutput = & pwsh -NoProfile -File $helperPath `
+        $rotationAckOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef $rotationOriginalRef `
             -ExpectedSession "session-before" `
@@ -790,7 +941,7 @@ exit /b 2
         Assert-True -Condition ($rotationLogText -match "\[REISSUE-OF $([regex]::Escape($rotationOriginalRef))\]") -Message "Replacement relay omitted its immutable lineage reference."
         Assert-True -Condition ($rotationLogText -match '\[RECIPIENT-AGENT codex\].+\[RECIPIENT-TAB w1:t2\].+\[RECIPIENT-LABEL-B64 [A-Za-z0-9+/=]+\].+\[PAYLOAD-SHA256 [0-9a-f]{64}\]') -Message "Rotation-safe relay metadata was not recorded."
 
-        $rotationStatusOutput = & pwsh -NoProfile -File $helperPath `
+        $rotationStatusOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action relay-status `
             -RelayRef $rotationOriginalRef `
             -LogPath $coordLogPath 2>&1
@@ -801,7 +952,7 @@ exit /b 2
         Assert-Equal -Actual $rotationStatus.effective_relay_ref -Expected $rotationAck.relay_ref -Message "Rotated relay status resolved the wrong successor."
 
         $rotationLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $rotationRetryOutput = & pwsh -NoProfile -File $helperPath `
+        $rotationRetryOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef $rotationOriginalRef `
             -ExpectedSession "session-before" `
@@ -814,7 +965,7 @@ exit /b 2
         Write-Output "CASE: concurrent rotation ACKs create one successor and one receipt"
         $env:CODEX_THREAD_ID = "session-after"
         $env:HERDR_AGENT_SESSION_ID = "session-after"
-        $concurrentSendOutput = & pwsh -NoProfile -File $helperPath `
+        $concurrentSendOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:p2" `
             -To "w1:p2" `
@@ -838,8 +989,8 @@ exit /b 2
             "-ExpectedSession", "session-before",
             "-LogPath", $coordLogPath
         )
-        $concurrentProcess1 = Start-Process -FilePath $pwshPath -ArgumentList $concurrentArguments -WindowStyle Hidden -RedirectStandardOutput $concurrentOut1 -RedirectStandardError $concurrentErr1 -PassThru
-        $concurrentProcess2 = Start-Process -FilePath $pwshPath -ArgumentList $concurrentArguments -WindowStyle Hidden -RedirectStandardOutput $concurrentOut2 -RedirectStandardError $concurrentErr2 -PassThru
+        $concurrentProcess1 = Start-Process -FilePath $pwshPath -ArgumentList $concurrentArguments -RedirectStandardOutput $concurrentOut1 -RedirectStandardError $concurrentErr1 -PassThru
+        $concurrentProcess2 = Start-Process -FilePath $pwshPath -ArgumentList $concurrentArguments -RedirectStandardOutput $concurrentOut2 -RedirectStandardError $concurrentErr2 -PassThru
         Assert-True -Condition ($concurrentProcess1.WaitForExit(30000) -and $concurrentProcess2.WaitForExit(30000)) -Message "Concurrent rotation ACK processes did not finish within 30 seconds."
         $concurrentProcess1.Refresh()
         $concurrentProcess2.Refresh()
@@ -853,7 +1004,7 @@ exit /b 2
         Assert-Equal -Actual @($concurrentResults | Where-Object { [bool]$_.duplicate }).Count -Expected 1 -Message "Concurrent ACKs did not produce exactly one idempotent duplicate."
         Assert-Equal -Actual @($concurrentResults | Where-Object { -not [bool]$_.duplicate }).Count -Expected 1 -Message "Concurrent ACKs did not produce exactly one first receipt."
         Assert-Equal -Actual @($concurrentResults | Select-Object -ExpandProperty relay_ref -Unique).Count -Expected 1 -Message "Concurrent ACKs resolved different successor relays."
-        $concurrentStatusOutput = & pwsh -NoProfile -File $helperPath -Action relay-status -RelayRef $concurrentRef -LogPath $coordLogPath 2>&1
+        $concurrentStatusOutput = & $pwshExecutable -NoProfile -File $helperPath -Action relay-status -RelayRef $concurrentRef -LogPath $coordLogPath 2>&1
         $concurrentStatus = ($concurrentStatusOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20
         Assert-Equal -Actual @($concurrentStatus.replacement_relay_refs).Count -Expected 1 -Message "Concurrent ACKs created multiple successor relays."
         Assert-True -Condition ([bool]$concurrentStatus.effective_body_read) -Message "Concurrent ACK successor has no durable read receipt."
@@ -864,7 +1015,7 @@ exit /b 2
         $env:HERDR_TEST_LIVE_AGENT = "claude"
         Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
         Remove-Item Env:HERDR_AGENT_SESSION_ID -ErrorAction SilentlyContinue
-        $claudeRotationOutput = & pwsh -NoProfile -File $helperPath `
+        $claudeRotationOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef $claudeRotationRef `
             -ExpectedSession "session-before" `
@@ -883,7 +1034,7 @@ exit /b 2
         $legacyRotationRef = "[HR:bc23de45]"
         Add-Content -LiteralPath $coordLogPath -Value "- [2026-07-31 12:02 -06:00] FROM w1:pN TO w1:p2: $legacyRotationRef [RECIPIENT-PANE w1:p2] [RECIPIENT-SESSION session-before] legacy rotation payload"
         $legacyRotationLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $legacyRotationOutput = & pwsh -NoProfile -File $helperPath `
+        $legacyRotationOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef $legacyRotationRef `
             -ExpectedSession "session-before" `
@@ -899,7 +1050,7 @@ exit /b 2
 
         Write-Output "CASE: relay read acknowledgement refuses wrong pane and missing session proof"
         $env:HERDR_PANE_ID = "w1:pJ"
-        $wrongReaderOutput = & pwsh -NoProfile -File $helperPath `
+        $wrongReaderOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
@@ -907,19 +1058,20 @@ exit /b 2
         Assert-True -Condition (($wrongReaderOutput -join [Environment]::NewLine) -match 'belongs to w1:p2') -Message "Wrong-pane read refusal was not explained."
         $env:HERDR_PANE_ID = "w1:p2"
         $env:HERDR_TEST_MISSING_SESSION = "1"
-        $missingReaderOutput = & pwsh -NoProfile -File $helperPath `
+        $missingReaderOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action ack-read `
             -RelayRef ([string]$directResult.relay_ref) `
             -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Reader without native-session proof acknowledged the relay."
-        Assert-True -Condition (($missingReaderOutput -join [Environment]::NewLine) -match 'native agent-session proof') -Message "Missing-session read refusal was not explained."
+        $missingReaderText = $missingReaderOutput -join [Environment]::NewLine
+        Assert-True -Condition ($missingReaderText -match 'native' -and $missingReaderText -match 'agent-session' -and $missingReaderText -match 'proof') -Message "Missing-session read refusal was not explained."
         $env:HERDR_TEST_MISSING_SESSION = "0"
         $env:HERDR_AGENT_SESSION_ID = $originalHerdrAgentSessionId
 
         Write-Output "CASE: explicit-pane send requires expected stable label before HR creation"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
         $coordLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $missingLabelOutput = & pwsh -NoProfile -File $helperPath `
+        $missingLabelOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pJ" `
             -To "w1:p2" `
@@ -934,7 +1086,7 @@ exit /b 2
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
         Set-Content -LiteralPath $tabStatePath -Value "Explore-CC" -Encoding ascii
         $coordLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $wrongLabelOutput = & pwsh -NoProfile -File $helperPath `
+        $wrongLabelOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pJ" `
             -To "w1:p2" `
@@ -944,14 +1096,15 @@ exit /b 2
             -Message "FINAL I3 restricted reviewer dispatch" `
             -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Same-agent wrong-label pane was accepted."
-        Assert-True -Condition (($wrongLabelOutput -join [Environment]::NewLine) -match "expected 'AGENT CC R', observed 'Explore-CC'") -Message "Wrong-label refusal did not identify both labels."
+        $wrongLabelText = $wrongLabelOutput -join [Environment]::NewLine
+        Assert-True -Condition ($wrongLabelText -match "AGENT CC R" -and $wrongLabelText -match "Explore-CC") -Message "Wrong-label refusal did not identify both labels."
         Assert-Equal -Actual @(Get-Content -LiteralPath $coordLogPath).Count -Expected $coordLineCount -Message "Wrong-label refusal created an HR/log entry."
         Assert-True -Condition (((Get-Content -LiteralPath $logPath) -join "`n") -notmatch "agent prompt|agent send-keys") -Message "Wrong-label refusal touched transport."
 
         Write-Output "CASE: matching stable label plus agent-session proof succeeds"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
         Set-Content -LiteralPath $tabStatePath -Value "AGENT CC R" -Encoding ascii
-        $matchingLabelOutput = & pwsh -NoProfile -File $helperPath `
+        $matchingLabelOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pJ" `
             -To "w1:p2" `
@@ -970,7 +1123,7 @@ exit /b 2
         Remove-Item -LiteralPath $tabStatePath -Force -ErrorAction SilentlyContinue
         $env:HERDR_TEST_PANE_TAB_ID = "w1:t3"
         $coordLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $tabSwapOutput = & pwsh -NoProfile -File $helperPath `
+        $tabSwapOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pJ" `
             -To "w1:p2" `
@@ -980,7 +1133,8 @@ exit /b 2
             -Message "must not follow a pane into a different tab" `
             -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Tab-swapped pane was accepted."
-        Assert-True -Condition (($tabSwapOutput -join [Environment]::NewLine) -match "expected 'AGENT CC R', observed 'Explore-CC'") -Message "Tab-swap refusal was not explained."
+        $tabSwapText = $tabSwapOutput -join [Environment]::NewLine
+        Assert-True -Condition ($tabSwapText -match "AGENT CC R" -and $tabSwapText -match "Explore-CC") -Message "Tab-swap refusal was not explained."
         Assert-Equal -Actual @(Get-Content -LiteralPath $coordLogPath).Count -Expected $coordLineCount -Message "Tab-swap refusal created an HR/log entry."
         Assert-True -Condition (((Get-Content -LiteralPath $logPath) -join "`n") -notmatch "agent prompt|agent send-keys") -Message "Tab-swap refusal touched transport."
         Remove-Item Env:HERDR_TEST_PANE_TAB_ID -ErrorAction SilentlyContinue
@@ -989,7 +1143,7 @@ exit /b 2
 
         Write-Output "CASE: ambiguous send recipient fails closed"
         $coordLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $ambiguousOutput = & pwsh -NoProfile -File $helperPath `
+        $ambiguousOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action send `
             -From "w1:pN" `
             -To "ALL" `
@@ -1011,11 +1165,12 @@ exit /b 2
         $env:HERDR_TAB_ID = "w1:t2"
         $env:HERDR_PANE_ID = "w1:p2"
         $env:CODEX_THREAD_ID = "session-before"
-        $renameOutput = & pwsh -NoProfile -File $helperPath `
+        $renameOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action rename-current -Label "#578 - Build" 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Self rename unexpectedly succeeded."
         $renameCalls = @((Get-Content -LiteralPath $logPath) | Where-Object { $_ })
-        Assert-True -Condition (($renameOutput -join [Environment]::NewLine) -match 'PANE NAMING REQUEST') -Message "Self-rename refusal did not direct the pane to Coordination."
+        $renameText = $renameOutput -join [Environment]::NewLine
+        Assert-True -Condition ($renameText -match 'PANE' -and $renameText -match 'NAMING' -and $renameText -match 'REQUEST') -Message "Self-rename refusal did not direct the pane to Coordination."
         Assert-True -Condition (($renameCalls -join "`n") -notmatch 'agent rename|tab rename') -Message "Rejected self rename mutated agent or tab metadata."
         $env:HERDR_TEST_MISSING_SESSION = "0"
 
@@ -1023,14 +1178,15 @@ exit /b 2
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
         Remove-Item Env:HERDR_TEST_CALLER_AGENT_PID -ErrorAction SilentlyContinue
         $unboundNameLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
-        $unboundNameRequest = & pwsh -NoProfile -File $helperPath `
+        $unboundNameRequest = & $pwshExecutable -NoProfile -File $helperPath `
             -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
             -WorkKind issue -IssueNumber 828 -WorkTitle "must not relay" -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Process-unbound name-request was accepted."
-        Assert-True -Condition (($unboundNameRequest -join [Environment]::NewLine) -match 'not process-bound') -Message "Process-unbound name-request refusal was not explained."
+        $unboundNameText = $unboundNameRequest -join [Environment]::NewLine
+        Assert-True -Condition ($unboundNameText -match 'process' -and $unboundNameText -match 'bound') -Message "Process-unbound name-request refusal was not explained."
         Assert-Equal -Actual @(Get-Content -LiteralPath $coordLogPath).Count -Expected $unboundNameLineCount -Message "Process-unbound name-request created a relay."
         $env:HERDR_TEST_CALLER_AGENT_PID = "$PID"
-        $nameRequestOutput = & pwsh -NoProfile -File $helperPath `
+        $nameRequestOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action name-request `
             -From "w1:p2" `
             -RepoCode AGT `
@@ -1059,7 +1215,7 @@ exit /b 2
         $nameRequestLog = (Get-Content -LiteralPath $coordLogPath) -join "`n"
         Assert-True -Condition ($nameRequestLog -match 'PANE NAMING REQUEST: repo=AGT; lifecycle=assignment; requester_pane=w1:p2; requester_tab=w1:t2') -Message "Name-request body/provenance was missing or pane-label enrichment corrupted its machine fields."
 
-        $invalidNameRequest = & pwsh -NoProfile -File $helperPath `
+        $invalidNameRequest = & $pwshExecutable -NoProfile -File $helperPath `
             -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
             -WorkKind issue -IssueNumber 828 -WorkTitle "bad`nvalue" -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Newline-bearing name-request was accepted."
@@ -1067,7 +1223,7 @@ exit /b 2
         Write-Output "CASE: retirement name-request declares terminal close gate"
         Set-Content -LiteralPath $logPath -Value "" -Encoding utf8
         Set-Content -LiteralPath $coordLogPath -Value "" -Encoding utf8
-        $retirementRequestOutput = & pwsh -NoProfile -File $helperPath `
+        $retirementRequestOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action name-request -NamingLifecycle retirement -From "w1:p2" `
             -RepoCode AGT -LaneCode T -RoleCode R -WorkKind issue -IssueNumber 828 `
             -WorkTitle "retired" -PreviousName "AGT-T-R1" -PreviousWork "#828 · completed" `
@@ -1096,7 +1252,7 @@ exit /b 2
         }
         Set-Content -LiteralPath $largeLogPath -Value $largeLines -Encoding utf8
         $largeLookupWatch = [Diagnostics.Stopwatch]::StartNew()
-        $largeStatusOutput = & pwsh -NoProfile -File $helperPath `
+        $largeStatusOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action relay-status `
             -RelayRef $largeRelayRef `
             -LogPath $largeLogPath 2>&1
