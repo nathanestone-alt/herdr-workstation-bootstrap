@@ -200,6 +200,114 @@ try {
             -BridgeIdentityProbe $substituteIdentityProbe -TestMode
     } 'identity substitution' 'bridge identity substitution'
 
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $currentGroups = @([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value })
+    $effectiveWriteSddl = "D:P(A;;0x120116;;;$currentSid)"
+    $effectiveReadSddl = "D:P(A;;0x120089;;;$currentSid)"
+    $effectiveWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveWriteSddl)
+    $effectiveReadDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveReadSddl)
+    $effectiveWriteBytes = [byte[]]::new($effectiveWriteDescriptor.BinaryLength)
+    $effectiveReadBytes = [byte[]]::new($effectiveReadDescriptor.BinaryLength)
+    $effectiveWriteDescriptor.GetBinaryForm($effectiveWriteBytes, 0)
+    $effectiveReadDescriptor.GetBinaryForm($effectiveReadBytes, 0)
+    Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveWriteBytes)) `
+        'Authz effective-access regression did not detect direct token write access.'
+    Assert-True (-not [Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveReadBytes)) `
+        'Authz effective-access regression treated read access as write access.'
+    if ($currentGroups.Count -gt 0) {
+        $groupSddl = "D:P(A;;0x120116;;;$($currentGroups[0]))"
+        $groupDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($groupSddl)
+        $groupBytes = [byte[]]::new($groupDescriptor.BinaryLength)
+        $groupDescriptor.GetBinaryForm($groupBytes, 0)
+        Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $groupBytes)) `
+            'Authz effective-access regression did not honor a token group write grant.'
+    }
+
+    $raceTrusted = Join-Path $root 'handle-race-trusted'
+    $raceParent = Join-Path $raceTrusted 'parent'
+    $raceMoved = Join-Path $raceTrusted 'parent-moved'
+    $raceOutside = Join-Path $root 'handle-race-outside'
+    New-Item -ItemType Directory -Path $raceParent, $raceOutside -Force | Out-Null
+    $raceSource = Join-Path $raceTrusted 'race-source.xlsx'
+    [IO.File]::WriteAllText($raceSource, 'race-source')
+    $raceStop = [Threading.ManualResetEventSlim]::new($false)
+    $raceAction = {
+        while (-not $raceStop.IsSet) {
+            try {
+                if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
+                    [IO.Directory]::Move($raceParent, $raceMoved)
+                }
+                if (-not [IO.Directory]::Exists($raceParent)) {
+                    New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
+                }
+                Start-Sleep -Milliseconds 1
+                if ([IO.Directory]::Exists($raceParent) -and
+                    (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                    Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+                }
+                if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+                    [IO.Directory]::Move($raceMoved, $raceParent)
+                }
+            }
+            catch { }
+        }
+    }.GetNewClosure()
+    $raceThread = [Threading.Thread]::new([Threading.ThreadStart]$raceAction)
+    $raceThread.Start()
+    try {
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            try {
+                Ensure-HerdrManagedDirectory -Path (Join-Path $raceParent ("created-{0:d2}" -f $attempt)) `
+                    -TrustedRoot $raceTrusted -Description 'concurrent create race' | Out-Null
+            }
+            catch { }
+            try {
+                Copy-HerdrFileExclusive -SourcePath $raceSource `
+                    -DestinationPath (Join-Path $raceParent ("copy-{0:d2}.xlsx" -f $attempt)) `
+                    -TrustedRoot $raceTrusted -TrustedDestinationRoot $raceTrusted | Out-Null
+            }
+            catch { }
+        }
+    }
+    finally {
+        $raceStop.Set()
+        if (-not $raceThread.Join(10000)) { throw 'The concurrent ancestor substitution race did not stop.' }
+    }
+    if ([IO.Directory]::Exists($raceParent) -and
+        (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+    }
+    if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+        [IO.Directory]::Move($raceMoved, $raceParent)
+    }
+    Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
+        'Handle-relative create/copy race wrote outside the trusted root.'
+
+    $cleanupCollision = Join-Path $raceParent 'cleanup-collision.json'
+    [IO.File]::WriteAllText($cleanupCollision, '{}')
+    $raceStop.Reset()
+    $cleanupRaceThread = [Threading.Thread]::new([Threading.ThreadStart]$raceAction)
+    $cleanupRaceThread.Start()
+    $cleanupError = $null
+    try {
+        Write-HerdrAtomicText -Path $cleanupCollision -Content '{"safe":true}' -TrustedRoot $raceTrusted | Out-Null
+    }
+    catch { $cleanupError = $_.Exception }
+    finally {
+        $raceStop.Set()
+        if (-not $cleanupRaceThread.Join(10000)) { throw 'The concurrent cleanup substitution race did not stop.' }
+    }
+    if ([IO.Directory]::Exists($raceParent) -and
+        (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+    }
+    if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+        [IO.Directory]::Move($raceMoved, $raceParent)
+    }
+    Assert-True ($null -ne $cleanupError) 'Handle-relative cleanup race accepted an output collision.'
+    Assert-True (@(Get-ChildItem -LiteralPath $raceTrusted -Recurse -Force -File -Filter '.herdr-text-*.tmp' -ErrorAction SilentlyContinue).Count -eq 0) `
+        'Handle-relative atomic-text cleanup left a temporary file.'
+
     $fixture = New-IntegrationFixture -Inbox $inbox -OneDriveOutbox $oneDriveOutbox -OneDriveArchive $oneDriveArchive `
         -Exchange $exchange -ReviewJobs $reviewJobs -Tools $tools -Number 1
     $sourceTamper = New-IntegrationFixture -Inbox $inbox -OneDriveOutbox $oneDriveOutbox -OneDriveArchive $oneDriveArchive `

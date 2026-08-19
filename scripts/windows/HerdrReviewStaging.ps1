@@ -7,6 +7,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
+using System.IO;
 
 namespace Herdr.Security {
     public sealed class FileIdentity {
@@ -18,10 +19,27 @@ namespace Herdr.Security {
 
     public static class NativeMethods {
         public const uint GenericRead = 0x80000000;
+        public const uint GenericWrite = 0x40000000;
+        public const uint DeleteAccess = 0x00010000;
+        public const uint WriteDac = 0x00040000;
+        public const uint WriteOwner = 0x00080000;
+        public const uint FileDeleteChild = 0x00000040;
+        public const uint FileListDirectory = 0x00000001;
+        public const uint FileAddSubdirectory = 0x00000004;
+        public const uint FileTraverse = 0x00000020;
         public const uint FileReadAttributes = 0x00000080;
+        public const uint Synchronize = 0x00100000;
         public const uint FileShareRead = 0x00000001;
         public const uint FileShareWrite = 0x00000002;
         public const uint FileShareDelete = 0x00000004;
+        public const uint FileCreate = 2;
+        public const uint FileOpen = 1;
+        public const uint FileOpenIf = 3;
+        public const uint FileDirectoryFile = 0x00000001;
+        public const uint FileNonDirectoryFile = 0x00000040;
+        public const uint FileSynchronousIoNonalert = 0x00000020;
+        public const uint FileDeleteOnClose = 0x00001000;
+        public const uint ObjectAttributesCaseInsensitive = 0x00000040;
         public const uint OpenExisting = 3;
         public const uint FileFlagOpenReparsePoint = 0x00200000;
         public const uint FileFlagBackupSemantics = 0x02000000;
@@ -31,6 +49,9 @@ namespace Herdr.Security {
         public const uint ProcessQueryLimitedInformation = 0x1000;
         public const uint TokenQuery = 0x0008;
         public const int TokenUser = 1;
+        private const int FileRenameInformation = 3;
+        private const int FileDispositionInformation = 4;
+        private const uint FileGenericWrite = 0x00120116;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct ByHandleFileInformation {
@@ -49,6 +70,52 @@ namespace Herdr.Security {
             public uint FileIndexLow;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UnicodeString {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ObjectAttributes {
+            public int Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoStatusBlock {
+            public IntPtr Status;
+            public IntPtr Information;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AuthzAccessRequest {
+            public uint DesiredAccess;
+            public IntPtr PrincipalSelfSid;
+            public IntPtr ObjectTypeList;
+            public uint ObjectTypeListLength;
+            public IntPtr OptionalArguments;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AuthzAccessReply {
+            public uint ResultListLength;
+            public IntPtr GrantedAccessMask;
+            public IntPtr SaclEvaluationResults;
+            public IntPtr Error;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Luid {
+            public uint LowPart;
+            public int HighPart;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateFileW(
             string fileName,
@@ -63,6 +130,13 @@ namespace Herdr.Security {
         private static extern bool GetFileInformationByHandle(
             IntPtr fileHandle,
             out ByHandleFileInformation fileInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(
+            IntPtr fileHandle,
+            int fileInformationClass,
+            IntPtr fileInformation,
+            uint bufferSize);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetFinalPathNameByHandleW(
@@ -94,6 +168,60 @@ namespace Herdr.Security {
             int tokenInformationLength,
             out int returnLength);
 
+        [DllImport("ntdll.dll")]
+        private static extern int NtCreateFile(
+            out IntPtr fileHandle,
+            uint desiredAccess,
+            ref ObjectAttributes objectAttributes,
+            out IoStatusBlock ioStatusBlock,
+            IntPtr allocationSize,
+            uint fileAttributes,
+            uint shareAccess,
+            uint createDisposition,
+            uint createOptions,
+            IntPtr eaBuffer,
+            uint eaLength);
+
+        [DllImport("ntdll.dll")]
+        private static extern uint RtlNtStatusToDosError(int status);
+
+        [DllImport("authz.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool AuthzInitializeResourceManager(
+            uint flags,
+            IntPtr accessCheck,
+            IntPtr computeDynamicGroups,
+            IntPtr getCentralAccessPolicy,
+            string resourceManagerName,
+            out IntPtr resourceManager);
+
+        [DllImport("authz.dll", SetLastError = true)]
+        private static extern bool AuthzInitializeContextFromSid(
+            uint flags,
+            IntPtr userSid,
+            IntPtr resourceManager,
+            IntPtr expirationTime,
+            Luid identifier,
+            IntPtr dynamicGroupArgs,
+            out IntPtr clientContext);
+
+        [DllImport("authz.dll", SetLastError = true)]
+        private static extern bool AuthzAccessCheck(
+            uint flags,
+            IntPtr clientContext,
+            ref AuthzAccessRequest accessRequest,
+            IntPtr auditEventType,
+            IntPtr securityDescriptor,
+            IntPtr optionalSecurityDescriptorArray,
+            uint optionalSecurityDescriptorCount,
+            ref AuthzAccessReply accessReply,
+            IntPtr accessCheckResults);
+
+        [DllImport("authz.dll", SetLastError = true)]
+        private static extern bool AuthzFreeContext(IntPtr clientContext);
+
+        [DllImport("authz.dll", SetLastError = true)]
+        private static extern bool AuthzFreeResourceManager(IntPtr resourceManager);
+
         public static IntPtr OpenPath(string path, bool directory, bool exclusive) {
             uint desiredAccess = directory ? FileReadAttributes : GenericRead;
             uint shareMode = exclusive ? 0u : FileShareRead | FileShareWrite | FileShareDelete;
@@ -104,6 +232,224 @@ namespace Herdr.Security {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
             return handle;
+        }
+
+        private static void ThrowNtStatus(int status, string operation) {
+            if (status >= 0) return;
+            uint error = RtlNtStatusToDosError(status);
+            throw new Win32Exception(unchecked((int)error), operation + " failed");
+        }
+
+        private static void ValidateRelativeName(string name) {
+            if (String.IsNullOrWhiteSpace(name) || name == "." || name == ".." ||
+                name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0) {
+                throw new ArgumentException("A relative operation requires one path component.", "name");
+            }
+        }
+
+        private static IntPtr OpenRelative(
+            IntPtr parentHandle,
+            string name,
+            uint desiredAccess,
+            uint shareAccess,
+            uint createDisposition,
+            uint createOptions) {
+            if (parentHandle == IntPtr.Zero || parentHandle.ToInt64() == -1) {
+                throw new ArgumentException("A valid parent directory handle is required.", "parentHandle");
+            }
+            ValidateRelativeName(name);
+            IntPtr nameBuffer = Marshal.StringToHGlobalUni(name);
+            IntPtr objectName = IntPtr.Zero;
+            try {
+                var unicodeName = new UnicodeString {
+                    Length = checked((ushort)(name.Length * 2)),
+                    MaximumLength = checked((ushort)(name.Length * 2 + 2)),
+                    Buffer = nameBuffer
+                };
+                objectName = Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
+                Marshal.StructureToPtr(unicodeName, objectName, false);
+                var attributes = new ObjectAttributes {
+                    Length = Marshal.SizeOf<ObjectAttributes>(),
+                    RootDirectory = parentHandle,
+                    ObjectName = objectName,
+                    Attributes = ObjectAttributesCaseInsensitive,
+                    SecurityDescriptor = IntPtr.Zero,
+                    SecurityQualityOfService = IntPtr.Zero
+                };
+                IntPtr handle;
+                IoStatusBlock ioStatus;
+                int status = NtCreateFile(
+                    out handle,
+                    desiredAccess,
+                    ref attributes,
+                    out ioStatus,
+                    IntPtr.Zero,
+                    0,
+                    shareAccess,
+                    createDisposition,
+                    createOptions,
+                    IntPtr.Zero,
+                    0);
+                ThrowNtStatus(status, "Relative path operation");
+                return handle;
+            }
+            finally {
+                if (objectName != IntPtr.Zero) Marshal.FreeHGlobal(objectName);
+                Marshal.FreeHGlobal(nameBuffer);
+            }
+        }
+
+        public static IntPtr OpenDirectoryForRelative(string path) {
+            uint access = FileListDirectory | FileAddSubdirectory | FileTraverse | FileReadAttributes | Synchronize;
+            uint flags = FileFlagOpenReparsePoint | FileFlagBackupSemantics;
+            IntPtr handle = CreateFileW(
+                path,
+                access,
+                FileShareRead | FileShareWrite,
+                IntPtr.Zero,
+                OpenExisting,
+                flags,
+                IntPtr.Zero);
+            if (handle == IntPtr.Zero || handle.ToInt64() == -1) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Opening a relative-operation root failed");
+            }
+            return handle;
+        }
+
+        public static IntPtr OpenDirectoryRelative(IntPtr parentHandle, string name, bool createIfMissing) {
+            uint access = FileListDirectory | FileAddSubdirectory | FileTraverse | FileReadAttributes | Synchronize;
+            uint options = FileDirectoryFile | FileSynchronousIoNonalert | FileFlagOpenReparsePoint;
+            return OpenRelative(parentHandle, name, access, FileShareRead | FileShareWrite,
+                createIfMissing ? FileOpenIf : FileOpen, options);
+        }
+
+        public static IntPtr CreateDirectoryRelative(IntPtr parentHandle, string name) {
+            uint access = FileListDirectory | FileAddSubdirectory | FileTraverse | FileReadAttributes | Synchronize;
+            uint options = FileDirectoryFile | FileSynchronousIoNonalert | FileFlagOpenReparsePoint;
+            return OpenRelative(parentHandle, name, access, FileShareRead | FileShareWrite, FileCreate, options);
+        }
+
+        public static IntPtr CreateFileRelative(IntPtr parentHandle, string name) {
+            uint access = GenericWrite | DeleteAccess | Synchronize;
+            uint options = FileNonDirectoryFile | FileSynchronousIoNonalert | FileFlagOpenReparsePoint;
+            return OpenRelative(parentHandle, name, access, 0, FileCreate, options);
+        }
+
+        public static void RenameFileRelative(IntPtr fileHandle, IntPtr destinationParentHandle, string destinationName) {
+            if (fileHandle == IntPtr.Zero || fileHandle.ToInt64() == -1) {
+                throw new ArgumentException("A valid file handle is required.", "fileHandle");
+            }
+            if (destinationParentHandle == IntPtr.Zero || destinationParentHandle.ToInt64() == -1) {
+                throw new ArgumentException("A valid destination directory handle is required.", "destinationParentHandle");
+            }
+            ValidateRelativeName(destinationName);
+            int nameBytes = checked(destinationName.Length * 2);
+            int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+            int lengthOffset = rootOffset + IntPtr.Size;
+            int nameOffset = lengthOffset + 4;
+            IntPtr buffer = Marshal.AllocHGlobal(nameOffset + nameBytes);
+            IntPtr nameBuffer = Marshal.StringToHGlobalUni(destinationName);
+            try {
+                for (int index = 0; index < nameOffset + nameBytes; index++) Marshal.WriteByte(buffer, index, 0);
+                Marshal.WriteIntPtr(buffer, rootOffset, destinationParentHandle);
+                Marshal.WriteInt32(buffer, lengthOffset, nameBytes);
+                byte[] nameBytesArray = new byte[nameBytes];
+                Marshal.Copy(nameBuffer, nameBytesArray, 0, nameBytes);
+                Marshal.Copy(nameBytesArray, 0, IntPtr.Add(buffer, nameOffset), nameBytes);
+                if (!SetFileInformationByHandle(fileHandle, FileRenameInformation, buffer, (uint)(nameOffset + nameBytes))) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Handle-relative rename failed");
+                }
+            }
+            finally {
+                Marshal.FreeHGlobal(nameBuffer);
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        public static void DeleteRelative(IntPtr parentHandle, string name, bool directory) {
+            uint access = DeleteAccess | Synchronize | (directory ? FileListDirectory | FileReadAttributes : 0u);
+            uint options = (directory ? FileDirectoryFile : FileNonDirectoryFile) |
+                FileSynchronousIoNonalert | FileFlagOpenReparsePoint;
+            IntPtr handle = OpenRelative(parentHandle, name, access,
+                FileShareRead | FileShareWrite | FileShareDelete, FileOpen, options);
+            try {
+                IntPtr disposition = Marshal.AllocHGlobal(1);
+                try {
+                    Marshal.WriteByte(disposition, 0, 1);
+                    if (!SetFileInformationByHandle(handle, FileDispositionInformation, disposition, 1)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Handle-relative delete failed");
+                    }
+                }
+                finally {
+                    Marshal.FreeHGlobal(disposition);
+                }
+            }
+            finally {
+                CloseHandle(handle);
+            }
+        }
+
+        public static bool HasEffectiveWriteAccess(string userSid, byte[] securityDescriptor) {
+            if (String.IsNullOrWhiteSpace(userSid)) throw new ArgumentException("A user SID is required.", "userSid");
+            if (securityDescriptor == null || securityDescriptor.Length == 0) throw new ArgumentException("A security descriptor is required.", "securityDescriptor");
+            var sid = new SecurityIdentifier(userSid);
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+            GCHandle sidPin = GCHandle.Alloc(sidBytes, GCHandleType.Pinned);
+            GCHandle descriptorPin = GCHandle.Alloc(securityDescriptor, GCHandleType.Pinned);
+            IntPtr resourceManager = IntPtr.Zero;
+            IntPtr clientContext = IntPtr.Zero;
+            IntPtr granted = IntPtr.Zero;
+            IntPtr saclResults = IntPtr.Zero;
+            IntPtr errors = IntPtr.Zero;
+            try {
+                if (!AuthzInitializeResourceManager(0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                    "HerdrBridge effective access", out resourceManager)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Authz resource manager initialization failed");
+                }
+                if (!AuthzInitializeContextFromSid(0, sidPin.AddrOfPinnedObject(), resourceManager,
+                    IntPtr.Zero, new Luid(), IntPtr.Zero, out clientContext)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Authz bridge context initialization failed");
+                }
+                uint writeMask = FileGenericWrite | DeleteAccess | WriteDac | WriteOwner | FileDeleteChild;
+                var request = new AuthzAccessRequest {
+                    DesiredAccess = writeMask,
+                    PrincipalSelfSid = IntPtr.Zero,
+                    ObjectTypeList = IntPtr.Zero,
+                    ObjectTypeListLength = 0,
+                    OptionalArguments = IntPtr.Zero
+                };
+                granted = Marshal.AllocHGlobal(sizeof(uint));
+                saclResults = Marshal.AllocHGlobal(sizeof(uint));
+                errors = Marshal.AllocHGlobal(sizeof(uint));
+                Marshal.WriteInt32(granted, 0);
+                Marshal.WriteInt32(saclResults, 0);
+                Marshal.WriteInt32(errors, 0);
+                var reply = new AuthzAccessReply {
+                    ResultListLength = 1,
+                    GrantedAccessMask = granted,
+                    SaclEvaluationResults = saclResults,
+                    Error = errors
+                };
+                bool checkedAccess = AuthzAccessCheck(0, clientContext, ref request, IntPtr.Zero,
+                    descriptorPin.AddrOfPinnedObject(), IntPtr.Zero, 0, ref reply, IntPtr.Zero);
+                int apiError = checkedAccess ? 0 : Marshal.GetLastWin32Error();
+                int resultError = Marshal.ReadInt32(errors);
+                if (!checkedAccess && apiError != 5 && resultError != 5) {
+                    throw new Win32Exception(apiError, "Authz effective access evaluation failed");
+                }
+                uint grantedMask = unchecked((uint)Marshal.ReadInt32(granted));
+                return (grantedMask & writeMask) != 0;
+            }
+            finally {
+                if (errors != IntPtr.Zero) Marshal.FreeHGlobal(errors);
+                if (saclResults != IntPtr.Zero) Marshal.FreeHGlobal(saclResults);
+                if (granted != IntPtr.Zero) Marshal.FreeHGlobal(granted);
+                if (clientContext != IntPtr.Zero) AuthzFreeContext(clientContext);
+                if (resourceManager != IntPtr.Zero) AuthzFreeResourceManager(resourceManager);
+                descriptorPin.Free();
+                sidPin.Free();
+            }
         }
 
         public static FileIdentity ReadFileIdentity(IntPtr handle) {
@@ -422,11 +768,27 @@ function Ensure-HerdrManagedDirectory {
     param(
         [Parameter(Mandatory)][string]$Path,
         [string]$TrustedRoot,
-        [string]$Description = 'Managed directory'
+        [string]$Description = 'Managed directory',
+        [switch]$RequireLeafCreation
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
     $trustedRootCanonical = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) { $null } else { Get-HerdrCanonicalPath -Path $TrustedRoot }
+    if ($IsWindows) {
+        $operationRoot = if ($null -eq $trustedRootCanonical) { [IO.Path]::GetPathRoot($canonical) } else { $trustedRootCanonical }
+        $chain = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $canonical `
+            -CreateMissing -RequireLeafCreation:$RequireLeafCreation -Description $Description
+        try {
+            $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity($chain.SafeHandle.DangerousGetHandle())
+            if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
+                throw "$Description is a reparse point: '$canonical'."
+            }
+            return $canonical
+        }
+        finally {
+            $chain.SafeHandle.Dispose()
+        }
+    }
     $trustedRootProof = if ($null -eq $trustedRootCanonical) { $null } else { Get-HerdrPhysicalPathProof -Path $trustedRootCanonical }
     foreach ($component in @(Get-HerdrPathComponents -Path $canonical)) {
         $componentPath = [string]$component
@@ -676,6 +1038,161 @@ function Open-HerdrNativeReadFile {
     }
 }
 
+function Get-HerdrRelativeChildNames {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RootPath,
+        [Parameter(Mandatory)][string]$TargetPath
+    )
+
+    $rootComponents = @(Get-HerdrPathComponents -Path $RootPath)
+    $targetComponents = @(Get-HerdrPathComponents -Path $TargetPath)
+    if ($targetComponents.Count -lt $rootComponents.Count) {
+        throw "Target path is outside the trusted root: '$TargetPath'."
+    }
+    for ($index = 0; $index -lt $rootComponents.Count; $index++) {
+        if (-not ([string]$targetComponents[$index]).Equals([string]$rootComponents[$index], [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Target path is outside the trusted root: '$TargetPath'."
+        }
+    }
+    $names = [Collections.Generic.List[string]]::new()
+    for ($index = $rootComponents.Count; $index -lt $targetComponents.Count; $index++) {
+        $name = [IO.Path]::GetFileName([string]$targetComponents[$index])
+        if ([string]::IsNullOrWhiteSpace($name)) { throw "Target path contains an invalid relative component: '$TargetPath'." }
+        $null = $names.Add($name)
+    }
+    return @($names)
+}
+
+function Open-HerdrNativeDirectoryChain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RootPath,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [switch]$CreateMissing,
+        [switch]$RequireLeafCreation,
+        [string]$Description = 'Directory'
+    )
+
+    if (-not $IsWindows) { throw 'Handle-relative directory operations are Windows-only.' }
+    $root = Get-HerdrCanonicalPath -Path $RootPath
+    $target = Get-HerdrCanonicalPath -Path $TargetPath
+    if (-not (Test-HerdrPathSameOrDescendant -Candidate $target -Ancestor $root)) {
+        throw "$Description is outside the trusted root: '$target'."
+    }
+    $rootProof = Get-HerdrPhysicalPathProof -Path $root
+    if (-not $rootProof.Exists -or -not $rootProof.Leaf.IsDirectory) { throw "$Description root is not a directory: '$root'." }
+    $current = $null
+    $rawHandle = [IntPtr]::Zero
+    try {
+        $rawHandle = [Herdr.Security.NativeMethods]::OpenDirectoryForRelative($root)
+        $current = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true)
+        $rawHandle = [IntPtr]::Zero
+        $rootNative = [Herdr.Security.NativeMethods]::ReadFileIdentity($current.DangerousGetHandle())
+        if (($rootNative.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
+            throw "$Description root is a reparse point: '$root'."
+        }
+        $rootIdentity = [pscustomobject][ordered]@{
+            Exists = $true
+            IsDirectory = $true
+            Attributes = [int64]$rootNative.Attributes
+            VolumeSerialNumber = [uint64]$rootNative.VolumeSerialNumber
+            FileIndex = [uint64]$rootNative.FileIndex
+            NumberOfLinks = [uint64]$rootNative.NumberOfLinks
+            FileIdentity = '{0:x8}:{1:x16}' -f $rootNative.VolumeSerialNumber, $rootNative.FileIndex
+        }
+        Compare-HerdrPhysicalIdentity -Expected $rootProof.Leaf -Actual $rootIdentity -Description "$Description root" -IncludeLinkCount | Out-Null
+        $childNames = @(Get-HerdrRelativeChildNames -RootPath $root -TargetPath $target)
+        for ($childIndex = 0; $childIndex -lt $childNames.Count; $childIndex++) {
+            $name = [string]$childNames[$childIndex]
+            $isRequiredLeaf = $CreateMissing.IsPresent -and $RequireLeafCreation.IsPresent -and
+                $childIndex -eq ($childNames.Count - 1)
+            $childRaw = if ($isRequiredLeaf) {
+                [Herdr.Security.NativeMethods]::CreateDirectoryRelative($current.DangerousGetHandle(), $name)
+            }
+            else {
+                [Herdr.Security.NativeMethods]::OpenDirectoryRelative($current.DangerousGetHandle(), $name, $CreateMissing.IsPresent)
+            }
+            $child = $null
+            try {
+                $child = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($childRaw, $true)
+                $childRaw = [IntPtr]::Zero
+                $childIdentity = [Herdr.Security.NativeMethods]::ReadFileIdentity($child.DangerousGetHandle())
+                if (($childIdentity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
+                    throw "$Description contains a reparse point: '$name'."
+                }
+                $current.Dispose()
+                $current = $child
+                $child = $null
+            }
+            finally {
+                if ($null -ne $child) { $child.Dispose() }
+                if ($childRaw -ne [IntPtr]::Zero -and $childRaw.ToInt64() -ne -1) {
+                    [void][Herdr.Security.NativeMethods]::CloseHandle($childRaw)
+                }
+            }
+        }
+        [pscustomobject][ordered]@{
+            Path = $target
+            SafeHandle = $current
+            RootIdentity = $rootIdentity
+        }
+        $current = $null
+    }
+    catch {
+        throw "$Description could not be opened with handle-relative no-follow semantics: $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $current) { $current.Dispose() }
+        if ($rawHandle -ne [IntPtr]::Zero -and $rawHandle.ToInt64() -ne -1) {
+            [void][Herdr.Security.NativeMethods]::CloseHandle($rawHandle)
+        }
+    }
+}
+
+function Remove-HerdrNativeRelativeEntry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TrustedRoot,
+        [switch]$Directory
+    )
+
+    if (-not $IsWindows) { throw 'Handle-relative cleanup is Windows-only.' }
+    $canonical = Get-HerdrCanonicalPath -Path $Path
+    $parent = Split-Path -Parent $canonical
+    $leaf = Split-Path -Leaf $canonical
+    $parentHandle = Open-HerdrNativeDirectoryChain -RootPath $TrustedRoot -TargetPath $parent -Description 'Cleanup parent'
+    try {
+        [Herdr.Security.NativeMethods]::DeleteRelative($parentHandle.SafeHandle.DangerousGetHandle(), $leaf, $Directory.IsPresent)
+    }
+    catch [System.ComponentModel.Win32Exception] {
+        if ($_.Exception.NativeErrorCode -notin @(2, 3, 53, 145)) { throw }
+    }
+    finally {
+        if ($null -ne $parentHandle -and $null -ne $parentHandle.SafeHandle) { $parentHandle.SafeHandle.Dispose() }
+    }
+}
+
+function Remove-HerdrManagedTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TrustedRoot,
+        [string[]]$KnownFileNames = @()
+    )
+
+    $canonical = Get-HerdrCanonicalPath -Path $Path
+    if (-not $IsWindows) {
+        if (Test-Path -LiteralPath $canonical) { Remove-Item -LiteralPath $canonical -Recurse -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    foreach ($name in @($KnownFileNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        Remove-HerdrNativeRelativeEntry -Path (Join-Path $canonical $name) -TrustedRoot $TrustedRoot
+    }
+    Remove-HerdrNativeRelativeEntry -Path $canonical -TrustedRoot $TrustedRoot -Directory
+}
+
 function ConvertTo-HerdrSha256 {
     [CmdletBinding()]
     param([Parameter(Mandatory)][byte[]]$Bytes)
@@ -796,6 +1313,97 @@ function Assert-HerdrSnapshotContentEqual {
     }
 }
 
+function Copy-HerdrNativeFileExclusive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [string]$TrustedRoot,
+        [object]$ExpectedSourceIdentity,
+        [string]$TrustedDestinationRoot
+    )
+
+    $source = Get-HerdrCanonicalPath -Path $SourcePath
+    $destination = Get-HerdrCanonicalPath -Path $DestinationPath
+    $parent = Split-Path -Parent $destination
+    $destinationName = Split-Path -Leaf $destination
+    $operationRoot = if ([string]::IsNullOrWhiteSpace($TrustedDestinationRoot)) {
+        [IO.Path]::GetPathRoot($parent)
+    }
+    else {
+        Get-HerdrCanonicalPath -Path $TrustedDestinationRoot
+    }
+    $destinationParent = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $parent `
+        -Description 'Copy destination parent'
+    $temporaryName = '.herdr-copy-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $sourceStream = $null
+    $destinationStream = $null
+    $opened = $null
+    $destinationHandle = $null
+    $committed = $false
+    $failure = $null
+    $sourceIdentity = $null
+    try {
+        $opened = Open-HerdrNativeReadFile -Path $source
+        $sourceIdentity = $opened.Identity
+        if ($null -ne $ExpectedSourceIdentity) {
+            Compare-HerdrPhysicalIdentity -Expected $ExpectedSourceIdentity -Actual $sourceIdentity `
+                -Description 'Copy source' -IncludeLinkCount | Out-Null
+        }
+        $sourceStream = [IO.FileStream]::new($opened.SafeHandle, [IO.FileAccess]::Read, 1048576, $false)
+        $rawDestination = [Herdr.Security.NativeMethods]::CreateFileRelative(
+            $destinationParent.SafeHandle.DangerousGetHandle(), $temporaryName)
+        $destinationHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawDestination, $true)
+        $destinationStream = [IO.FileStream]::new($destinationHandle, [IO.FileAccess]::Write, 1048576, $false)
+        $sourceStream.CopyTo($destinationStream, 1048576)
+        $destinationStream.Flush($true)
+        [Herdr.Security.NativeMethods]::RenameFileRelative(
+            $destinationHandle.DangerousGetHandle(),
+            $destinationParent.SafeHandle.DangerousGetHandle(),
+            $destinationName)
+        $committed = $true
+    }
+    catch {
+        $failure = $_.Exception
+    }
+    finally {
+        if ($null -ne $destinationStream) { $destinationStream.Dispose() }
+        if ($null -ne $destinationHandle -and -not $destinationHandle.IsClosed) { $destinationHandle.Dispose() }
+        if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+        if ($null -ne $opened -and $null -ne $opened.SafeHandle -and -not $opened.SafeHandle.IsClosed) { $opened.SafeHandle.Dispose() }
+    }
+    if (-not $committed) {
+        try {
+            [Herdr.Security.NativeMethods]::DeleteRelative(
+                $destinationParent.SafeHandle.DangerousGetHandle(), $temporaryName, $false)
+        }
+        catch [System.ComponentModel.Win32Exception] {
+            if ($_.Exception.NativeErrorCode -notin @(2, 3, 53)) { $failure = $_.Exception }
+        }
+        finally {
+            $destinationParent.SafeHandle.Dispose()
+        }
+        if ($null -ne $failure) { throw "Exclusive workbook copy failed: $($failure.Message)" }
+        throw 'Exclusive workbook copy failed.'
+    }
+    $destinationParent.SafeHandle.Dispose()
+    if ($null -ne $sourceIdentity) {
+        $sourceAfter = Get-HerdrPhysicalPathProof -Path $source
+        Compare-HerdrPhysicalIdentity -Expected $sourceIdentity -Actual $sourceAfter.Leaf `
+            -Description 'Copy source after read' -IncludeLinkCount | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
+            Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
+                -ExpectedCandidate $sourceIdentity -Description 'Copy source boundary after read' | Out-Null
+        }
+    }
+    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination
+    if (-not $destinationProof.Exists -or $destinationProof.Leaf.IsDirectory -or
+        [int64]$destinationProof.Leaf.NumberOfLinks -gt 1) {
+        throw "Exclusive workbook copy produced an unsafe destination: '$destination'."
+    }
+    return $destination
+}
+
 function Copy-HerdrFileExclusive {
     [CmdletBinding()]
     param(
@@ -806,6 +1414,9 @@ function Copy-HerdrFileExclusive {
         [string]$TrustedDestinationRoot
     )
 
+    if ($IsWindows) {
+        return Copy-HerdrNativeFileExclusive @PSBoundParameters
+    }
     $source = Get-HerdrCanonicalPath -Path $SourcePath
     $destination = Get-HerdrCanonicalPath -Path $DestinationPath
     if (Test-Path -LiteralPath $destination) {
@@ -905,6 +1516,74 @@ function Copy-HerdrFileExclusive {
     return $destination
 }
 
+function Write-HerdrNativeAtomicText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Content,
+        [string]$TrustedRoot
+    )
+
+    $destination = Get-HerdrCanonicalPath -Path $Path
+    $parent = Split-Path -Parent $destination
+    $destinationName = Split-Path -Leaf $destination
+    $operationRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        [IO.Path]::GetPathRoot($parent)
+    }
+    else {
+        Get-HerdrCanonicalPath -Path $TrustedRoot
+    }
+    $destinationParent = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $parent `
+        -Description 'Atomic text destination parent'
+    $temporaryName = '.herdr-text-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $destinationStream = $null
+    $destinationHandle = $null
+    $committed = $false
+    $failure = $null
+    try {
+        $rawDestination = [Herdr.Security.NativeMethods]::CreateFileRelative(
+            $destinationParent.SafeHandle.DangerousGetHandle(), $temporaryName)
+        $destinationHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawDestination, $true)
+        $destinationStream = [IO.FileStream]::new($destinationHandle, [IO.FileAccess]::Write, 65536, $false)
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content)
+        $destinationStream.Write($bytes, 0, $bytes.Length)
+        $destinationStream.Flush($true)
+        [Herdr.Security.NativeMethods]::RenameFileRelative(
+            $destinationHandle.DangerousGetHandle(),
+            $destinationParent.SafeHandle.DangerousGetHandle(),
+            $destinationName)
+        $committed = $true
+    }
+    catch {
+        $failure = $_.Exception
+    }
+    finally {
+        if ($null -ne $destinationStream) { $destinationStream.Dispose() }
+        if ($null -ne $destinationHandle -and -not $destinationHandle.IsClosed) { $destinationHandle.Dispose() }
+    }
+    if (-not $committed) {
+        try {
+            [Herdr.Security.NativeMethods]::DeleteRelative(
+                $destinationParent.SafeHandle.DangerousGetHandle(), $temporaryName, $false)
+        }
+        catch [System.ComponentModel.Win32Exception] {
+            if ($_.Exception.NativeErrorCode -notin @(2, 3, 53)) { $failure = $_.Exception }
+        }
+        finally {
+            $destinationParent.SafeHandle.Dispose()
+        }
+        if ($null -ne $failure) { throw "Atomic text output could not be committed: $($failure.Message)" }
+        throw 'Atomic text output could not be committed.'
+    }
+    $destinationParent.SafeHandle.Dispose()
+    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination
+    if (-not $destinationProof.Exists -or $destinationProof.Leaf.IsDirectory -or
+        [int64]$destinationProof.Leaf.NumberOfLinks -gt 1) {
+        throw "Atomic text output is not a safe regular file: '$destination'."
+    }
+    return $destination
+}
+
 function Write-HerdrAtomicText {
     [CmdletBinding()]
     param(
@@ -913,6 +1592,9 @@ function Write-HerdrAtomicText {
         [string]$TrustedRoot
     )
 
+    if ($IsWindows) {
+        return Write-HerdrNativeAtomicText @PSBoundParameters
+    }
     $destination = Get-HerdrCanonicalPath -Path $Path
     if (Test-Path -LiteralPath $destination) { throw "Output already exists: '$destination'." }
     $parent = Split-Path -Parent $destination
@@ -1008,8 +1690,9 @@ function Invoke-HerdrReviewStaging {
     $stageRoot = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeRootCanonical 'in') `
         -TrustedRoot $exchangeRootCanonical -Description 'Exchange input root'
     $jobDirectory = Get-HerdrCanonicalPath -Path (Join-Path $stageRoot $JobId)
-    if (Test-Path -LiteralPath $jobDirectory) { throw "Staging collision for job '$JobId'." }
-    $jobDirectory = Ensure-HerdrManagedDirectory -Path $jobDirectory -TrustedRoot $stageRoot -Description 'Staging job directory'
+    if (-not $IsWindows -and (Test-Path -LiteralPath $jobDirectory)) { throw "Staging collision for job '$JobId'." }
+    $jobDirectory = Ensure-HerdrManagedDirectory -Path $jobDirectory -TrustedRoot $stageRoot `
+        -RequireLeafCreation -Description 'Staging job directory'
     $completed = $false
     try {
         $firstSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot
@@ -1088,8 +1771,14 @@ function Invoke-HerdrReviewStaging {
         }
     }
     finally {
-        if (-not $completed -and (Test-Path -LiteralPath $jobDirectory)) {
-            Remove-Item -LiteralPath $jobDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $completed) {
+            try {
+                Remove-HerdrManagedTree -Path $jobDirectory -TrustedRoot $stageRoot `
+                    -KnownFileNames @('input.xlsx', 'input.xlsm', 'input.xlsb', 'staging-provenance.json')
+            }
+            catch {
+                Write-Verbose "Safe staging cleanup did not remove '$jobDirectory': $($_.Exception.Message)"
+            }
         }
     }
 }

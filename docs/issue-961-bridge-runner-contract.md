@@ -19,9 +19,12 @@ reparse points (including every ancestor), Offline/Recall attributes, hard-linke
 sources, unstable exclusive reads, collisions, and source/stage size, hash, or
 physical file-identity mismatches. Windows production paths are proven through
 no-follow handles, final-handle paths, volume/file identities, and revalidation
-before and after read/copy/hash transitions. Destination parents are likewise
-tied to their trusted job root before commit and the committed leaf is re-proven
-afterward. It never deletes or moves the Inbox original.
+before and after read/copy/hash transitions. Managed-directory creation, temp
+file creation, atomic text output, atomic commit/rename, and failure cleanup are
+handle-relative to pinned no-follow directory handles; path checks are test-only
+seams on non-Windows hosts. Destination parents are likewise tied to their
+trusted job root before commit and the committed leaf is re-proven afterward.
+It never deletes or moves the Inbox original.
 
 ## Job schema
 
@@ -35,8 +38,9 @@ fields:
 
 The only operation is `recalculate`. Unknown fields, arbitrary input/output
 paths, PowerShell, commands, scripts, macros, and other operations are rejected.
-The runner re-hashes the canonical Inbox source and bridge stage, copies the
-accepted stage into protected `C:\HerdrReviewJobs\<job-id>`, and opens only that
+The runner re-hashes the canonical Inbox source and bridge stage, reads JSON
+through a supported `FileStream`-backed UTF-8 reader over the validated native
+handle, copies the accepted stage into protected `C:\HerdrReviewJobs\<job-id>`, and opens only that
 last-mile copy. The source and last-mile hashes are checked again after Excel
 and the result is copied into both `C:\HerdrExchange\out\<job-id>` for the
 Ubuntu bridge and the configured OneDrive `Outbox\<job-id>` for human review.
@@ -59,7 +63,8 @@ Production execution requires deployment configuration for
 `HERDR_DESIGNATED_INTERACTIVE_SESSION_ID`, and
 `HERDR_BRIDGE_ACCOUNT_SID`. The runner proves the current process, Explorer,
 and Excel owner/session against the first two values. The fixed local
-`HerdrBridge` account and its complete effective group membership are checked
-against the third value and are denied write access to every host-owned tools or
-review-jobs root. Test probes are available only behind the explicit hermetic
+`HerdrBridge` account is checked against the third value, then Windows Authz
+evaluates its complete token/effective group access against every host-owned
+tools or review-jobs root; any effective write grant is denied. Test probes are
+available only behind the explicit hermetic
 `-TestMode` seam; the production wrapper exposes no bridge-account override.

@@ -68,6 +68,24 @@ function New-TestJob {
 
 try {
     New-Item -ItemType Directory -Path $inbox, $oneDriveOutbox, $oneDriveArchive, $exchange, $reviewJobs, $tools -Force | Out-Null
+    $jsonReaderProbePath = Join-Path $root 'json-reader-probe.json'
+    [IO.File]::WriteAllText($jsonReaderProbePath, '{"schema":"probe"}', [Text.UTF8Encoding]::new($false))
+    $jsonReaderOwner = [IO.FileStream]::new($jsonReaderProbePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $jsonReaderBorrowedHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new(
+        $jsonReaderOwner.SafeFileHandle.DangerousGetHandle(), $false)
+    $jsonReaderStream = $null
+    $jsonReader = $null
+    try {
+        $jsonReaderStream = [IO.FileStream]::new($jsonReaderBorrowedHandle, [IO.FileAccess]::Read, 4096, $false)
+        $jsonReader = [IO.StreamReader]::new($jsonReaderStream, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $true)
+        Assert-True (($jsonReader.ReadToEnd()) -ceq '{"schema":"probe"}') 'The supported handle-backed JSON reader did not read the fixture.'
+    }
+    finally {
+        if ($null -ne $jsonReader) { $jsonReader.Dispose() }
+        if ($null -ne $jsonReaderStream) { $jsonReaderStream.Dispose() }
+        if ($null -ne $jsonReaderBorrowedHandle -and -not $jsonReaderBorrowedHandle.IsClosed) { $jsonReaderBorrowedHandle.Dispose() }
+        if ($null -ne $jsonReaderOwner) { $jsonReaderOwner.Dispose() }
+    }
     $success = New-TestJob
     $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
         -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
@@ -161,6 +179,8 @@ try {
     Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $safeReader -GroupSidReader $groups -TestMode | Out-Null
 
     $runnerText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1')
+    Assert-True ($runnerText.Contains('FileStream]::new($opened.SafeHandle', [StringComparison]::Ordinal)) 'The production JSON reader is not handle-backed through FileStream.'
+    Assert-True (-not $runnerText.Contains('StreamReader]::new($opened.SafeHandle', [StringComparison]::Ordinal)) 'The production JSON reader uses the unsupported SafeFileHandle StreamReader overload.'
     foreach ($required in @('AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'SaveCopyAs', 'canonical_workbook_mutated')) {
         Assert-True ($runnerText.Contains($required, [StringComparison]::Ordinal)) "Excel canary marker is missing: $required"
     }

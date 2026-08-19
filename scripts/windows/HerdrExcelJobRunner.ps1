@@ -54,6 +54,7 @@ function Read-HerdrJsonFile {
     )
 
     $opened = $null
+    $fileStream = $null
     $reader = $null
     $boundaryBefore = $null
     try {
@@ -70,7 +71,8 @@ function Read-HerdrJsonFile {
         if ($IsWindows) {
             $opened = Open-HerdrNativeReadFile -Path $Path
             Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $opened.Identity -Description 'JSON input before read' -IncludeLinkCount | Out-Null
-            $reader = [IO.StreamReader]::new($opened.SafeHandle, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $false)
+            $fileStream = [IO.FileStream]::new($opened.SafeHandle, [IO.FileAccess]::Read, 4096, $false)
+            $reader = [IO.StreamReader]::new($fileStream, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $true)
             $raw = $reader.ReadToEnd()
         }
         else {
@@ -89,6 +91,7 @@ function Read-HerdrJsonFile {
     }
     finally {
         if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $fileStream) { $fileStream.Dispose() }
         if ($null -ne $opened -and $null -ne $opened.SafeHandle -and -not $opened.SafeHandle.IsClosed) { $opened.SafeHandle.Dispose() }
     }
     if ($null -eq $value -or $value -is [Array] -or $value -isnot [pscustomobject]) {
@@ -455,7 +458,7 @@ function Resolve-HerdrIdentitySid {
     }
 }
 
-function Get-HerdrBridgeGroupSids {
+function Get-HerdrBridgeAccountSid {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ExpectedBridgeAccountSid)
 
@@ -466,31 +469,10 @@ function Get-HerdrBridgeGroupSids {
         if ($actualSid -cne $ExpectedBridgeAccountSid) {
             throw 'The fixed HerdrBridge account SID does not match deployment configuration.'
         }
-        $sids = [Collections.Generic.List[string]]::new()
-        $null = $sids.Add($actualSid)
-        $adsiUser = [ADSI]"WinNT://$env:COMPUTERNAME/HerdrBridge,user"
-        $groupsToVisit = [Collections.Generic.Queue[string]]::new()
-        foreach ($group in @($adsiUser.psbase.Invoke('Groups'))) {
-            $groupName = [string]$group.GetType().InvokeMember('Name', 'GetProperty', $null, $group, $null)
-            $sidBytes = $group.GetType().InvokeMember('objectSID', 'GetProperty', $null, $group, $null)
-            $null = $sids.Add(([Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0)).Value)
-            if (-not [string]::IsNullOrWhiteSpace($groupName)) { $groupsToVisit.Enqueue($groupName) }
-        }
-        $visitedGroups = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        while ($groupsToVisit.Count -gt 0) {
-            $groupName = $groupsToVisit.Dequeue()
-            if (-not $visitedGroups.Add($groupName)) { continue }
-            $members = @(Get-LocalGroupMember -Group $groupName -ErrorAction Stop)
-            foreach ($member in $members) {
-                $memberSid = Resolve-HerdrIdentitySid -IdentityReference $member.SID
-                $null = $sids.Add($memberSid)
-                if ([string]$member.ObjectClass -match 'Group') { $groupsToVisit.Enqueue([string]$member.Name) }
-            }
-        }
-        return @($sids | Select-Object -Unique)
+        return $actualSid
     }
     catch {
-        throw "Could not resolve the complete HerdrBridge effective group membership: $($_.Exception.Message)"
+        throw "Could not resolve the fixed HerdrBridge account SID: $($_.Exception.Message)"
     }
 }
 
@@ -524,6 +506,29 @@ function Assert-HerdrBridgeCannotWrite {
     if (($null -ne $AclReader -or $null -ne $GroupSidReader -or $null -ne $BridgeIdentityProbe) -and -not $TestMode) {
         throw 'Bridge identity and ACL probes are permitted only in explicit test mode.'
     }
+    if (-not $TestMode) {
+        if ([string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) { throw 'Expected HerdrBridge account SID is required.' }
+        $bridgeSid = Get-HerdrBridgeAccountSid -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid
+        foreach ($path in $Paths) {
+            $canonicalPath = Get-HerdrCanonicalPath -Path $path
+            if (-not (Test-Path -LiteralPath $canonicalPath -PathType Container)) {
+                throw "Host-owned path is missing: '$canonicalPath'."
+            }
+            try {
+                $acl = Get-Acl -LiteralPath $canonicalPath -ErrorAction Stop
+                if (-not $acl.AreAccessRulesProtected) { throw "Host-owned path inherits access rules: '$canonicalPath'." }
+                $securityDescriptor = $acl.GetSecurityDescriptorBinaryForm()
+                $hasEffectiveWrite = [Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($bridgeSid, $securityDescriptor)
+            }
+            catch {
+                throw "Host-owned effective access could not be evaluated: '$canonicalPath': $($_.Exception.Message)"
+            }
+            if ($hasEffectiveWrite) {
+                throw "Bridge account has effective write access to host-owned path '$canonicalPath'."
+            }
+        }
+        return $true
+    }
     $observedBridgeSid = $null
     if ($null -ne $BridgeIdentityProbe) {
         $identity = & $BridgeIdentityProbe
@@ -538,9 +543,9 @@ function Assert-HerdrBridgeCannotWrite {
     }
     else {
         if ([string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) { throw 'Expected HerdrBridge account SID is required.' }
-        @(Get-HerdrBridgeGroupSids -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid)
+        @($ExpectedBridgeAccountSid)
     }
-    $groupSids = @(@($groupSids) + @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') | Select-Object -Unique)
+    $groupSids = @(@($groupSids) | Select-Object -Unique)
     if ($groupSids.Count -eq 0) { throw 'Bridge account group membership is empty; refusing to continue.' }
     foreach ($path in $Paths) {
         $canonicalPath = Get-HerdrCanonicalPath -Path $path
@@ -893,9 +898,29 @@ function Invoke-HerdrExcelJob {
     }
     finally {
         if (-not $completed) {
-            if (Test-Path -LiteralPath $outboxJobPath) { Remove-Item -LiteralPath $outboxJobPath -Recurse -Force -ErrorAction SilentlyContinue }
-            if (Test-Path -LiteralPath $oneDriveOutboxJobPath) { Remove-Item -LiteralPath $oneDriveOutboxJobPath -Recurse -Force -ErrorAction SilentlyContinue }
-            if (Test-Path -LiteralPath $reviewJobPath) { Remove-Item -LiteralPath $reviewJobPath -Recurse -Force -ErrorAction SilentlyContinue }
+            foreach ($cleanup in @(
+                [pscustomobject]@{ Path = $outboxJobPath; Root = $outboxCanonical; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
+                [pscustomobject]@{ Path = $oneDriveOutboxJobPath; Root = $oneDriveOutboxCanonical; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
+                [pscustomobject]@{ Path = $reviewJobPath; Root = $reviewCanonical; Files = @('input.xlsx', 'input.xlsm', 'input.xlsb', 'result.xlsx', 'result.xlsm', 'result.xlsb') }
+            )) {
+                try {
+                    Remove-HerdrManagedTree -Path $cleanup.Path -TrustedRoot $cleanup.Root -KnownFileNames $cleanup.Files
+                }
+                catch {
+                    Write-Verbose "Safe runner cleanup did not remove '$($cleanup.Path)': $($_.Exception.Message)"
+                }
+            }
+            try {
+                if ($IsWindows) {
+                    Remove-HerdrNativeRelativeEntry -Path $logPath -TrustedRoot $jobLogsRoot
+                }
+                elseif (Test-Path -LiteralPath $logPath) {
+                    Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-Verbose "Safe runner log cleanup did not remove '$logPath': $($_.Exception.Message)"
+            }
         }
     }
 }
