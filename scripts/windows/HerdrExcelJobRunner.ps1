@@ -797,7 +797,7 @@ function Invoke-HerdrExcelJob {
     $runtimeConfiguration = $null
     if (-not $TestMode -or -not [string]::IsNullOrWhiteSpace($RuntimeConfigurationPath) -or
         -not [string]::IsNullOrWhiteSpace($env:HERDR_WINDOWS_REVIEW_CONFIG)) {
-        $runtimeConfiguration = Get-HerdrRuntimeConfiguration -Path $RuntimeConfigurationPath -TestMode:$TestMode
+        $runtimeConfiguration = Get-HerdrRuntimeConfiguration -Path $RuntimeConfigurationPath
         $providedPaths = @(
             [pscustomobject]@{ Name = 'exchange_root'; Provided = $ExchangeRoot; Configured = $runtimeConfiguration.ExchangeRoot },
             [pscustomobject]@{ Name = 'review_jobs_root'; Provided = $ReviewJobsRoot; Configured = $runtimeConfiguration.ReviewJobsRoot },
@@ -831,6 +831,8 @@ function Invoke-HerdrExcelJob {
         -ExpectedInteractiveSessionId $ExpectedInteractiveSessionId `
         -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid `
         -TestMode:$TestMode
+    $interactiveProbe = if ($null -ne $IdentityProbe) { $IdentityProbe } else { $InteractiveSessionProbe }
+    Assert-HerdrInteractiveIdentity -Configuration $identityConfiguration -TestMode:$TestMode -IdentityProbe $interactiveProbe | Out-Null
     if ($null -ne $runtimeConfiguration -and -not $TestMode) {
         Assert-HerdrBridgeCannotWrite -Paths @($runtimeConfiguration.ConfigurationPath) `
             -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid | Out-Null
@@ -882,8 +884,6 @@ function Invoke-HerdrExcelJob {
     if (Test-Path -LiteralPath $reviewJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Review-job collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $outboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Outbox collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $oneDriveOutboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "OneDrive Outbox collision for '$($job.JobId)'." }
-    $interactiveProbe = if ($null -ne $IdentityProbe) { $IdentityProbe } else { $InteractiveSessionProbe }
-    Assert-HerdrInteractiveIdentity -Configuration $identityConfiguration -TestMode:$TestMode -IdentityProbe $interactiveProbe | Out-Null
     if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical)
     }

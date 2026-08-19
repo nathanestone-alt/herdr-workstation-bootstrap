@@ -13,6 +13,56 @@ if (-not $fixtureText.Contains('RunspaceFactory', [StringComparison]::Ordinal) -
     -not $fixtureText.Contains('[PowerShell]::Create()', [StringComparison]::Ordinal)) {
     throw 'Mechanical race-fixture regression: the mutator must own an explicit PowerShell runspace.'
 }
+if (-not $fixtureText.Contains('[System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()', [StringComparison]::Ordinal)) {
+    throw 'Mechanical race-fixture regression: the PowerShell 7 RunspaceFactory type must be fully qualified.'
+}
+
+function Invoke-HerdrRunspaceRoundTrip {
+    $evidence = [Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
+    $runspace = $null
+    $powerShell = $null
+    try {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        [void]$evidence.TryAdd('runspace-opened', $true)
+        $powerShell = [PowerShell]::Create()
+        $powerShell.Runspace = $runspace
+        [void]$powerShell.AddScript('param($value) "round-trip:$value"')
+        [void]$powerShell.AddArgument('fixture')
+        $async = $powerShell.BeginInvoke()
+        [void]$evidence.TryAdd('begin-invoke-started', $true)
+        if (-not $async.AsyncWaitHandle.WaitOne(5000)) {
+            throw 'The platform-independent runspace round trip did not complete within the bounded timeout.'
+        }
+        $result = @($powerShell.EndInvoke($async))
+        [void]$evidence.TryAdd('end-invoke-completed', $true)
+        if ($result.Count -ne 1 -or [string]$result[0] -cne 'round-trip:fixture') {
+            throw "The platform-independent runspace round trip returned an unexpected result: '$($result -join ', ')'."
+        }
+        [void]$evidence.TryAdd('result-collected', $true)
+        if ($powerShell.Streams.Error.Count -gt 0) {
+            throw (($powerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join ' | ')
+        }
+    }
+    finally {
+        if ($null -ne $powerShell) {
+            $powerShell.Dispose()
+            [void]$evidence.TryAdd('powershell-disposed', $true)
+        }
+        if ($null -ne $runspace) {
+            $runspace.Dispose()
+            [void]$evidence.TryAdd('runspace-disposed', $true)
+        }
+    }
+    foreach ($requiredKey in @('runspace-opened', 'begin-invoke-started', 'end-invoke-completed', 'result-collected', 'powershell-disposed', 'runspace-disposed')) {
+        if (-not $evidence.ContainsKey($requiredKey)) {
+            throw "The platform-independent runspace round trip did not prove '$requiredKey'."
+        }
+    }
+}
+
+Invoke-HerdrRunspaceRoundTrip
+Write-Host 'PASS: platform-independent runspace round-trip regression passed.'
 Write-Host 'PASS: race-fixture execution mechanism is runspace-backed.'
 
 if (-not $IsWindows) {
@@ -49,11 +99,13 @@ function Start-HerdrRaceMutator {
         [Parameter(Mandatory)][string]$RaceOutside,
         [Parameter(Mandatory)][object]$RaceEvidence,
         [Parameter(Mandatory)][object]$RaceStop,
-        [Parameter(Mandatory)][object]$RaceErrors
+        [Parameter(Mandatory)][object]$RaceErrors,
+        [object]$RaceReady,
+        [object]$RaceRelease
     )
 
     $script = @'
-param($raceParent, $raceMoved, $raceOutside, $raceEvidence, $raceStop, $raceErrors)
+param($raceParent, $raceMoved, $raceOutside, $raceEvidence, $raceStop, $raceErrors, $raceReady, $raceRelease)
 [void]$raceEvidence.TryAdd('race-runspace-started', $true)
 for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++) {
     [void]$raceEvidence.TryAdd('race-cycle', $true)
@@ -65,6 +117,13 @@ for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++)
         if (-not [IO.Directory]::Exists($raceParent)) {
             New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
             [void]$raceEvidence.TryAdd('junction-created', $true)
+            if ($null -ne $raceReady) {
+                [void]$raceEvidence.TryAdd('race-junction-ready', $true)
+                [void]$raceReady.Set()
+                while ($null -ne $raceRelease -and -not $raceRelease.IsSet -and -not $raceStop.IsSet) {
+                    Start-Sleep -Milliseconds 1
+                }
+            }
         }
         Start-Sleep -Milliseconds 1
         if ([IO.Directory]::Exists($raceParent) -and
@@ -83,7 +142,7 @@ for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++)
     }
 }
 '@
-    $runspace = [Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $runspace.Open()
     $powerShell = [PowerShell]::Create()
     $powerShell.Runspace = $runspace
@@ -94,6 +153,8 @@ for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++)
     [void]$powerShell.AddArgument($RaceEvidence)
     [void]$powerShell.AddArgument($RaceStop)
     [void]$powerShell.AddArgument($RaceErrors)
+    [void]$powerShell.AddArgument($RaceReady)
+    [void]$powerShell.AddArgument($RaceRelease)
     $async = $powerShell.BeginInvoke()
     [pscustomobject]@{
         PowerShell = $powerShell
@@ -382,9 +443,7 @@ try {
     if ($null -ne $raceWorkerFailure) {
         throw "The ancestor/junction race worker failed: $($raceWorkerFailure.Message)"
     }
-    if ($raceErrors.Count -gt 0) {
-        throw "The ancestor/junction race worker reported an exception: $($raceErrors.ToArray()[0])"
-    }
+    $raceContentionDiagnostics = @($raceErrors.ToArray())
     $raceEvidenceKeys = @($raceEvidence.Keys)
     $raceMutationEvidence = @($raceEvidenceKeys | Where-Object {
         $_ -in @('parent-moved', 'junction-created', 'junction-removed', 'parent-restored')
@@ -393,7 +452,8 @@ try {
         "Ancestor/junction race did not execute the bounded operation set (attempts=$raceOperationAttempts)."
     Assert-True ($raceMutationEvidence.Count -gt 0) `
         ("Ancestor/junction race did not observe a bounded ancestor mutation; attempts={0}; successes={1}; " +
-         "race_evidence={2}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '))
+         "race_evidence={2}; contention={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '),
+         ($raceContentionDiagnostics -join ' | '))
     $raceControlSuccess = $false
     try {
         Ensure-HerdrManagedDirectory -Path (Join-Path $raceParent 'control-after-race') `
@@ -405,23 +465,44 @@ try {
     }
     Assert-True $raceControlSuccess `
         ("Ancestor/junction race control operation failed after parent restoration; attempts={0}; successes={1}; failures={2}; " +
-         "race_evidence={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
-         ($raceEvidenceKeys -join ', '))
+         "race_evidence={3}; contention={4}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
+         ($raceEvidenceKeys -join ', '), ($raceContentionDiagnostics -join ' | '))
     Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative create/copy race wrote outside the trusted root.'
 
     $cleanupCollision = Join-Path $raceParent 'cleanup-collision.json'
     [IO.File]::WriteAllText($cleanupCollision, '{}')
+    $cleanupEvidence = [Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
+    $cleanupErrors = [Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $cleanupReady = [Threading.ManualResetEventSlim]::new($false)
+    $cleanupRelease = [Threading.ManualResetEventSlim]::new($false)
     $raceStop.Reset()
     $cleanupRaceWorker = Start-HerdrRaceMutator -RaceParent $raceParent -RaceMoved $raceMoved -RaceOutside $raceOutside `
-        -RaceEvidence $raceEvidence -RaceStop $raceStop -RaceErrors $raceErrors
+        -RaceEvidence $cleanupEvidence -RaceStop $raceStop -RaceErrors $cleanupErrors `
+        -RaceReady $cleanupReady -RaceRelease $cleanupRelease
     $cleanupError = $null
     $cleanupWorkerFailure = $null
     try {
-        Write-HerdrAtomicText -Path $cleanupCollision -Content '{"safe":true}' -TrustedRoot $raceTrusted | Out-Null
+        if (-not $cleanupReady.Wait(5000)) {
+            throw ("The cleanup collision race did not establish its bounded start barrier; evidence={0}; contention={1}." -f
+                (($cleanupEvidence.Keys | Sort-Object) -join ', '), ($cleanupErrors.ToArray() -join ' | '))
+        }
+        Assert-True ($cleanupEvidence.ContainsKey('race-runspace-started')) `
+            'The cleanup collision race worker did not start.'
+        Assert-True ($cleanupEvidence.ContainsKey('race-junction-ready')) `
+            'The cleanup collision race did not report a ready junction.'
+        Assert-True ([IO.Directory]::Exists($raceParent) -and
+            (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) `
+            'The cleanup collision race did not establish the junction before the collision attempt.'
+        [void]$cleanupEvidence.TryAdd('cleanup-junction-ready', $true)
+        try {
+            Write-HerdrAtomicText -Path $cleanupCollision -Content '{"safe":true}' -TrustedRoot $raceTrusted | Out-Null
+        }
+        catch { $cleanupError = $_.Exception }
     }
     catch { $cleanupError = $_.Exception }
     finally {
+        [void]$cleanupRelease.Set()
         try { Stop-HerdrRaceMutator -Worker $cleanupRaceWorker }
         catch { $cleanupWorkerFailure = $_.Exception }
     }
@@ -432,13 +513,39 @@ try {
     if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
         [IO.Directory]::Move($raceMoved, $raceParent)
     }
+    $cleanupReady.Dispose()
+    $cleanupRelease.Dispose()
     if ($null -ne $cleanupWorkerFailure) {
         throw "The cleanup collision race worker failed: $($cleanupWorkerFailure.Message)"
     }
-    if ($raceErrors.Count -gt 0) {
-        throw "The cleanup collision race worker reported an exception: $($raceErrors.ToArray()[0])"
-    }
+    $cleanupContentionDiagnostics = @($cleanupErrors.ToArray())
+    $cleanupEvidenceKeys = @($cleanupEvidence.Keys)
+    $cleanupMutationEvidence = @($cleanupEvidenceKeys | Where-Object {
+        $_ -in @('parent-moved', 'junction-created', 'junction-removed', 'parent-restored')
+    })
+    Assert-True ($cleanupEvidence.ContainsKey('cleanup-junction-ready')) `
+        ("Cleanup collision race did not retain its junction-ready evidence; evidence={0}; contention={1}." -f
+            ($cleanupEvidenceKeys -join ', '), ($cleanupContentionDiagnostics -join ' | '))
+    Assert-True ($cleanupMutationEvidence.Count -gt 0) `
+        ("Cleanup collision race did not observe a bounded ancestor mutation; evidence={0}; contention={1}." -f
+            ($cleanupEvidenceKeys -join ', '), ($cleanupContentionDiagnostics -join ' | '))
     Assert-True ($null -ne $cleanupError) 'Handle-relative cleanup race accepted an output collision.'
+    $cleanupControlFailures = [Collections.Generic.List[string]]::new()
+    $cleanupControlSuccess = $false
+    try {
+        Ensure-HerdrManagedDirectory -Path (Join-Path $raceParent 'cleanup-control-after-race') `
+            -TrustedRoot $raceTrusted -Description 'post-cleanup-race control operation' | Out-Null
+        $cleanupControlSuccess = $true
+    }
+    catch {
+        [void]$cleanupControlFailures.Add($_.Exception.Message)
+    }
+    Assert-True $cleanupControlSuccess `
+        ("Cleanup collision race control operation failed after parent restoration; failures={0}; evidence={1}; contention={2}." -f
+            ($cleanupControlFailures -join ' | '), ($cleanupEvidenceKeys -join ', '),
+            ($cleanupContentionDiagnostics -join ' | '))
+    Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Recurse -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
+        'Handle-relative cleanup race wrote outside the trusted root.'
     Assert-True (@(Get-ChildItem -LiteralPath $raceTrusted -Recurse -Force -File -Filter '.herdr-text-*.tmp' -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative atomic-text cleanup left a temporary file.'
 

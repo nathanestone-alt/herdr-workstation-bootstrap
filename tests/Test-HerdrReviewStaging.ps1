@@ -52,7 +52,7 @@ try {
         designated_interactive_session_id = 7
         bridge_account_sid = 'S-1-5-21-961-1002'
     })
-    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig -TestMode
+    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
     Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
@@ -100,16 +100,23 @@ try {
     $recallBits = [int64]0x400000
     Assert-True ((Get-HerdrBlockedAttributeNames -Attributes $recallBits) -contains 'RecallOnDataAccess') 'Recall flag is not blocked.'
 
+    $stagePath = Join-Path $PSScriptRoot '..\scripts\windows\Stage-HerdrReviewWorkbook.ps1'
+    $stageText = [IO.File]::ReadAllText($stagePath)
+    Assert-True (-not $stageText.Contains('TestMode', [StringComparison]::Ordinal)) 'Production staging wrapper exposes a test-mode seam.'
+    $identityIndex = $stageText.IndexOf('Assert-HerdrInteractiveIdentity', [StringComparison]::Ordinal)
+    $bridgeIndex = $stageText.IndexOf('Assert-HerdrBridgeCannotWrite', [StringComparison]::Ordinal)
+    $oneDriveIndex = $stageText.IndexOf('Assert-HerdrOneDriveReady', [StringComparison]::Ordinal)
+    $stagingIndex = $stageText.IndexOf('Invoke-HerdrReviewStaging', [StringComparison]::Ordinal)
+    Assert-True ($identityIndex -ge 0 -and $identityIndex -lt $bridgeIndex -and $bridgeIndex -lt $oneDriveIndex -and $oneDriveIndex -lt $stagingIndex) `
+        'Production staging gates are not ordered before real staging.'
     $cliSource = Join-Path $inbox 'cli.xlsx'
     [IO.File]::WriteAllBytes($cliSource, $sourceBytes)
-    $cliOutput = & (Join-Path $PSScriptRoot '..\scripts\windows\Stage-HerdrReviewWorkbook.ps1') `
-        -SourcePath $cliSource -JobId 'job-cli' -RuntimeConfigurationPath $runtimeConfig -TestMode `
-        -StabilityIntervalMilliseconds 0 2>&1 | Out-String
-    Assert-True (-not $cliOutput.Contains($secret, [StringComparison]::Ordinal)) 'Staging stdout/stderr leaked workbook content.'
-    $stagedFiles = @(Get-ChildItem -LiteralPath $exchange -File -Recurse -Filter '*.json' | ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
-    foreach ($text in $stagedFiles) {
-        Assert-True (-not $text.Contains($secret, [StringComparison]::Ordinal)) 'Staging metadata/log output leaked workbook content.'
-    }
+    Assert-Throws {
+        & $stagePath -SourcePath $cliSource -JobId 'job-cli' -RuntimeConfigurationPath $runtimeConfig -TestMode `
+            -StabilityIntervalMilliseconds 0
+    } 'parameter' 'production staging test-mode bypass'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-cli'))) `
+        'Production staging reached the staging function after a rejected test-mode bypass.'
     Write-Host 'Herdr review staging regression test passed.'
 }
 finally {

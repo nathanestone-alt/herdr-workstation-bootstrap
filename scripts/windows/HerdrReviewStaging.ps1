@@ -998,8 +998,7 @@ function Get-HerdrRuntimeString {
 function Get-HerdrRuntimeConfiguration {
     [CmdletBinding()]
     param(
-        [string]$Path,
-        [switch]$TestMode
+        [string]$Path
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) { $Path = $env:HERDR_WINDOWS_REVIEW_CONFIG }

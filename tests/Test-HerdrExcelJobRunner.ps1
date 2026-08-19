@@ -83,7 +83,7 @@ try {
         designated_interactive_session_id = 7
         bridge_account_sid = 'S-1-5-21-961-1002'
     })
-    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig -TestMode
+    $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ReviewJobsRoot -ceq $reviewJobs) 'Runtime configuration did not resolve the local review-job root.'
     Assert-True ($runtime.OneDriveArchiveRoot -ceq $oneDriveArchive) 'Runtime configuration did not derive the OneDrive Archive root.'
     Assert-True ($null -ne (Get-Command Copy-HerdrFileExclusive -ErrorAction SilentlyContinue)) 'Runner dependency did not expose Copy-HerdrFileExclusive.'
@@ -91,7 +91,7 @@ try {
     $unapprovedDocument = [IO.File]::ReadAllText($runtimeConfig) | ConvertFrom-Json
     $unapprovedDocument.approved = $false
     Write-TestJson -Path $unapprovedConfig -Value $unapprovedDocument
-    Assert-Throws { Get-HerdrRuntimeConfiguration -Path $unapprovedConfig -TestMode } 'not explicitly approved' 'unapproved runtime configuration'
+    Assert-Throws { Get-HerdrRuntimeConfiguration -Path $unapprovedConfig } 'not explicitly approved' 'unapproved runtime configuration'
     Assert-HerdrOneDriveReady -OneDriveExchangeRoot $oneDriveExchange -OneDriveAccount 'configured@example.invalid' `
         -IdentityConfiguration ([pscustomobject]@{ InteractiveUserSid = 'S-1-5-21-961-1001'; InteractiveSessionId = 7 }) `
         -TestMode -ReadyProbe { $true } | Out-Null
