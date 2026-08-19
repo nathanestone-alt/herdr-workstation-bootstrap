@@ -80,12 +80,12 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "\${1:-}" == '-NoProfile' && "\${2:-}" == '-File' ]]; then
-  manifest_path="\${3:-}"
+  script_path="\${3:-}"
   if [[ -n "\${HERDR_TEST_PWSH_FILE_LOG:-}" ]]; then
     printf '%s\n' "\$*" >> "\$HERDR_TEST_PWSH_FILE_LOG"
   fi
   if [[ "\${HERDR_TEST_PWSH_FILE_RESULT:-pass}" == 'fail' ]]; then
-    printf 'fixture manifest failure: %s\n' "\$manifest_path" >&2
+    printf 'fixture PowerShell failure: %s\n' "\$script_path" >&2
     exit 17
   fi
   exit 0
@@ -320,9 +320,10 @@ run_portability_regression_cases() {
   }
   mkdir -p "$portability_root"
   cp -a "$repo_root/payload/agents-skills/herdr-coordination/scripts" "$portability_root/"
+  [[ -f "$scripts_root/run_ubuntu_portability_manifest.ps1" ]] || exit 1
   grep -Fq '@echo off' "$scripts_root/test_herdr_workflow.ps1"
   grep -Fq '$isWindowsPlatform' "$scripts_root/test_herdr_workflow.ps1"
-  pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$pass_output" 2>&1 || {
+  env -u HERDR_ENV pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$pass_output" 2>&1 || {
     cat "$pass_output" >&2
     echo 'Canonical Ubuntu portability payload unexpectedly failed.' >&2
     exit 1
@@ -330,7 +331,7 @@ run_portability_regression_cases() {
   grep -Fq 'PASS: Ubuntu portability scan' "$pass_output"
   printf '%s\n' "Write-Output 'C:\\deliberately-nonportable'" >> "$scripts_root/herdr_workflow.ps1"
   set +e
-  pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$failure_output" 2>&1
+  env -u HERDR_ENV pwsh -NoProfile -File "$scripts_root/test_ubuntu_portability.ps1" > "$failure_output" 2>&1
   status=$?
   set -e
   [[ "$status" -ne 0 ]] || {
@@ -341,7 +342,7 @@ run_portability_regression_cases() {
   grep -Fq 'contains a drive-rooted Windows path in production code' "$failure_output"
 }
 
-run_herdr_manifest_gate_case() {
+run_herdr_static_gate_case() {
   local case_name="$1"
   local result="$2"
   local home
@@ -362,15 +363,47 @@ run_herdr_manifest_gate_case() {
   set -e
   if [[ "$result" == 'pass' ]]; then
     [[ "$status" == 0 ]] || { cat "$output" >&2; exit 1; }
-    grep -Fqx -- "-NoProfile -File $fixture_root/payload/agents-skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1" "$invocation_log"
+    grep -Fqx -- "-NoProfile -File $fixture_root/payload/agents-skills/herdr-coordination/scripts/test_ubuntu_portability.ps1" "$invocation_log"
+    ! grep -Fq -- 'run_ubuntu_portability_manifest.ps1' "$invocation_log"
     [[ -f "$home/.agents/skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1" ]] || exit 1
   else
     [[ "$status" == 30 ]] || { cat "$output" >&2; exit 1; }
-    grep -Fq 'BLOCKED: herdr-coordination Ubuntu portability manifest failed' "$output"
-    grep -Fq 'fixture manifest failure' "$output"
+    grep -Fq 'BLOCKED: herdr-coordination Ubuntu portability validator failed' "$output"
+    grep -Fq 'fixture PowerShell failure' "$output"
     assert_sentinels "$home"
     assert_no_transaction_residue "$home"
   fi
+}
+
+run_herdr_static_missing_case() {
+  local case_name='herdr-static-missing'
+  local home
+  local output="$test_root/$case_name.out"
+  local invocation_log="$test_root/$case_name.pwsh.log"
+  local validator_path="$fixture_root/payload/agents-skills/herdr-coordination/scripts/test_ubuntu_portability.ps1"
+  local status
+
+  make_herdr_fixture
+  rm "$validator_path"
+  sed -i '\#  agents-skills/herdr-coordination/scripts/test_ubuntu_portability.ps1$#d' \
+    "$fixture_root/config/payload-manifest.sha256"
+  git -C "$fixture_root" add -A
+  git -C "$fixture_root" commit -qm 'fixture without static portability validator'
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  set +e
+  env -u HERDR_ENV \
+    HERDR_TEST_PWSH_FILE_RESULT=pass \
+    HERDR_TEST_PWSH_FILE_LOG="$invocation_log" \
+    HOME="$home" PATH="$home/.local/bin:$PATH" \
+      bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" == 31 ]] || { cat "$output" >&2; exit 1; }
+  grep -Fq 'BLOCKED: herdr-coordination Ubuntu portability validator is missing' "$output"
+  [[ ! -s "$invocation_log" ]] || { cat "$invocation_log" >&2; exit 1; }
+  assert_sentinels "$home"
+  assert_no_transaction_residue "$home"
 }
 
 make_restore_mv_shim() {
@@ -536,8 +569,9 @@ run_payload_committed_signal_case() {
 # remains an exact authority for the installable payload.
 assert_payload_manifest_parity
 run_portability_regression_cases
-run_herdr_manifest_gate_case herdr-manifest-pass pass
-run_herdr_manifest_gate_case herdr-manifest-fail fail
+run_herdr_static_gate_case herdr-static-pass pass
+run_herdr_static_gate_case herdr-static-fail fail
+run_herdr_static_missing_case
 
 # Signals before the durable commit restore the complete old transaction.
 run_payload_signal_case signal-before-commit before-commit

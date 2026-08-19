@@ -1278,22 +1278,22 @@ revalidate_source_and_stage() {
   verify_payload_roots "$stage_root/agents-skills" "$stage_root/claude-skills" staged
 }
 
-run_herdr_portability_manifest() {
-  local manifest_path="$payload_root/agents-skills/herdr-coordination/scripts/run_ubuntu_portability_manifest.ps1"
-  local manifest_output=''
-  local manifest_status=0
+run_herdr_portability_validator() {
+  local validator_path="$payload_root/agents-skills/herdr-coordination/scripts/test_ubuntu_portability.ps1"
+  local validator_output=''
+  local validator_status=0
 
-  [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || {
-    fail_closed "herdr-coordination Ubuntu portability manifest is missing: $manifest_path"
+  [[ -f "$validator_path" && ! -L "$validator_path" ]] || {
+    fail_closed "herdr-coordination Ubuntu portability validator is missing: $validator_path"
   }
-  manifest_output="$(pwsh -NoProfile -File "$manifest_path" 2>&1)" || manifest_status=$?
-  if (( manifest_status != 0 )); then
-    echo "BLOCKED: herdr-coordination Ubuntu portability manifest failed (exit $manifest_status)." >&2
-    echo "Run: pwsh -NoProfile -File $manifest_path" >&2
-    if [[ -n "$manifest_output" ]]; then
-      printf '%s\n' "$manifest_output" | tail -n 8 >&2
+  validator_output="$(pwsh -NoProfile -File "$validator_path" 2>&1)" || validator_status=$?
+  if (( validator_status != 0 )); then
+    echo "BLOCKED: herdr-coordination Ubuntu portability validator failed (exit $validator_status)." >&2
+    echo "Run: pwsh -NoProfile -File $validator_path" >&2
+    if [[ -n "$validator_output" ]]; then
+      printf '%s\n' "$validator_output" | tail -n 8 >&2
     else
-      echo 'Manifest produced no diagnostic output.' >&2
+      echo 'Static validator produced no diagnostic output.' >&2
     fi
     exit 30
   fi
@@ -1313,7 +1313,7 @@ main() {
   validate_managed_toolchain
 
   if [[ -d "$payload_root/agents-skills/herdr-coordination" ]]; then
-    run_herdr_portability_manifest
+    run_herdr_portability_validator
   fi
 
   fence_require_directory "$state_dir" "$state_dir_fd" 'payload state directory'
