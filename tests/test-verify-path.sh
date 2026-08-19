@@ -228,6 +228,42 @@ run_verify_layout profile
 run_verify_layout bash-profile
 run_verify_layout bash-login
 
+expect_unmanaged_managed_path_failure() {
+  local command_name="$1"
+  local managed_path="$HOME/.local/bin/$command_name"
+  local managed_backup="$test_root/managed-$command_name"
+  local unmanaged_bin="$test_root/unmanaged-$command_name"
+  local unmanaged_path="$unmanaged_bin/$command_name"
+  local output="$test_root/verify-output-unmanaged-$command_name.txt"
+  mkdir -p "$unmanaged_bin"
+  [[ -e "$managed_path" || -L "$managed_path" ]] || {
+    echo "Managed fixture is missing for $command_name." >&2
+    exit 1
+  }
+  mv "$managed_path" "$managed_backup"
+  cp -L "$managed_backup" "$unmanaged_path"
+  set +e
+  PATH="$unmanaged_bin:/usr/bin:/bin" /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  local status=$?
+  set -e
+  mv "$managed_backup" "$managed_path"
+  [[ "$status" -ne 0 ]] || {
+    cat "$output" >&2
+    echo "verify.sh accepted unmanaged $command_name." >&2
+    exit 1
+  }
+  grep -Fq "FAIL managed target $command_name expected $managed_path (got $unmanaged_path)" "$output" || {
+    cat "$output" >&2
+    echo "verify.sh did not reject unmanaged $command_name." >&2
+    exit 1
+  }
+}
+
+# These fixtures still return the locked-looking values, so only the managed
+# executable-path gate can make the negative cases fail.
+expect_unmanaged_managed_path_failure rustup
+expect_unmanaged_managed_path_failure node
+
 expect_receipt_field_failure() {
   local field="$1"
   local receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"

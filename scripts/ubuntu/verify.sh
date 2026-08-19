@@ -87,42 +87,46 @@ check_managed_command_target() {
   local expected_path="$2"
   local actual_path
   local resolved_path
-  if command -v "$name" >/dev/null 2>&1; then
-    actual_path="$(command -v "$name")"
-    if [[ "$actual_path" == "$expected_path" ]]; then
-      resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
-      if path_is_under "$resolved_path" "$home_real"; then
-        echo "PASS managed target $name $resolved_path"
-      else
-        echo "FAIL managed target $name resolves outside HOME: $resolved_path"
-        failures=$((failures + 1))
-      fi
-    fi
+  if ! actual_path="$(command -v "$name" 2>/dev/null)"; then
+    echo "FAIL managed target $name missing (expected $expected_path)"
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$actual_path" != "$expected_path" ]]; then
+    echo "FAIL managed target $name expected $expected_path (got $actual_path)"
+    failures=$((failures + 1))
+    return 1
+  fi
+  resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
+  if path_is_under "$resolved_path" "$home_real"; then
+    echo "PASS managed target $name $resolved_path"
+  else
+    echo "FAIL managed target $name resolves outside HOME: $resolved_path"
+    failures=$((failures + 1))
+    return 1
   fi
 }
 check_managed_node_command_target() {
   local name="$1"
   local expected_path="$HOME/.local/bin/$name"
   local node_root="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
-  local actual_path
   local resolved_path
-  check_managed_command_target "$name" "$expected_path"
-  actual_path="$(command -v "$name" 2>/dev/null || true)"
-  if [[ "$actual_path" == "$expected_path" ]]; then
-    resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
-    if path_is_under "$resolved_path" "$node_root"; then
-      echo "PASS locked Node target $name $resolved_path"
-    else
-      echo "FAIL locked Node target $name resolves outside Node prefix: $resolved_path"
-      failures=$((failures + 1))
-    fi
+  if ! check_managed_command_target "$name" "$expected_path"; then
+    return 0
+  fi
+  resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
+  if path_is_under "$resolved_path" "$node_root"; then
+    echo "PASS locked Node target $name $resolved_path"
+  else
+    echo "FAIL locked Node target $name resolves outside Node prefix: $resolved_path"
+    failures=$((failures + 1))
   fi
 }
-check_managed_command_target uv "$HOME/.local/bin/uv"
-check_managed_command_target python3.13 "$HOME/.local/bin/python3.13"
-check_managed_command_target py "$HOME/.local/bin/py"
+check_managed_command_target uv "$HOME/.local/bin/uv" || :
+check_managed_command_target python3.13 "$HOME/.local/bin/python3.13" || :
+check_managed_command_target py "$HOME/.local/bin/py" || :
 for managed_tool in rustup rustc herdr; do
-  check_managed_command_target "$managed_tool" "$HOME/.local/bin/$managed_tool"
+  check_managed_command_target "$managed_tool" "$HOME/.local/bin/$managed_tool" || :
 done
 for managed_tool in node npm codex claude bun; do
   check_managed_node_command_target "$managed_tool"
