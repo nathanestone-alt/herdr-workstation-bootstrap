@@ -419,13 +419,14 @@ reconcile_pending_transaction_state() {
 
 recover_prior_transaction() {
   local candidate
-  local recovery_parents_open=0
+  local candidate_list=''
   local -a candidates=()
   while IFS= read -r -d '' candidate; do
     candidates+=("$candidate")
-  done < <(find -L "$state_dir_anchor" -mindepth 1 -maxdepth 1 -name '.payload-transaction.*' -print0 2>/dev/null)
+    candidate_list+="${candidate_list:+,}$candidate"
+  done < <(find -P "$state_dir_anchor/." -mindepth 1 -maxdepth 1 -name '.payload-transaction.*' -print0 2>/dev/null)
   (( ${#candidates[@]} == 0 )) && return 0
-  (( ${#candidates[@]} == 1 )) || fail_closed 'multiple payload transactions require manual recovery; refusing to choose one.'
+  (( ${#candidates[@]} == 1 )) || fail_closed "manual operator recovery required for multiple payload transactions; no transaction was selected or mutated; no-follow candidates=$candidate_list state_dir=$state_dir"
 
   load_transaction_state "${candidates[0]}"
   case "$transaction_phase" in
@@ -435,24 +436,8 @@ recover_prior_transaction() {
       cleanup_transaction_residue || fail_closed "could not remove committed payload transaction residue; recover $transaction_display_root"
       transaction_recovery_mode=0
       ;;
-    staging)
-      fail_closed "payload transaction is incomplete before durable backups; inspect and recover $transaction_display_root before retrying."
-      ;;
-    backing-up|publishing|writing-receipt|committing|rollback-started|rollback-incomplete)
-      fence_open_parent "$agents_destination" agents_parent_fd agents_destination_anchor agents_parent_path
-      fence_open_parent "$claude_destination" claude_parent_fd claude_destination_anchor claude_parent_path
-      recovery_parents_open=1
-      fence_require_parent "$agents_parent_path" "$agents_parent_fd" 'agents recovery destination parent'
-      fence_require_parent "$claude_parent_path" "$claude_parent_fd" 'claude recovery destination parent'
-      transaction_recovery_mode=1
-      reconcile_pending_transaction_state || fail_closed "payload transaction recovery is ambiguous; inspect $transaction_display_root and preserve its backups."
-      rollback_transaction || fail_closed "incomplete rollback retained at $transaction_display_root; rerun after resolving the reported restore failure."
-      cleanup_transaction_residue || fail_closed "recovered payload transaction residue could not be removed; recover $transaction_display_root"
-      if (( recovery_parents_open == 1 )); then
-        close_fence_fd "$agents_parent_fd"
-        close_fence_fd "$claude_parent_fd"
-      fi
-      transaction_recovery_mode=0
+    staging|backing-up|publishing|writing-receipt|committing|rollback-started|rollback-incomplete)
+      fail_closed "manual operator recovery required for incomplete payload transaction; automatic restore and cleanup are disabled and no destination, backup, receipt, stage, cleanup, or new-transaction mutation was attempted: transaction=$transaction_display_root state=$transaction_display_state_file backup=$transaction_display_backup_root stage=$transaction_display_root/stage phase=$transaction_phase agents_destination=$agents_destination claude_destination=$claude_destination payload_receipt=$payload_receipt agents_new=$agents_new claude_new=$claude_new receipt_touched=$receipt_touched agents_backup_present=$agents_backup_present claude_backup_present=$claude_backup_present receipt_backup_present=$receipt_backup_present agents_backup_pending=$agents_backup_pending claude_backup_pending=$claude_backup_pending receipt_backup_pending=$receipt_backup_pending"
       ;;
     *)
       fail_closed "payload transaction has an unsupported recovery phase at $transaction_display_root"

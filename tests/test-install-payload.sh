@@ -164,7 +164,14 @@ source_path="${3:-}"
 fail_source="${HERDR_TEST_FAIL_MV_SOURCE:-}"
 case "$source_path" in
   */backup/agents-skills|*/backup/claude-skills|*/backup/payload-runtime-receipt.txt)
-    if [[ -n "$fail_source" && "$source_path" == *"/backup/$fail_source" ]]; then
+    should_fail=0
+    IFS=',' read -r -a fail_sources <<< "$fail_source"
+    for configured_source in "${fail_sources[@]}"; do
+      if [[ -n "$configured_source" && "$source_path" == *"/backup/$configured_source" ]]; then
+        should_fail=1
+      fi
+    done
+    if (( should_fail == 1 )); then
       printf 'injected rollback mv failure: %s\n' "$fail_source" >&2
       if [[ "${HERDR_TEST_MV_SIGNAL:-}" == TERM ]]; then
         kill -TERM "$PPID"
@@ -197,6 +204,29 @@ assert_retained_transaction() {
   [[ "$(stat -c '%a' "$root/backup")" == 700 ]] || exit 1
   [[ "$(stat -c '%a' "$root/state")" == 600 ]] || exit 1
   grep -Fqx 'phase=rollback-incomplete' "$root/state"
+}
+
+snapshot_tree() {
+  local path="$1"
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    printf 'missing|%s\n' "$path"
+    return 0
+  fi
+  find -P "$path" -printf 'entry|%y|%m|%u|%g|%p|%l\n' | LC_ALL=C sort
+  while IFS= read -r -d '' file; do
+    printf 'content|%s|' "$file"
+    sha256sum -- "$file"
+  done < <(find -P "$path" -type f -print0 | sort -z)
+}
+
+snapshot_install_state() {
+  local home="$1"
+  local output="$2"
+  {
+    snapshot_tree "$home/.agents/skills"
+    snapshot_tree "$home/.claude/skills"
+    snapshot_tree "$home/.local/state/herdr-workstation-bootstrap"
+  } > "$output"
 }
 
 assert_no_owned_transaction_residue() {
@@ -341,10 +371,14 @@ run_payload_parent_swap_case payload-parent-swap-before-mutation before-destinat
 run_payload_parent_swap_case payload-parent-swap-before-publish before-agents-publish
 
 # Successful transactional install, ignored commissioning log allowance and
-# deterministic receipt content.
+# deterministic receipt content. Foreign state is not owned by the installer,
+# and a second normal install remains idempotent.
 make_fixture
 success_home="$(new_home success)"
 printf 'local commissioning notes\n' > "$fixture_root/LOCAL-COMMISSIONING-LOG.md"
+success_foreign="$success_home/.local/state/herdr-workstation-bootstrap/.payload-foreign"
+mkdir -p "$success_foreign"
+printf 'foreign success sentinel\n' > "$success_foreign/sentinel.txt"
 HOME="$success_home" PATH="$success_home/.local/bin:$PATH" bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/success.out"
 [[ "$(< "$success_home/.agents/skills/demo/SKILL.md")" == '# fixture agents skill' ]] || { echo 'agents payload was not installed.' >&2; exit 1; }
 [[ "$(< "$success_home/.claude/skills/demo/SKILL.md")" == '# fixture claude skill' ]] || { echo 'claude payload was not installed.' >&2; exit 1; }
@@ -362,6 +396,15 @@ grep -Fqx 'regression_test_count=10' "$receipt"
 grep -Fq 'source_payload_sha256.agents-skills/demo/SKILL.md=' "$receipt"
 grep -Fq 'installed_payload_sha256.claude-skills/demo/SKILL.md=' "$receipt"
 ! grep -Eiq 'timestamp|hostname|LOCAL-COMMISSIONING-LOG' "$receipt"
+[[ "$(< "$success_foreign/sentinel.txt")" == 'foreign success sentinel' ]] || exit 1
+set +e
+HOME="$success_home" PATH="$success_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/success-idempotent.out" 2>&1
+success_idempotent_status=$?
+set -e
+[[ "$success_idempotent_status" == 0 ]] || { cat "$test_root/success-idempotent.out" >&2; exit 1; }
+assert_no_owned_transaction_residue "$success_home"
+[[ "$(< "$success_foreign/sentinel.txt")" == 'foreign success sentinel' ]] || exit 1
 
 # Locked toolchain provenance is required before any payload destination move.
 make_fixture
@@ -612,8 +655,8 @@ set -e
 [[ "$receipt_failure_status" -ne 0 ]] || exit 1
 assert_restored_transaction "$receipt_failure_home" "$receipt_failure_before"
 
-# A restore failure retains only the exact transaction's unrestored backup and
-# makes the next invocation recover it before starting any new transaction.
+# A restore failure retains only the exact transaction's unrestored backup. A
+# later invocation must remain non-mutating even after the restore fault clears.
 run_retained_restore_case() {
   local case_name="$1"
   local fail_source="$2"
@@ -622,11 +665,10 @@ run_retained_restore_case() {
   local receipt_before="$test_root/$case_name.receipt.before"
   local output="$test_root/$case_name.out"
   local retry_output="$test_root/$case_name.retry.out"
+  local before_retry="$test_root/$case_name.before-retry"
   local root
   local status
   local retry_status
-  local install_status
-  local idempotent_status
   local foreign_backup
 
   make_fixture
@@ -651,7 +693,9 @@ run_retained_restore_case() {
   grep -Fq 'incomplete rollback retained at' "$output"
   assert_retained_transaction "$home"
   root="$(transaction_root "$home")"
-  [[ "$(find "$root/backup" -mindepth 1 -maxdepth 1 -printf x | wc -c)" == 1 ]] || exit 1
+  expected_backup_count=1
+  [[ "$fail_source" == agents-skills,claude-skills ]] && expected_backup_count=2
+  [[ "$(find "$root/backup" -mindepth 1 -maxdepth 1 -printf x | wc -c)" == "$expected_backup_count" ]] || exit 1
   case "$fail_source" in
     agents-skills)
       [[ ! -e "$home/.agents/skills" && ! -L "$home/.agents/skills" ]] || exit 1
@@ -672,50 +716,146 @@ run_retained_restore_case() {
       cmp -s "$receipt_before" "$root/backup/payload-runtime-receipt.txt"
       [[ ! -e "$root/backup/agents-skills" && ! -e "$root/backup/claude-skills" ]] || exit 1
       ;;
+    agents-skills,claude-skills)
+      [[ ! -e "$home/.agents/skills" && ! -L "$home/.agents/skills" ]] || exit 1
+      [[ ! -e "$home/.claude/skills" && ! -L "$home/.claude/skills" ]] || exit 1
+      [[ -f "$root/backup/agents-skills/keep.txt" ]] || exit 1
+      [[ -f "$root/backup/claude-skills/keep.txt" ]] || exit 1
+      [[ ! -e "$root/backup/payload-runtime-receipt.txt" ]] || exit 1
+      ;;
     *) exit 1 ;;
   esac
   [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
 
+  rm "$home/.local/bin/mv"
+  snapshot_install_state "$home" "$before_retry"
   set +e
-  HERDR_TEST_FAIL_MV_SOURCE="$fail_source" \
   HOME="$home" PATH="$home/.local/bin:$PATH" \
     bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$retry_output" 2>&1
   retry_status=$?
   set -e
   [[ "$retry_status" == 31 ]] || { cat "$retry_output" >&2; echo "$case_name retry expected exit 31, got $retry_status." >&2; exit 1; }
-  grep -Fq 'incomplete rollback retained at' "$retry_output"
+  grep -Fq 'manual operator recovery required' "$retry_output"
+  grep -Fq "transaction=$root" "$retry_output"
+  snapshot_install_state "$home" "$test_root/$case_name.after-retry"
+  cmp -s "$before_retry" "$test_root/$case_name.after-retry" || {
+    echo "$case_name changed managed, backup, journal, or transaction state during blocked retry." >&2
+    diff -u "$before_retry" "$test_root/$case_name.after-retry" >&2 || true
+    exit 1
+  }
   assert_retained_transaction "$home"
-  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
-
-  rm "$home/.local/bin/mv"
-  set +e
-  HOME="$home" PATH="$home/.local/bin:$PATH" \
-    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/$case_name.recovered.out" 2>&1
-  install_status=$?
-  set -e
-  [[ "$install_status" == 0 ]] || { cat "$test_root/$case_name.recovered.out" >&2; exit 1; }
-  assert_no_owned_transaction_residue "$home"
-  [[ -f "$home/.agents/skills/demo/SKILL.md" && -f "$home/.claude/skills/demo/SKILL.md" ]] || exit 1
-  [[ -s "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" ]] || exit 1
-  [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
-
-  set +e
-  HOME="$home" PATH="$home/.local/bin:$PATH" \
-    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/$case_name.idempotent.out" 2>&1
-  idempotent_status=$?
-  set -e
-  [[ "$idempotent_status" == 0 ]] || { cat "$test_root/$case_name.idempotent.out" >&2; exit 1; }
-  assert_no_owned_transaction_residue "$home"
-  [[ -f "$home/.agents/skills/demo/SKILL.md" && -f "$home/.claude/skills/demo/SKILL.md" ]] || exit 1
   [[ "$(< "$foreign_backup/agents-skills/sentinel.txt")" == 'foreign backup sentinel' ]] || exit 1
 }
 
 run_retained_restore_case rollback-failed-agents agents-skills after-agents-commit
 run_retained_restore_case rollback-failed-claude claude-skills after-claude-commit
 run_retained_restore_case rollback-failed-receipt payload-runtime-receipt.txt after-claude-commit
+run_retained_restore_case rollback-failed-mixed agents-skills,claude-skills after-claude-commit
+
+new_incomplete_home() {
+  local case_name="$1"
+  local home
+  local status
+  make_fixture
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  write_payload_receipt_sentinel "$home"
+  make_restore_mv_shim "$home"
+  set +e
+  HERDR_PAYLOAD_TEST_FAIL_PHASE=after-agents-commit \
+  HERDR_TEST_FAIL_MV_SOURCE=agents-skills \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/$case_name.seed.out" 2>&1
+  status=$?
+  set -e
+  [[ "$status" == 31 ]] || { cat "$test_root/$case_name.seed.out" >&2; exit 1; }
+  assert_retained_transaction "$home"
+  printf '%s\n' "$home"
+}
+
+# Malformed or adversarial journals are parsed as inert data and must remain
+# byte-for-byte unchanged, with no command substitution or path following.
+run_journal_case() {
+  local kind="$1"
+  local home
+  local root
+  local state
+  local state_dir
+  local marker="$test_root/journal-$kind-command-ran"
+  local before="$test_root/journal-$kind.before"
+  local after="$test_root/journal-$kind.after"
+  local output="$test_root/journal-$kind.out"
+  local status
+
+  home="$(new_incomplete_home "journal-$kind")"
+  rm "$home/.local/bin/mv"
+  root="$(transaction_root "$home")"
+  state="$root/state"
+  state_dir="$home/.local/state/herdr-workstation-bootstrap"
+  case "$kind" in
+    malformed)
+      printf 'not a journal assignment\n' >> "$state"
+      ;;
+    truncated)
+      sed -i '$d' "$state"
+      ;;
+    duplicate)
+      printf 'phase=rollback-incomplete\n' >> "$state"
+      ;;
+    unknown)
+      printf 'future_key=not-allowed\n' >> "$state"
+      ;;
+    conflicting)
+      sed -i "s#^transaction_root=.*#transaction_root=$state_dir/.payload-transaction-conflicting#" "$state"
+      ;;
+    command-substitution)
+      awk -v marker="$marker" '
+        BEGIN { replacement = "repo_root=$(touch " marker ")" }
+        /^repo_root=/ { print replacement; next }
+        { print }
+      ' "$state" > "$state.tmp"
+      chmod 0600 "$state.tmp"
+      mv -T -- "$state.tmp" "$state"
+      ;;
+    path-traversal)
+      sed -i "s#^transaction_root=.*#transaction_root=$state_dir/../outside-transaction#" "$state"
+      ;;
+    absolute-substitution)
+      sed -i 's#^state_dir=.*#state_dir=/tmp/issue-961-absolute-substitution#' "$state"
+      ;;
+    *)
+      echo "unknown journal case: $kind" >&2
+      exit 1
+      ;;
+  esac
+  snapshot_install_state "$home" "$before"
+  set +e
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "$kind journal unexpectedly passed." >&2; exit 1; }
+  grep -Fq 'BLOCKED:' "$output"
+  snapshot_install_state "$home" "$after"
+  cmp -s "$before" "$after" || {
+    echo "$kind journal changed managed, backup, journal, or transaction state." >&2
+    diff -u "$before" "$after" >&2 || true
+    exit 1
+  }
+  [[ ! -e "$marker" ]] || { echo "$kind journal evaluated command substitution." >&2; exit 1; }
+}
+
+run_journal_case malformed
+run_journal_case truncated
+run_journal_case duplicate
+run_journal_case unknown
+run_journal_case conflicting
+run_journal_case command-substitution
+run_journal_case path-traversal
+run_journal_case absolute-substitution
 
 # A signal during incomplete rollback must leave the journal and every
-# unrestored backup in place; the next invocation can finish the exact journal.
+# unrestored backup in place; a later invocation remains blocked and inert.
 make_fixture
 signal_recovery_home="$(new_home rollback-signal-during-recovery)"
 make_sentinels "$signal_recovery_home"
@@ -742,11 +882,122 @@ signal_recovery_root="$(transaction_root "$signal_recovery_home")"
 [[ -f "$signal_recovery_root/backup/claude-skills/keep.txt" ]] || exit 1
 [[ -f "$signal_recovery_root/backup/payload-runtime-receipt.txt" ]] || exit 1
 rm "$signal_recovery_home/.local/bin/mv"
+snapshot_install_state "$signal_recovery_home" "$test_root/rollback-signal-during-recovery.before"
+set +e
 HOME="$signal_recovery_home" PATH="$signal_recovery_home/.local/bin:$PATH" \
   bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$test_root/rollback-signal-during-recovery.retry.out" 2>&1
-assert_no_owned_transaction_residue "$signal_recovery_home"
-[[ -f "$signal_recovery_home/.agents/skills/demo/SKILL.md" ]] || exit 1
-[[ -f "$signal_recovery_home/.claude/skills/demo/SKILL.md" ]] || exit 1
+signal_recovery_retry_status=$?
+set -e
+[[ "$signal_recovery_retry_status" == 31 ]] || {
+  cat "$test_root/rollback-signal-during-recovery.retry.out" >&2
+  exit 1
+}
+grep -Fq 'manual operator recovery required' "$test_root/rollback-signal-during-recovery.retry.out"
+snapshot_install_state "$signal_recovery_home" "$test_root/rollback-signal-during-recovery.after"
+cmp -s "$test_root/rollback-signal-during-recovery.before" \
+  "$test_root/rollback-signal-during-recovery.after" || exit 1
+
+# Foreign, ambiguous, unsafe, and symlinked transaction shapes fail closed
+# without selecting, following, cleaning, or mutating any candidate.
+run_transaction_shape_case() {
+  local kind="$1"
+  local home
+  local root
+  local state_dir
+  local outside="$test_root/shape-$kind-outside"
+  local before="$test_root/shape-$kind.before"
+  local after="$test_root/shape-$kind.after"
+  local output="$test_root/shape-$kind.out"
+  local status
+  local real_root
+
+  home="$(new_incomplete_home "shape-$kind")"
+  rm "$home/.local/bin/mv"
+  root="$(transaction_root "$home")"
+  state_dir="$home/.local/state/herdr-workstation-bootstrap"
+  mkdir -p "$outside"
+  printf 'outside shape sentinel\n' > "$outside/sentinel.txt"
+  case "$kind" in
+    multiple)
+      cp -a "$root" "$state_dir/.payload-transaction.second"
+      mkdir -p "$state_dir/.payload-foreign"
+      printf 'foreign state sentinel\n' > "$state_dir/.payload-foreign/sentinel.txt"
+      ;;
+    foreign)
+      mkdir -p "$state_dir/.payload-foreign"
+      printf 'foreign state sentinel\n' > "$state_dir/.payload-foreign/sentinel.txt"
+      ;;
+    wrong-mode)
+      chmod 0755 "$root"
+      ;;
+    wrong-owner)
+      if [[ "$(id -u)" == 0 ]]; then
+        chown 65534:65534 "$root"
+      else
+        chmod 0755 "$root"
+      fi
+      ;;
+    symlink-transaction)
+      real_root="$state_dir/.retained-transaction-real"
+      mv -T -- "$root" "$real_root"
+      ln -s "$outside" "$root"
+      ;;
+    symlink-journal)
+      printf 'outside journal sentinel\n' > "$outside/journal-target"
+      mv -T -- "$root/state" "$root/state-real"
+      ln -s "$outside/journal-target" "$root/state"
+      ;;
+    symlink-backup)
+      mv -T -- "$root/backup" "$root/backup-real"
+      ln -s "$outside" "$root/backup"
+      ;;
+    symlink-backup-entry)
+      mkdir -p "$outside/entry-target"
+      printf 'outside backup-entry sentinel\n' > "$outside/entry-target/sentinel.txt"
+      mv -T -- "$root/backup/agents-skills" "$root/backup/agents-real"
+      ln -s "$outside/entry-target" "$root/backup/agents-skills"
+      ;;
+    *)
+      echo "unknown transaction shape case: $kind" >&2
+      exit 1
+      ;;
+  esac
+  snapshot_install_state "$home" "$before"
+  set +e
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "$kind transaction shape unexpectedly passed." >&2; exit 1; }
+  grep -Fq 'BLOCKED:' "$output"
+  snapshot_install_state "$home" "$after"
+  cmp -s "$before" "$after" || {
+    echo "$kind transaction shape changed managed, foreign, or transaction state." >&2
+    diff -u "$before" "$after" >&2 || true
+    exit 1
+  }
+  [[ "$(< "$outside/sentinel.txt")" == 'outside shape sentinel' ]] || exit 1
+  [[ ! -e "$outside/skills" ]] || exit 1
+  [[ ! -e "$outside/payload-runtime-receipt.txt" ]] || exit 1
+  if [[ "$kind" == foreign || "$kind" == multiple ]]; then
+    [[ "$(< "$state_dir/.payload-foreign/sentinel.txt")" == 'foreign state sentinel' ]] || exit 1
+  fi
+  if [[ "$kind" == symlink-journal ]]; then
+    [[ "$(< "$outside/journal-target")" == 'outside journal sentinel' ]] || exit 1
+  fi
+  if [[ "$kind" == symlink-backup-entry ]]; then
+    [[ "$(< "$outside/entry-target/sentinel.txt")" == 'outside backup-entry sentinel' ]] || exit 1
+  fi
+}
+
+run_transaction_shape_case multiple
+run_transaction_shape_case foreign
+run_transaction_shape_case wrong-mode
+run_transaction_shape_case wrong-owner
+run_transaction_shape_case symlink-transaction
+run_transaction_shape_case symlink-journal
+run_transaction_shape_case symlink-backup
+run_transaction_shape_case symlink-backup-entry
 
 # Source drift after staging is detected before the first live mutation.
 make_fixture
