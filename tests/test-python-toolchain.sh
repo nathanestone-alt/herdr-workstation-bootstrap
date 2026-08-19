@@ -145,4 +145,40 @@ ln -s "$bootstrap_profile_outside" "$bootstrap_profile_home/.config"
 expect_bootstrap_path_blocked profile "$bootstrap_profile_home" install-tools
 [[ "$(< "$bootstrap_profile_outside/sentinel.txt")" == 'profile sentinel' ]] || exit 1
 
+# A destination parent replacement after the bootstrap writer captures its
+# directory fd must fail closed and leave the original managed file intact.
+bootstrap_swap_home="$(make_bootstrap_safety_home mutation-swap)"
+mkdir -p "$bootstrap_swap_home/.local/bin"
+printf 'original py wrapper\n' > "$bootstrap_swap_home/.local/bin/py"
+bootstrap_swap_outside="$test_root/bootstrap-outside-mutation-swap"
+mkdir -p "$bootstrap_swap_outside"
+printf 'outside sentinel\n' > "$bootstrap_swap_outside/sentinel.txt"
+bootstrap_swap_ready="$test_root/bootstrap-mutation-swap.ready"
+bootstrap_swap_continue="$test_root/bootstrap-mutation-swap.continue"
+bootstrap_swap_output="$test_root/bootstrap-mutation-swap.out"
+HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-py-publish \
+HERDR_BOOTSTRAP_TEST_READY_FILE="$bootstrap_swap_ready" \
+HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$bootstrap_swap_continue" \
+HOME="$bootstrap_swap_home" bash -c \
+  'bootstrap_script="$1"; set --; source "$bootstrap_script"; write_py_compat' _ "$repo_root/scripts/ubuntu/bootstrap.sh" > "$bootstrap_swap_output" 2>&1 &
+bootstrap_swap_pid=$!
+for attempt in $(seq 1 200); do
+  [[ -e "$bootstrap_swap_ready" ]] && break
+  sleep 0.01
+done
+[[ -e "$bootstrap_swap_ready" ]] || { kill "$bootstrap_swap_pid" 2>/dev/null || true; exit 1; }
+mv "$bootstrap_swap_home/.local" "$bootstrap_swap_home/.local-original"
+ln -s "$bootstrap_swap_outside" "$bootstrap_swap_home/.local"
+: > "$bootstrap_swap_continue"
+set +e
+wait "$bootstrap_swap_pid"
+bootstrap_swap_status=$?
+set -e
+[[ "$bootstrap_swap_status" -ne 0 ]] || { cat "$bootstrap_swap_output" >&2; exit 1; }
+[[ "$(< "$bootstrap_swap_outside/sentinel.txt")" == 'outside sentinel' ]] || exit 1
+[[ "$(< "$bootstrap_swap_home/.local-original/bin/py")" == 'original py wrapper' ]] || exit 1
+[[ ! -e "$bootstrap_swap_outside/bin/py" ]] || { echo 'Bootstrap wrote outside HOME.' >&2; exit 1; }
+rm "$bootstrap_swap_home/.local"
+mv "$bootstrap_swap_home/.local-original" "$bootstrap_swap_home/.local"
+
 echo 'Python 3.13 lock, selector and convergence seam tests passed.'

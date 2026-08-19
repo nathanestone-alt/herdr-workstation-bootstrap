@@ -102,6 +102,217 @@ validate_managed_paths() {
   done
 }
 
+fence_components_safe() {
+  local path="$1"
+  local normalized
+  local relative
+  local component
+  local component_path
+  local -a components
+
+  [[ "$path" == "$HOME" || "$path" == "$HOME/"* ]] || return 1
+  normalized="$(realpath -m -- "$path" 2>/dev/null || true)"
+  path_is_under "$normalized" "$home_real" || return 1
+  [[ "$path" == "$HOME" ]] && return 0
+  relative="${path#"$HOME"/}"
+  component_path="$HOME"
+  IFS='/' read -r -a components <<< "$relative"
+  for component in "${components[@]}"; do
+    [[ -z "$component" || "$component" == '.' ]] && continue
+    [[ "$component" != '..' && "$component" != *'/'* ]] || return 1
+    component_path="$component_path/$component"
+    [[ ! -L "$component_path" ]] || return 1
+  done
+}
+
+close_fence_fd() {
+  local fd="$1"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 0
+  eval "exec ${fd}<&-" 2>/dev/null || true
+}
+
+fence_open_directory() {
+  local path="$1"
+  local output_name="$2"
+  local relative
+  local component
+  local current
+  local child
+  local -a components
+  local opened_fd
+  local next_fd
+
+  validate_user_home || exit 24
+  fence_components_safe "$path" || {
+    echo "Unsafe fenced directory: $path" >&2
+    exit 24
+  }
+  exec {opened_fd}<"$HOME" || { echo 'Could not open fenced HOME directory.' >&2; exit 24; }
+  current="/proc/self/fd/$opened_fd"
+  relative="${path#"$HOME"}"
+  relative="${relative#/}"
+  if [[ -n "$relative" ]]; then
+    IFS='/' read -r -a components <<< "$relative"
+    for component in "${components[@]}"; do
+      [[ -n "$component" && "$component" != '.' && "$component" != '..' && "$component" != *'/'* ]] || {
+        close_fence_fd "$opened_fd"
+        echo "Unsafe fenced path component: $component" >&2
+        exit 24
+      }
+      child="$current/$component"
+      [[ ! -L "$child" ]] || {
+        close_fence_fd "$opened_fd"
+        echo "Fenced directory contains a symlink: $path" >&2
+        exit 24
+      }
+      if [[ ! -e "$child" ]]; then
+        mkdir -- "$child" || {
+          close_fence_fd "$opened_fd"
+          echo "Could not create fenced directory: $path" >&2
+          exit 24
+        }
+      fi
+      [[ -d "$child" && ! -L "$child" ]] || {
+        close_fence_fd "$opened_fd"
+        echo "Fenced directory is not a real directory: $path" >&2
+        exit 24
+      }
+      exec {next_fd}<"$child" || {
+        close_fence_fd "$opened_fd"
+        echo "Could not open fenced directory: $path" >&2
+        exit 24
+      }
+      close_fence_fd "$opened_fd"
+      opened_fd="$next_fd"
+      current="/proc/self/fd/$opened_fd"
+    done
+  fi
+  [[ -d "$current" ]] || {
+    close_fence_fd "$opened_fd"
+    echo "Fenced path is not a directory: $path" >&2
+    exit 24
+  }
+  printf -v "$output_name" '%s' "$opened_fd"
+}
+
+fence_directory_matches() {
+  local path="$1"
+  local fd="$2"
+  local fd_id
+  local live_id
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  [[ -d "/proc/self/fd/$fd" ]] || return 1
+  [[ ! -L "$path" ]] || return 1
+  fence_components_safe "$path" || return 1
+  fd_id="$(stat -Lc '%d:%i' -- "/proc/self/fd/$fd" 2>/dev/null || true)"
+  live_id="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  [[ -n "$fd_id" && "$fd_id" == "$live_id" ]]
+}
+
+fence_require_directory() {
+  local path="$1"
+  local fd="$2"
+  local label="${3:-managed directory}"
+  fence_directory_matches "$path" "$fd" || {
+    echo "Managed namespace drift detected for $label: $path" >&2
+    exit 24
+  }
+}
+
+fence_open_parent() {
+  local path="$1"
+  local fd_name="$2"
+  local anchor_name="$3"
+  local parent_name="$4"
+  local expected_fd="${5:-}"
+  local parent="${path%/*}"
+  local base="${path##*/}"
+  local fd
+  if [[ -n "$expected_fd" ]]; then
+    fd="$expected_fd"
+  else
+    fence_open_directory "$parent" fd
+  fi
+  printf -v "$fd_name" '%s' "$fd"
+  printf -v "$anchor_name" '/proc/self/fd/%s/%s' "$fd" "$base"
+  printf -v "$parent_name" '%s' "$parent"
+}
+
+fence_require_parent() {
+  fence_require_directory "$1" "$2" "${3:-managed parent}"
+}
+
+bootstrap_test_pause() {
+  local phase="$1"
+  local ready_file="${HERDR_BOOTSTRAP_TEST_READY_FILE:-${HERDR_PAYLOAD_TEST_READY_FILE:-}}"
+  local continue_file="${HERDR_BOOTSTRAP_TEST_CONTINUE_FILE:-${HERDR_PAYLOAD_TEST_CONTINUE_FILE:-}}"
+  [[ "${HERDR_BOOTSTRAP_TEST_PAUSE_PHASE:-}" == "$phase" ]] || return 0
+  [[ -n "$ready_file" && -n "$continue_file" ]] || {
+    echo "Test pause is missing synchronization files: $phase" >&2
+    exit 24
+  }
+  : > "$ready_file"
+  while [[ ! -e "$continue_file" ]]; do sleep 0.01; done
+}
+
+fence_replace_link() {
+  local source="$1"
+  local link_path="$2"
+  local phase="$3"
+  local expected_fd="${4:-}"
+  local fd
+  local anchor
+  local parent
+  local owns_fd=0
+  if [[ -n "$expected_fd" ]]; then
+    fence_open_parent "$link_path" fd anchor parent "$expected_fd"
+  else
+    fence_open_parent "$link_path" fd anchor parent
+    owns_fd=1
+  fi
+  fence_require_parent "$parent" "$fd" "link parent for $link_path"
+  bootstrap_test_pause "$phase"
+  fence_require_parent "$parent" "$fd" "link parent for $link_path"
+  [[ ! -e "$anchor" || -L "$anchor" ]] || {
+    if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+    echo "Refusing to replace non-managed path: $link_path" >&2
+    exit 24
+  }
+  ln -sfnT -- "$source" "$anchor"
+  fence_require_parent "$parent" "$fd" "link parent for $link_path"
+  if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+}
+
+fence_replace_file() {
+  local source="$1"
+  local target_path="$2"
+  local mode="$3"
+  local phase="$4"
+  local expected_fd="${5:-}"
+  local fd
+  local anchor
+  local parent
+  local owns_fd=0
+  if [[ -n "$expected_fd" ]]; then
+    fence_open_parent "$target_path" fd anchor parent "$expected_fd"
+  else
+    fence_open_parent "$target_path" fd anchor parent
+    owns_fd=1
+  fi
+  fence_require_parent "$parent" "$fd" "file parent for $target_path"
+  chmod "$mode" "$source"
+  bootstrap_test_pause "$phase"
+  fence_require_parent "$parent" "$fd" "file parent for $target_path"
+  [[ ! -L "$anchor" ]] || {
+    if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+    echo "Managed file path became a symlink: $target_path" >&2
+    exit 24
+  }
+  mv -T -- "$source" "$anchor"
+  fence_require_parent "$parent" "$fd" "file parent for $target_path"
+  if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+}
+
 validate_toolchain_lock() {
   for lock_hash_key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
     [[ "${!lock_hash_key:-}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -168,10 +379,27 @@ check_python_platform() {
 }
 
 write_py_compat() {
+  local expected_fd="${1:-}"
   local wrapper="$bin_dir/py"
   local replacement
+  local wrapper_fd
+  local wrapper_anchor
+  local wrapper_parent
+  local owns_fd=0
   validate_managed_paths "$wrapper" || {
     echo "Unsafe managed py path: $wrapper" >&2
+    exit 24
+  }
+  if [[ -n "$expected_fd" ]]; then
+    fence_open_parent "$wrapper" wrapper_fd wrapper_anchor wrapper_parent "$expected_fd"
+  else
+    fence_open_parent "$wrapper" wrapper_fd wrapper_anchor wrapper_parent
+    owns_fd=1
+  fi
+  fence_require_parent "$wrapper_parent" "$wrapper_fd" 'managed py parent'
+  [[ ! -L "$wrapper_anchor" ]] || {
+    if (( owns_fd == 1 )); then close_fence_fd "$wrapper_fd"; fi
+    echo "Managed py path is a symlink: $wrapper" >&2
     exit 24
   }
   replacement="$(mktemp)"
@@ -188,10 +416,15 @@ wrapper_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 exec "$wrapper_dir/python3.13" "$@"
 EOF
   chmod 0755 "$replacement"
-  if ! cmp -s "$replacement" "$wrapper" 2>/dev/null; then
-    install -m 0755 "$replacement" "$wrapper"
+  bootstrap_test_pause before-py-publish
+  fence_require_parent "$wrapper_parent" "$wrapper_fd" 'managed py parent'
+  if ! cmp -s "$replacement" "$wrapper_anchor" 2>/dev/null; then
+    mv -T -- "$replacement" "$wrapper_anchor"
+    replacement=''
   fi
-  rm -f "$replacement"
+  fence_require_parent "$wrapper_parent" "$wrapper_fd" 'managed py parent'
+  if (( owns_fd == 1 )); then close_fence_fd "$wrapper_fd"; fi
+  [[ -z "$replacement" ]] || rm -f "$replacement"
 }
 
 download_verified() {
@@ -208,6 +441,21 @@ download_verified() {
 }
 
 install_python_toolchain() {
+  local state_fd
+  local bin_fd
+  local uv_parent_fd
+  local uv_version_parent_fd
+  local python_parent_fd
+  local uv_dir_fd
+  local python_dir_fd
+  local uv_parent_anchor
+  local python_parent_anchor
+  local uv_dir_anchor
+  local python_dir_anchor
+  local uv_dir_parent
+  local python_dir_parent
+  local uv_runtime_real
+  local python_runtime_real
   validate_toolchain_lock || exit 22
   validate_platform || exit 20
 
@@ -222,8 +470,16 @@ install_python_toolchain() {
       echo 'Managed Python toolchain paths are unsafe.' >&2
       exit 24
     }
-  mkdir -p "$state_dir" "$bin_dir"
-  mkdir -p "$uv_parent/$UV_VERSION" "$python_parent"
+  fence_open_directory "$state_dir" state_fd
+  fence_open_directory "$bin_dir" bin_fd
+  fence_require_directory "$state_dir" "$state_fd" 'toolchain state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'toolchain bin directory'
+  bootstrap_test_pause before-toolchain-directory-mutations
+  fence_open_directory "$uv_parent" uv_parent_fd
+  uv_parent_anchor="/proc/self/fd/$uv_parent_fd"
+  fence_open_directory "$uv_parent/$UV_VERSION" uv_version_parent_fd
+  fence_open_directory "$python_parent" python_parent_fd
+  python_parent_anchor="/proc/self/fd/$python_parent_fd"
 
   if [[ ! -x "$uv_dir/uv" ]] || ! check_uv_version "$uv_dir/uv"; then
     uv_archive="$(mktemp --suffix=.tar.gz)"
@@ -239,11 +495,17 @@ install_python_toolchain() {
       echo "uv artifact version does not match the lock ($UV_VERSION)." >&2
       exit 24
     }
-    uv_install_stage="$(mktemp -d "$uv_parent/.install.XXXXXX")"
+    fence_require_directory "$uv_parent" "$uv_parent_fd" 'uv parent'
+    uv_install_stage="$(mktemp -d "$uv_parent_anchor/.install.XXXXXX")"
     install -m 0755 "${uv_candidates[0]}" "$uv_install_stage/uv"
-    validate_managed_paths "$uv_dir" || { echo 'Unsafe uv managed path.' >&2; exit 24; }
-    if [[ -e "$uv_dir" || -L "$uv_dir" ]]; then rm -rf -- "$uv_dir"; fi
-    mv -- "$uv_install_stage" "$uv_dir"
+    fence_open_parent "$uv_dir" uv_dir_fd uv_dir_anchor uv_dir_parent "$uv_version_parent_fd"
+    bootstrap_test_pause before-uv-publish
+    fence_require_parent "$uv_dir_parent" "$uv_dir_fd" 'uv destination parent'
+    [[ ! -L "$uv_dir_anchor" ]] || { echo 'Unsafe uv managed destination symlink.' >&2; exit 24; }
+    if [[ -e "$uv_dir_anchor" ]]; then rm -rf -- "$uv_dir_anchor"; fi
+    mv -T -- "$uv_install_stage" "$uv_dir_anchor"
+    fence_require_parent "$uv_dir_parent" "$uv_dir_fd" 'uv destination parent'
+    close_fence_fd "$uv_dir_fd"
     rm -rf -- "$uv_stage"
     rm -f -- "$uv_archive"
   fi
@@ -263,28 +525,32 @@ install_python_toolchain() {
       exit 24
     }
     python_source_root="$(cd "$(dirname "${python_candidates[0]}")/.." && pwd)"
-    python_install_stage="$(mktemp -d "$python_parent/.install.XXXXXX")"
+    fence_require_directory "$python_parent" "$python_parent_fd" 'Python parent'
+    python_install_stage="$(mktemp -d "$python_parent_anchor/.install.XXXXXX")"
     cp -a "$python_source_root"/. "$python_install_stage"/
     check_python_version "$python_install_stage/bin/python3.13" && check_python_platform "$python_install_stage/bin/python3.13" || {
       echo 'Staged CPython runtime failed its exact version/platform check.' >&2
       exit 24
     }
-    validate_managed_paths "$python_dir" || { echo 'Unsafe Python managed path.' >&2; exit 24; }
-    if [[ -e "$python_dir" || -L "$python_dir" ]]; then rm -rf -- "$python_dir"; fi
-    mv -- "$python_install_stage" "$python_dir"
+    fence_open_parent "$python_dir" python_dir_fd python_dir_anchor python_dir_parent "$python_parent_fd"
+    bootstrap_test_pause before-python-publish
+    fence_require_parent "$python_dir_parent" "$python_dir_fd" 'Python destination parent'
+    [[ ! -L "$python_dir_anchor" ]] || { echo 'Unsafe Python managed destination symlink.' >&2; exit 24; }
+    if [[ -e "$python_dir_anchor" ]]; then rm -rf -- "$python_dir_anchor"; fi
+    mv -T -- "$python_install_stage" "$python_dir_anchor"
+    fence_require_parent "$python_dir_parent" "$python_dir_fd" 'Python destination parent'
+    close_fence_fd "$python_dir_fd"
     rm -rf -- "$python_stage"
     rm -f -- "$python_archive"
   fi
 
-  for managed_link in "$bin_dir/uv" "$bin_dir/python3.13"; do
-    if [[ -e "$managed_link" && ! -L "$managed_link" ]]; then
-      echo "Refusing to replace non-managed path: $managed_link" >&2
-      exit 24
-    fi
-  done
-  ln -sfn "$uv_dir/uv" "$bin_dir/uv"
-  ln -sfn "$python_dir/bin/python3.13" "$bin_dir/python3.13"
-  write_py_compat
+  uv_runtime_real="$(realpath -e -- "$uv_dir/uv" 2>/dev/null || true)"
+  python_runtime_real="$(realpath -e -- "$python_dir/bin/python3.13" 2>/dev/null || true)"
+  path_is_under "$uv_runtime_real" "$home_real" || { echo 'uv runtime escaped the managed HOME.' >&2; exit 24; }
+  path_is_under "$python_runtime_real" "$home_real" || { echo 'Python runtime escaped the managed HOME.' >&2; exit 24; }
+  fence_replace_link "$uv_runtime_real" "$bin_dir/uv" before-uv-link-publish "$bin_fd"
+  fence_replace_link "$python_runtime_real" "$bin_dir/python3.13" before-python-link-publish "$bin_fd"
+  write_py_compat "$bin_fd"
   check_uv_version "$bin_dir/uv" || { echo 'Managed uv failed its final version check.' >&2; exit 24; }
   check_python_version "$bin_dir/python3.13" && check_python_platform "$bin_dir/python3.13" || {
     echo 'Managed python3.13 failed its final version/platform check.' >&2
@@ -295,6 +561,13 @@ install_python_toolchain() {
     echo 'Managed py -3.13 did not select the pinned CPython runtime.' >&2
     exit 24
   }
+  fence_require_directory "$state_dir" "$state_fd" 'toolchain state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'toolchain bin directory'
+  close_fence_fd "$uv_version_parent_fd"
+  close_fence_fd "$uv_parent_fd"
+  close_fence_fd "$python_parent_fd"
+  close_fence_fd "$state_fd"
+  close_fence_fd "$bin_fd"
 }
 
 converge_profile_hook() {
@@ -303,25 +576,39 @@ converge_profile_hook() {
   local marker='# BEGIN herdr-workstation PATH'
   local end_marker='# END herdr-workstation PATH'
   local replacement
+  local profile_fd
+  local profile_anchor
+  local profile_parent
+  local backup_temp=''
+  local backup_name
+  local backup_anchor
   validate_managed_paths "$profile_file" || {
     echo "Unsafe managed profile path: $profile_file" >&2
     exit 24
   }
+  fence_open_parent "$profile_file" profile_fd profile_anchor profile_parent
+  fence_require_parent "$profile_parent" "$profile_fd" "profile parent for $profile_file"
+  [[ ! -L "$profile_anchor" ]] || {
+    close_fence_fd "$profile_fd"
+    echo "Managed profile path is a symlink: $profile_file" >&2
+    exit 24
+  }
   replacement="$(mktemp)"
-  touch "$profile_file"
-  mapfile -t begin_lines < <(grep -nFx "$marker" "$profile_file" | cut -d: -f1)
-  mapfile -t end_lines < <(grep -nFx "$end_marker" "$profile_file" | cut -d: -f1)
+  if [[ ! -e "$profile_anchor" ]]; then : > "$profile_anchor"; fi
+  fence_require_parent "$profile_parent" "$profile_fd" "profile parent for $profile_file"
+  mapfile -t begin_lines < <(grep -nFx "$marker" "$profile_anchor" | cut -d: -f1)
+  mapfile -t end_lines < <(grep -nFx "$end_marker" "$profile_anchor" | cut -d: -f1)
   if (( ${#begin_lines[@]} == 0 && ${#end_lines[@]} == 0 )); then
-    cp "$profile_file" "$replacement"
+    cp "$profile_anchor" "$replacement"
   elif (( ${#begin_lines[@]} == 1 && ${#end_lines[@]} == 1 && begin_lines[0] < end_lines[0] )); then
     begin="${begin_lines[0]}"
     end="${end_lines[0]}"
     remove_start="$begin"
-    if (( begin > 1 )) && [[ -z "$(sed -n "$((begin - 1))p" "$profile_file")" ]]; then
+    if (( begin > 1 )) && [[ -z "$(sed -n "$((begin - 1))p" "$profile_anchor")" ]]; then
       remove_start=$((begin - 1))
     fi
-    if (( remove_start > 1 )); then head -n "$((remove_start - 1))" "$profile_file" > "$replacement"; fi
-    tail -n "+$((end + 1))" "$profile_file" >> "$replacement"
+    if (( remove_start > 1 )); then head -n "$((remove_start - 1))" "$profile_anchor" > "$replacement"; fi
+    tail -n "+$((end + 1))" "$profile_anchor" >> "$replacement"
   else
     echo "Managed PATH markers in $profile_file are missing, duplicated, or out of order." >&2
     exit 24
@@ -344,19 +631,46 @@ converge_profile_hook() {
     fi
     printf '%s\n' "$end_marker"
   } >> "$replacement"
-  if ! cmp -s "$profile_file" "$replacement"; then
-    cp "$profile_file" "$profile_file.$(date +%Y%m%d-%H%M%S)-$$.bak"
-    install -m 0644 "$replacement" "$profile_file"
+  if ! cmp -s "$profile_anchor" "$replacement"; then
+    fence_require_parent "$profile_parent" "$profile_fd" "profile parent for $profile_file"
+    backup_name="$(basename "$profile_file").$(date +%Y%m%d-%H%M%S)-$$.bak"
+    backup_temp="$(mktemp "/proc/self/fd/$profile_fd/.herdr-profile-backup.XXXXXX")"
+    cp "$profile_anchor" "$backup_temp"
+    backup_anchor="/proc/self/fd/$profile_fd/$backup_name"
+    mv -T -- "$backup_temp" "$backup_anchor"
+    backup_temp=''
+    chmod 0644 "$replacement"
+    bootstrap_test_pause before-profile-publish
+    fence_require_parent "$profile_parent" "$profile_fd" "profile parent for $profile_file"
+    [[ ! -L "$profile_anchor" ]] || {
+      close_fence_fd "$profile_fd"
+      rm -f "$replacement"
+      echo "Managed profile path became a symlink: $profile_file" >&2
+      exit 24
+    }
+    mv -T -- "$replacement" "$profile_anchor"
+    replacement=''
+    fence_require_parent "$profile_parent" "$profile_fd" "profile parent for $profile_file"
   fi
-  rm -f "$replacement"
+  close_fence_fd "$profile_fd"
+  [[ -z "$backup_temp" ]] || rm -f "$backup_temp"
+  [[ -z "$replacement" ]] || rm -f "$replacement"
 }
 
 install_base() {
+  local state_fd
+  local bin_fd
+  local state_anchor
   validate_managed_paths "$state_dir" "$state_dir/base-complete" "$bin_dir" || {
     echo 'Managed bootstrap paths are unsafe.' >&2
     exit 24
   }
-  mkdir -p "$state_dir" "$bin_dir"
+  fence_open_directory "$state_dir" state_fd
+  fence_open_directory "$bin_dir" bin_fd
+  state_anchor="/proc/self/fd/$state_fd"
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'base bin directory'
+  bootstrap_test_pause before-base-directory-mutations
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     apt-transport-https build-essential ca-certificates cifs-utils curl git git-lfs gh gnupg jq mosh \
@@ -391,10 +705,25 @@ install_base() {
     echo "Tailscale version does not match lock ($TAILSCALE_VERSION)." >&2; exit 24;
   }
   sudo systemctl enable --now tailscaled
-  touch "$state_dir/base-complete"
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  : > "$state_anchor/base-complete"
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  close_fence_fd "$state_fd"
+  close_fence_fd "$bin_fd"
 }
 
 install_tools() {
+  local state_fd
+  local bin_fd
+  local state_anchor
+  local src_fd
+  local src_anchor
+  local profile_dir_fd
+  local profile_dir_anchor
+  local node_fd
+  local node_anchor
+  local code_fd
+  local manifest_tmp
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   validate_managed_paths \
@@ -404,7 +733,22 @@ install_tools() {
       echo 'Managed bootstrap paths are unsafe.' >&2
       exit 24
     }
-  mkdir -p "$state_dir" "$bin_dir"
+  fence_open_directory "$state_dir" state_fd
+  fence_open_directory "$bin_dir" bin_fd
+  fence_open_directory "$profile_dir" profile_dir_fd
+  fence_open_directory "$HOME/src" src_fd
+  fence_open_directory "$node_dir" node_fd
+  fence_open_directory "$HOME/code" code_fd
+  state_anchor="/proc/self/fd/$state_fd"
+  src_anchor="/proc/self/fd/$src_fd"
+  profile_dir_anchor="/proc/self/fd/$profile_dir_fd"
+  node_anchor="/proc/self/fd/$node_fd"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'tools bin directory'
+  fence_require_directory "$profile_dir" "$profile_dir_fd" 'profile directory'
+  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
+  fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+  bootstrap_test_pause before-tools-directory-mutations
   if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
     echo 'systemd is required before the tools phase.' >&2
     exit 21
@@ -438,20 +782,21 @@ install_tools() {
     echo "rustup version changed after toolchain installation ($RUSTUP_VERSION)." >&2; exit 24;
   }
 
-  mkdir -p "$HOME/src"
-  if [[ ! -d "$HOME/src/rtk/.git" ]]; then
-    git clone "$RTK_REPO_URL" "$HOME/src/rtk"
+  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
+  if [[ ! -d "$src_anchor/rtk/.git" ]]; then
+    git clone "$RTK_REPO_URL" "$src_anchor/rtk"
   fi
-  git -C "$HOME/src/rtk" remote set-url origin "$RTK_REPO_URL"
-  git -C "$HOME/src/rtk" fetch --force origin "$RTK_REF"
-  git -C "$HOME/src/rtk" checkout --detach "$RTK_REF"
-  [[ "$(git -C "$HOME/src/rtk" rev-parse HEAD)" == "$RTK_REF" ]] || {
+  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
+  git -C "$src_anchor/rtk" remote set-url origin "$RTK_REPO_URL"
+  git -C "$src_anchor/rtk" fetch --force origin "$RTK_REF"
+  git -C "$src_anchor/rtk" checkout --detach "$RTK_REF"
+  [[ "$(git -C "$src_anchor/rtk" rev-parse HEAD)" == "$RTK_REF" ]] || {
     echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
   }
-  cargo install --path "$HOME/src/rtk" --locked --force
+  cargo install --path "$src_anchor/rtk" --locked --force
   for executable in rustup cargo rustc; do
     executable_path="$(command -v "$executable")"
-    ln -sfn "$executable_path" "$bin_dir/$executable"
+    fence_replace_link "$executable_path" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
   cargo_home="${CARGO_HOME:-$HOME/.cargo}"
   cargo_install_root="${CARGO_INSTALL_ROOT:-$cargo_home}"
@@ -459,9 +804,8 @@ install_tools() {
     echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
     exit 24
   }
-  ln -sfn "$cargo_install_root/bin/rtk" "$bin_dir/rtk"
+  fence_replace_link "$cargo_install_root/bin/rtk" "$bin_dir/rtk" before-rtk-link-publish "$bin_fd"
 
-  mkdir -p "$profile_dir"
   profile_script_tmp="$(mktemp)"
   {
     printf '%s\n' '# Managed by herdr-workstation-bootstrap.'
@@ -469,8 +813,8 @@ install_tools() {
     printf '%s\n' 'case ":$PATH:" in *":$HOME/.cargo/bin:"*) ;; *) PATH="$HOME/.cargo/bin:$PATH" ;; esac'
     printf '%s\n' 'export PATH'
   } > "$profile_script_tmp"
-  install -m 0644 "$profile_script_tmp" "$profile_dir/profile.sh"
-  rm -f "$profile_script_tmp"
+  fence_replace_file "$profile_script_tmp" "$profile_dir/profile.sh" 0644 before-profile-script-publish "$profile_dir_fd"
+  profile_script_tmp=''
   converge_profile_hook "$HOME/.profile"
   if [[ -e "$HOME/.bash_profile" ]]; then
     converge_profile_hook "$HOME/.bash_profile" true
@@ -481,38 +825,45 @@ install_tools() {
 
   install_python_toolchain
 
-  if [[ ! -x "$node_dir/bin/node" ]]; then
+  fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+  if [[ ! -x "$node_anchor/bin/node" ]]; then
     archive="$(mktemp --suffix=.tar.gz)"
     download_verified "$NODE_URL" "$NODE_SHA256" "$archive"
-    mkdir -p "$node_dir"
-    tar -xzf "$archive" -C "$node_dir" --strip-components=1
+    bootstrap_test_pause before-node-extract
+    fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+    tar -xzf "$archive" -C "$node_anchor" --strip-components=1
+    fence_require_directory "$node_dir" "$node_fd" 'Node directory'
     rm -f "$archive"
   fi
   for executable in node npm npx corepack; do
-    ln -sfn "$node_dir/bin/$executable" "$bin_dir/$executable"
+    executable_real="$(realpath -e -- "$node_anchor/bin/$executable" 2>/dev/null || true)"
+    path_is_under "$executable_real" "$home_real" || { echo "Node executable escaped HOME: $executable" >&2; exit 24; }
+    fence_replace_link "$executable_real" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
-  export PATH="$bin_dir:$node_dir/bin:$HOME/.cargo/bin:$PATH"
+  export PATH="$bin_dir:$node_anchor/bin:$HOME/.cargo/bin:$PATH"
   hash -r
   [[ "$(node --version)" == "v$NODE_VERSION" ]] || { echo 'Node version does not match lock.' >&2; exit 24; }
 
-  "$node_dir/bin/npm" install --global --save-exact --prefix "$node_dir" \
+  "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
     "bun@$BUN_VERSION"
   for package_dir in '@openai/codex' '@anthropic-ai/claude-code' bun; do
-    [[ -d "$node_dir/lib/node_modules/$package_dir" ]] || {
+    [[ -d "$node_anchor/lib/node_modules/$package_dir" ]] || {
       echo "npm did not install '$package_dir' under the pinned Node prefix '$node_dir'." >&2
       exit 24
     }
   done
   for executable in codex claude bun bunx; do
-    ln -sfn "$node_dir/bin/$executable" "$bin_dir/$executable"
+    executable_real="$(realpath -e -- "$node_anchor/bin/$executable" 2>/dev/null || true)"
+    path_is_under "$executable_real" "$home_real" || { echo "Node executable escaped HOME: $executable" >&2; exit 24; }
+    fence_replace_link "$executable_real" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
 
   herdr_temp="$(mktemp)"
   download_verified "$HERDR_URL" "$HERDR_SHA256" "$herdr_temp"
-  install -m 0755 "$herdr_temp" "$bin_dir/herdr"
-  rm -f "$herdr_temp"
+  fence_replace_file "$herdr_temp" "$bin_dir/herdr" 0755 before-herdr-publish "$bin_fd"
+  herdr_temp=''
 
   [[ "$(codex --version | awk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
   [[ "$(claude --version | awk '{ print $1 }')" == "$CLAUDE_VERSION" ]] || { echo 'Claude version does not match lock.' >&2; exit 24; }
@@ -520,6 +871,7 @@ install_tools() {
   [[ "$(herdr --version | awk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
 
   manifest="$state_dir/toolchain-manifest.txt"
+  manifest_tmp="$(mktemp "$state_anchor/.toolchain-manifest.XXXXXX")"
   {
     printf 'receipt_format=%s\n' 'issue-961-toolchain-v2'
     printf 'lock_sha256=%s\n' "$(sha256sum "$lock_file" | awk '{print $1}')"
@@ -553,11 +905,22 @@ install_tools() {
     printf 'powershell=%s\n' "$(pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
     dpkg-query -W -f='apt:${binary:Package}=${Version}\n' \
       cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
-  } > "$manifest.tmp"
-  mv "$manifest.tmp" "$manifest"
+  } > "$manifest_tmp"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  mv -T -- "$manifest_tmp" "$state_anchor/toolchain-manifest.txt"
+  manifest_tmp=''
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
 
-  mkdir -p "$HOME/code"
-  touch "$state_dir/tools-complete"
+  fence_require_directory "$HOME/code" "$code_fd" 'code directory'
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  : > "$state_anchor/tools-complete"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  close_fence_fd "$state_fd"
+  close_fence_fd "$bin_fd"
+  close_fence_fd "$profile_dir_fd"
+  close_fence_fd "$src_fd"
+  close_fence_fd "$node_fd"
+  close_fence_fd "$code_fd"
   echo "Tool installation complete. Resolved manifest: $manifest"
   echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile or .bash_login chain, makes them available in new Bash login shells."
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'

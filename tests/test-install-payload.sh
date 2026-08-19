@@ -166,6 +166,128 @@ wait_for_file() {
   return 1
 }
 
+run_payload_signal_case() {
+  local case_name="$1"
+  local phase="$2"
+  local home
+  local ready="$test_root/$case_name.ready"
+  local continue_file="$test_root/$case_name.continue"
+  local output="$test_root/$case_name.out"
+  local pid
+  local status
+  local receipt_before="$test_root/$case_name.receipt.before"
+
+  make_fixture
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  write_payload_receipt_sentinel "$home"
+  cp "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" "$receipt_before"
+  HERDR_PAYLOAD_TEST_PAUSE_PHASE="$phase" \
+  HERDR_PAYLOAD_TEST_READY_FILE="$ready" \
+  HERDR_PAYLOAD_TEST_CONTINUE_FILE="$continue_file" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1 &
+  pid=$!
+  wait_for_file "$ready"
+  kill -TERM "$pid"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "$case_name signal unexpectedly passed." >&2; exit 1; }
+  assert_restored_transaction "$home" "$receipt_before"
+}
+
+run_payload_committed_signal_case() {
+  local case_name="$1"
+  local phase="$2"
+  local home
+  local ready="$test_root/$case_name.ready"
+  local continue_file="$test_root/$case_name.continue"
+  local output="$test_root/$case_name.out"
+  local pid
+  local status
+
+  make_fixture
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  HERDR_PAYLOAD_TEST_PAUSE_PHASE="$phase" \
+  HERDR_PAYLOAD_TEST_READY_FILE="$ready" \
+  HERDR_PAYLOAD_TEST_CONTINUE_FILE="$continue_file" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1 &
+  pid=$!
+  wait_for_file "$ready"
+  kill -TERM "$pid"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "$case_name signal unexpectedly passed." >&2; exit 1; }
+  [[ "$(< "$home/.agents/skills/demo/SKILL.md")" == '# fixture agents skill' ]] || exit 1
+  [[ "$(< "$home/.claude/skills/demo/SKILL.md")" == '# fixture claude skill' ]] || exit 1
+  [[ -s "$home/.local/state/herdr-workstation-bootstrap/payload-runtime-receipt.txt" ]] || exit 1
+  residue_count="$(find "$home/.local/state/herdr-workstation-bootstrap" -maxdepth 1 -name '.payload-*' -printf x | wc -c)"
+  [[ "$residue_count" -le 2 ]] || { echo "$case_name left unbounded residue." >&2; exit 1; }
+}
+
+# Signals before the durable commit restore the complete old transaction.
+run_payload_signal_case signal-before-commit before-commit
+run_payload_signal_case signal-after-agents-commit after-agents-commit
+
+# Signals after rollback disarm never remove committed destinations. Each seam
+# is intentionally bounded and may leave only this transaction's cleanup roots.
+run_payload_committed_signal_case signal-between-disarm between-rollback-disarm-and-trap-removal
+run_payload_committed_signal_case signal-after-traps after-trap-removal
+run_payload_committed_signal_case signal-before-cleanup before-cleanup
+run_payload_committed_signal_case signal-during-backup-cleanup during-backup-cleanup
+run_payload_committed_signal_case signal-after-backup-cleanup after-backup-cleanup
+
+run_payload_parent_swap_case() {
+  local case_name="$1"
+  local phase="$2"
+  local home
+  local outside="$test_root/$case_name-outside"
+  local ready="$test_root/$case_name.ready"
+  local continue_file="$test_root/$case_name.continue"
+  local output="$test_root/$case_name.out"
+  local pid
+  local status
+
+  make_fixture
+  home="$(new_home "$case_name")"
+  make_sentinels "$home"
+  mkdir -p "$outside"
+  printf 'outside sentinel\n' > "$outside/sentinel.txt"
+  HERDR_PAYLOAD_TEST_PAUSE_PHASE="$phase" \
+  HERDR_PAYLOAD_TEST_READY_FILE="$ready" \
+  HERDR_PAYLOAD_TEST_CONTINUE_FILE="$continue_file" \
+  HOME="$home" PATH="$home/.local/bin:$PATH" \
+    bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$output" 2>&1 &
+  pid=$!
+  wait_for_file "$ready"
+  mv "$home/.agents" "$home/.agents-original"
+  ln -s "$outside" "$home/.agents"
+  : > "$continue_file"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "$case_name namespace swap unexpectedly passed." >&2; exit 1; }
+  [[ "$(< "$outside/sentinel.txt")" == 'outside sentinel' ]] || exit 1
+  [[ "$(< "$home/.agents-original/skills/keep.txt")" == 'keep agents' ]] || exit 1
+  [[ ! -e "$outside/skills/demo/SKILL.md" ]] || { echo "$case_name wrote outside HOME." >&2; exit 1; }
+  rm "$home/.agents"
+  mv "$home/.agents-original" "$home/.agents"
+  assert_no_transaction_residue "$home"
+}
+
+# Replacing the validated destination parent after its fd was captured must
+# fail closed without following the outside symlink.
+run_payload_parent_swap_case payload-parent-swap-r2-before-commit before-commit
+run_payload_parent_swap_case payload-parent-swap-before-mutation before-destination-mutations
+run_payload_parent_swap_case payload-parent-swap-before-publish before-agents-publish
+
 # Successful transactional install, ignored commissioning log allowance and
 # deterministic receipt content.
 make_fixture
@@ -227,6 +349,33 @@ unmanaged_bin="$test_root/unmanaged-bin"
 mkdir -p "$unmanaged_bin"
 cp "$unmanaged_home/.local/bin/uv" "$unmanaged_home/.local/bin/python3.13" "$unmanaged_home/.local/bin/py" "$unmanaged_bin/"
 expect_blocked unmanaged-toolchain "$unmanaged_home" 'uv is not managed' "$unmanaged_bin"
+
+# Toolchain receipts are strict single-assignment maps: duplicates, malformed
+# assignments, and unknown keys are all rejected before payload mutation.
+make_fixture
+duplicate_same_home="$(new_home receipt-duplicate-same)"
+duplicate_same_line="$(grep '^uv_version=' "$duplicate_same_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt")"
+printf '%s\n' "$duplicate_same_line" >> \
+  "$duplicate_same_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_blocked receipt-duplicate-same "$duplicate_same_home" 'duplicate toolchain receipt key: uv_version'
+
+make_fixture
+duplicate_conflict_home="$(new_home receipt-duplicate-conflict)"
+printf 'uv_version=uv 0.0.0 (x86_64-unknown-linux-gnu)\n' >> \
+  "$duplicate_conflict_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_blocked receipt-duplicate-conflict "$duplicate_conflict_home" 'duplicate toolchain receipt key: uv_version'
+
+make_fixture
+malformed_receipt_home="$(new_home receipt-malformed)"
+printf 'not a receipt assignment\n' >> \
+  "$malformed_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_blocked receipt-malformed "$malformed_receipt_home" 'malformed toolchain receipt line'
+
+make_fixture
+unknown_receipt_home="$(new_home receipt-unknown)"
+printf 'future_key=not-allowed\n' >> \
+  "$unknown_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_blocked receipt-unknown "$unknown_receipt_home" 'unknown toolchain receipt key: future_key'
 
 # Dirty tracked source is rejected before any destination mutation.
 make_fixture

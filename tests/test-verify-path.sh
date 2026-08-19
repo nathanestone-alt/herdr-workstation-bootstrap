@@ -171,7 +171,7 @@ expect_receipt_field_failure() {
   set -e
   mv "$backup" "$receipt"
   [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "verify.sh accepted tampered $field." >&2; exit 1; }
-  grep -q '^FAIL receipt missing ' "$output" || { cat "$output" >&2; echo "verify.sh did not report tampered $field." >&2; exit 1; }
+  grep -Eq '^FAIL receipt (missing|mismatch) ' "$output" || { cat "$output" >&2; echo "verify.sh did not report tampered $field." >&2; exit 1; }
 }
 
 receipt_fields=(
@@ -183,6 +183,32 @@ receipt_fields=(
 for receipt_field in "${receipt_fields[@]}"; do
   expect_receipt_field_failure "$receipt_field"
 done
+
+expect_receipt_structure_failure() {
+  local case_name="$1"
+  local extra_line="$2"
+  local receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+  local backup="$test_root/receipt-$case_name.before"
+  local output="$test_root/verify-output-$case_name.txt"
+  cp "$receipt" "$backup"
+  printf '%s\n' "$extra_line" >> "$receipt"
+  set +e
+  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  local status=$?
+  set -e
+  mv "$backup" "$receipt"
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "verify.sh accepted $case_name receipt." >&2; exit 1; }
+  grep -Eq '^FAIL receipt (duplicate|malformed|unknown) ' "$output" || {
+    cat "$output" >&2
+    echo "verify.sh did not report $case_name receipt." >&2
+    exit 1
+  }
+}
+
+expect_receipt_structure_failure duplicate-same "uv_version=uv $UV_VERSION ($UV_PLATFORM)"
+expect_receipt_structure_failure duplicate-conflict 'uv_version=uv 0.0.0 (x86_64-unknown-linux-gnu)'
+expect_receipt_structure_failure malformed 'not a receipt assignment'
+expect_receipt_structure_failure unknown 'future_key=not-allowed'
 
 rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
 : > "$HOME/.profile"

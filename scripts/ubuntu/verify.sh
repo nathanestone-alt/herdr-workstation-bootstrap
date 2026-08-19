@@ -106,38 +106,91 @@ check_managed_command_target py "$HOME/.local/bin/py"
 
 toolchain_receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 lock_sha256="$(sha256sum "$lock_file" | awk '{print $1}')"
-if [[ -L "$toolchain_receipt" ]]; then
-  echo "FAIL receipt is a symlink: $toolchain_receipt"
+validate_runtime_receipt() {
+  local line_number=0
+  local line
+  local key
+  local value
+  local expected
+  local receipt_failures=0
+  local -a required_keys=(
+    receipt_format lock_sha256 host_platform host_architecture
+    uv_path python3.13_path py_path uv_version python3.13_version
+    py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
+    python_version python_platform python_release python_archive python_url python_sha256
+  )
+  local -A expected_by_key=()
+  local -A seen_keys=()
+
+  expected_by_key[receipt_format]='issue-961-toolchain-v2'
+  expected_by_key[lock_sha256]="$lock_sha256"
+  expected_by_key[host_platform]='linux'
+  expected_by_key[host_architecture]='x86_64'
+  expected_by_key[uv_path]="$HOME/.local/bin/uv"
+  expected_by_key[python3.13_path]="$HOME/.local/bin/python3.13"
+  expected_by_key[py_path]="$HOME/.local/bin/py"
+  expected_by_key[uv_version]="uv $UV_VERSION ($UV_PLATFORM)"
+  expected_by_key[python3.13_version]="Python $PYTHON_VERSION"
+  expected_by_key[py_3.13_version]="Python $PYTHON_VERSION"
+  expected_by_key[py_3.13_probe]="$PYTHON_VERSION|x86_64|linux"
+  expected_by_key[uv_platform]="$UV_PLATFORM"
+  expected_by_key[uv_url]="$UV_URL"
+  expected_by_key[uv_sha256]="$UV_SHA256"
+  expected_by_key[python_version]="$PYTHON_VERSION"
+  expected_by_key[python_platform]="$PYTHON_PLATFORM"
+  expected_by_key[python_release]="$PYTHON_RELEASE"
+  expected_by_key[python_archive]="$PYTHON_ARCHIVE"
+  expected_by_key[python_url]="$PYTHON_URL"
+  expected_by_key[python_sha256]="$PYTHON_SHA256"
+
+  if [[ ! -f "$toolchain_receipt" || -L "$toolchain_receipt" ]]; then
+    echo "FAIL receipt missing $toolchain_receipt"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    if [[ ! "$line" =~ ^([A-Za-z][A-Za-z0-9_.-]*)=(.*)$ ]]; then
+      echo "FAIL receipt malformed line $line_number"
+      receipt_failures=$((receipt_failures + 1))
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    if [[ -z "${expected_by_key[$key]+present}" ]]; then
+      echo "FAIL receipt unknown key $key"
+      receipt_failures=$((receipt_failures + 1))
+      continue
+    fi
+    if [[ -n "${seen_keys[$key]+present}" ]]; then
+      echo "FAIL receipt duplicate key $key"
+      receipt_failures=$((receipt_failures + 1))
+      continue
+    fi
+    expected="${expected_by_key[$key]}"
+    if [[ "$value" != "$expected" ]]; then
+      echo "FAIL receipt mismatch $key"
+      receipt_failures=$((receipt_failures + 1))
+      continue
+    fi
+    seen_keys["$key"]=1
+    echo "PASS receipt $key=$value"
+  done < "$toolchain_receipt"
+  for key in "${required_keys[@]}"; do
+    if [[ -z "${seen_keys[$key]+present}" ]]; then
+      echo "FAIL receipt missing $key"
+      receipt_failures=$((receipt_failures + 1))
+    fi
+  done
+  [[ "$receipt_failures" -eq 0 && "${#seen_keys[@]}" -eq "${#required_keys[@]}" ]]
+}
+
+if ! validate_managed_paths "$toolchain_receipt"; then
+  echo "FAIL receipt path is not securely confined: $toolchain_receipt"
   failures=$((failures + 1))
 fi
-for receipt_line in \
-  'receipt_format=issue-961-toolchain-v2' \
-  "lock_sha256=$lock_sha256" \
-  'host_platform=linux' \
-  'host_architecture=x86_64' \
-  "uv_path=$HOME/.local/bin/uv" \
-  "python3.13_path=$HOME/.local/bin/python3.13" \
-  "py_path=$HOME/.local/bin/py" \
-  "uv_version=uv $UV_VERSION ($UV_PLATFORM)" \
-  "python3.13_version=Python $PYTHON_VERSION" \
-  "py_3.13_version=Python $PYTHON_VERSION" \
-  "py_3.13_probe=$PYTHON_VERSION|x86_64|linux" \
-  "uv_platform=$UV_PLATFORM" \
-  "uv_url=$UV_URL" \
-  "uv_sha256=$UV_SHA256" \
-  "python_version=$PYTHON_VERSION" \
-  "python_platform=$PYTHON_PLATFORM" \
-  "python_release=$PYTHON_RELEASE" \
-  "python_archive=$PYTHON_ARCHIVE" \
-  "python_url=$PYTHON_URL" \
-  "python_sha256=$PYTHON_SHA256"; do
-  if [[ -f "$toolchain_receipt" ]] && grep -Fqx -- "$receipt_line" "$toolchain_receipt"; then
-    echo "PASS receipt $receipt_line"
-  else
-    echo "FAIL receipt missing $receipt_line"
-    failures=$((failures + 1))
-  fi
-done
+if ! validate_runtime_receipt; then
+  failures=$((failures + 1))
+fi
 login_shell="$(command -v bash)"
 login_path="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc 'printf "%s" "$PATH"')"
 for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
