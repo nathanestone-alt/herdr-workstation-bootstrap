@@ -48,21 +48,189 @@ function Get-HerdrOptionalJsonString {
 
 function Read-HerdrJsonFile {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$TrustedRoot
+    )
 
+    $opened = $null
+    $reader = $null
+    $boundaryBefore = $null
     try {
+        if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+            $proof = Get-HerdrPhysicalPathProof -Path $Path
+        }
+        else {
+            $boundaryBefore = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot -Description 'JSON input boundary'
+            $proof = $boundaryBefore.Candidate
+        }
+        if (-not $proof.Exists -or $proof.Leaf.IsDirectory) { throw 'not a regular file' }
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
-        $raw = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+        if ($IsWindows) {
+            $opened = Open-HerdrNativeReadFile -Path $Path
+            Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $opened.Identity -Description 'JSON input before read' -IncludeLinkCount | Out-Null
+            $reader = [IO.StreamReader]::new($opened.SafeHandle, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $false)
+            $raw = $reader.ReadToEnd()
+        }
+        else {
+            $raw = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+        }
         $value = $raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop
+        $afterProof = Get-HerdrPhysicalPathProof -Path $Path
+        Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $afterProof.Leaf -Description 'JSON input after read' -IncludeLinkCount | Out-Null
+        if ($null -ne $boundaryBefore) {
+            Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot `
+                -ExpectedCandidate $proof -ExpectedRoot $boundaryBefore.Root -Description 'JSON input boundary after read' | Out-Null
+        }
     }
     catch {
         throw "JSON input is invalid or unreadable: '$Path'."
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $opened -and $null -ne $opened.SafeHandle -and -not $opened.SafeHandle.IsClosed) { $opened.SafeHandle.Dispose() }
     }
     if ($null -eq $value -or $value -is [Array] -or $value -isnot [pscustomobject]) {
         throw "JSON input must be an object: '$Path'."
     }
     return $value
+}
+
+function Assert-HerdrSidValue {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Sid, [Parameter(Mandatory)][string]$Name)
+
+    if ($Sid -notmatch '^S-\d-\d+(?:-\d+)+$') { throw "$Name must be a Windows SID." }
+    return $Sid
+}
+
+function Get-HerdrIdentityConfiguration {
+    [CmdletBinding()]
+    param(
+        [string]$ExpectedInteractiveUserSid,
+        [int]$ExpectedInteractiveSessionId = -1,
+        [string]$ExpectedBridgeAccountSid,
+        [switch]$TestMode
+    )
+
+    if ($TestMode) {
+        return [pscustomobject][ordered]@{
+            InteractiveUserSid = if ([string]::IsNullOrWhiteSpace($ExpectedInteractiveUserSid)) { $null } else { Assert-HerdrSidValue -Sid $ExpectedInteractiveUserSid -Name 'Expected interactive user SID' }
+            InteractiveSessionId = $ExpectedInteractiveSessionId
+            BridgeAccountSid = if ([string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) { $null } else { Assert-HerdrSidValue -Sid $ExpectedBridgeAccountSid -Name 'Expected bridge account SID' }
+            Source = 'explicit-test-mode'
+        }
+    }
+    if (-not $IsWindows) { throw 'Production identity configuration is Windows-only.' }
+
+    $userSid = if (-not [string]::IsNullOrWhiteSpace($ExpectedInteractiveUserSid)) {
+        $ExpectedInteractiveUserSid
+    }
+    else { [string]$env:HERDR_DESIGNATED_INTERACTIVE_USER_SID }
+    $sessionText = if ($ExpectedInteractiveSessionId -ge 0) {
+        [string]$ExpectedInteractiveSessionId
+    }
+    else { [string]$env:HERDR_DESIGNATED_INTERACTIVE_SESSION_ID }
+    $bridgeSid = if (-not [string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) {
+        $ExpectedBridgeAccountSid
+    }
+    else { [string]$env:HERDR_BRIDGE_ACCOUNT_SID }
+    if ([string]::IsNullOrWhiteSpace($userSid) -or [string]::IsNullOrWhiteSpace($sessionText) -or
+        [string]::IsNullOrWhiteSpace($bridgeSid)) {
+        throw 'Production requires HERDR_DESIGNATED_INTERACTIVE_USER_SID, HERDR_DESIGNATED_INTERACTIVE_SESSION_ID, and HERDR_BRIDGE_ACCOUNT_SID deployment configuration.'
+    }
+    $parsedSession = 0
+    if (-not [int]::TryParse($sessionText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedSession) -or $parsedSession -le 0) {
+        throw 'Expected designated interactive session ID must be a positive integer.'
+    }
+    [pscustomobject][ordered]@{
+        InteractiveUserSid = Assert-HerdrSidValue -Sid $userSid -Name 'Expected interactive user SID'
+        InteractiveSessionId = $parsedSession
+        BridgeAccountSid = Assert-HerdrSidValue -Sid $bridgeSid -Name 'Expected bridge account SID'
+        Source = 'deployment-configuration'
+    }
+}
+
+function Get-HerdrProcessIdentityProof {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    if (-not $IsWindows) { throw 'Process identity proof is Windows-only.' }
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        $sid = [Herdr.Security.NativeMethods]::ReadProcessUserSid($ProcessId)
+        if ([string]::IsNullOrWhiteSpace($sid)) { throw 'empty process token SID' }
+        [pscustomobject][ordered]@{
+            ProcessId = $ProcessId
+            UserSid = Assert-HerdrSidValue -Sid $sid -Name 'Observed process user SID'
+            SessionId = [int]$process.SessionId
+            Name = [string]$process.ProcessName
+        }
+    }
+    catch {
+        throw "Could not prove process identity for PID $ProcessId."
+    }
+}
+
+function Assert-HerdrInteractiveIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Configuration,
+        [switch]$TestMode,
+        [scriptblock]$IdentityProbe
+    )
+
+    if ($null -ne $IdentityProbe -and -not $TestMode) {
+        throw 'Interactive identity probes are permitted only in explicit test mode.'
+    }
+    if ($TestMode) {
+        $observed = if ($null -ne $IdentityProbe) { & $IdentityProbe } else { Test-HerdrInteractiveSession }
+        if ($observed -is [bool] -and -not $observed) { throw 'Designated interactive Windows session is unavailable.' }
+        if ($null -ne $observed -and $observed -isnot [bool]) {
+            foreach ($name in @('CurrentUserSid', 'ExplorerUserSid')) {
+                $property = $observed.PSObject.Properties[$name]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value) -and
+                    $null -ne $Configuration.InteractiveUserSid -and
+                    [string]$property.Value -cne [string]$Configuration.InteractiveUserSid) {
+                    throw "Interactive identity proof mismatch for $name."
+                }
+            }
+            foreach ($name in @('CurrentSessionId', 'ExplorerSessionId')) {
+                $property = $observed.PSObject.Properties[$name]
+                if ($null -ne $property -and [int]$property.Value -gt 0 -and
+                    [int]$Configuration.InteractiveSessionId -gt 0 -and
+                    [int]$property.Value -ne [int]$Configuration.InteractiveSessionId) {
+                    throw "Interactive session proof mismatch for $name."
+                }
+            }
+        }
+        return $observed
+    }
+
+    $current = Get-HerdrProcessIdentityProof -ProcessId $PID
+    if ($current.UserSid -cne $Configuration.InteractiveUserSid -or
+        $current.SessionId -ne $Configuration.InteractiveSessionId -or
+        $current.SessionId -eq 0) {
+        throw 'Current process is not running as the designated interactive user and session.'
+    }
+    $explorers = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $Configuration.InteractiveSessionId })
+    if ($explorers.Count -eq 0) { throw 'No Explorer process exists in the designated interactive session.' }
+    $matchingExplorer = $false
+    foreach ($explorer in $explorers) {
+        $proof = Get-HerdrProcessIdentityProof -ProcessId $explorer.Id
+        if ($proof.UserSid -cne $Configuration.InteractiveUserSid -or $proof.SessionId -ne $Configuration.InteractiveSessionId) {
+            throw 'Explorer owner or session does not match the designated interactive identity.'
+        }
+        $matchingExplorer = $true
+    }
+    if (-not $matchingExplorer) { throw 'Designated Explorer identity could not be proven.' }
+    return [pscustomobject][ordered]@{
+        CurrentUserSid = $current.UserSid
+        CurrentSessionId = $current.SessionId
+        ExplorerUserSid = $Configuration.InteractiveUserSid
+        ExplorerSessionId = $Configuration.InteractiveSessionId
+    }
 }
 
 function Assert-HerdrSha256 {
@@ -96,11 +264,11 @@ function Get-HerdrManifestRecord {
     Assert-HerdrPathDoesNotOverlap -Left $inboxCanonical -Right $archiveCanonical -Description 'OneDrive Inbox and Archive'
     Assert-HerdrPathDoesNotOverlap -Left $outboxCanonical -Right $archiveCanonical -Description 'OneDrive Outbox and Archive'
     $allowedManifestRoot = Get-HerdrCanonicalPath -Path (Join-Path (Join-Path $exchangeCanonical 'in') $JobId)
-    if (-not (Test-HerdrPathSameOrDescendant -Candidate $manifestCanonical -Ancestor $allowedManifestRoot) -or
-        [IO.Path]::GetExtension($manifestCanonical).ToLowerInvariant() -ne '.json') {
+    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $manifestCanonical -RootPath $allowedManifestRoot -Description 'Staging manifest boundary' | Out-Null
+    if ([IO.Path]::GetExtension($manifestCanonical).ToLowerInvariant() -ne '.json') {
         throw 'Staging manifest is outside the job-specific exchange input directory.'
     }
-    $document = Read-HerdrJsonFile -Path $manifestCanonical
+    $document = Read-HerdrJsonFile -Path $manifestCanonical -TrustedRoot $allowedManifestRoot
     Assert-HerdrJsonProperties -Object $document -Allowed @(
         'schema', 'job_id', 'created_utc', 'stability_interval_milliseconds', 'allowed_extensions',
         'source_root', 'one_drive_outbox_root', 'one_drive_archive_root', 'exchange_root', 'staged_input_path', 'source', 'bridge_stage', 'provenance', 'source_preserved'
@@ -131,17 +299,17 @@ function Get-HerdrManifestRecord {
     if ($null -eq $source -or $null -eq $stage -or $source -is [Array] -or $stage -is [Array]) {
         throw 'Staging manifest source records are missing.'
     }
-    Assert-HerdrJsonProperties -Object $source -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256') -Description 'Source record'
-    Assert-HerdrJsonProperties -Object $stage -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256') -Description 'Bridge-stage record'
+    Assert-HerdrJsonProperties -Object $source -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256', 'volume_serial_number', 'file_index', 'number_of_links', 'file_identity') -Description 'Source record'
+    Assert-HerdrJsonProperties -Object $stage -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256', 'volume_serial_number', 'file_index', 'number_of_links', 'file_identity') -Description 'Bridge-stage record'
     $sourcePath = Get-HerdrCanonicalPath -Path (Get-HerdrRequiredJsonString -Object $source -Name 'path' -Description 'Source record')
-    if (-not (Test-HerdrPathSameOrDescendant -Candidate $sourcePath -Ancestor $inboxCanonical) -or
-        $sourcePath.Equals($inboxCanonical, [StringComparison]::OrdinalIgnoreCase)) {
+    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourcePath -RootPath $inboxCanonical -Description 'Staging source boundary' | Out-Null
+    if ($sourcePath.Equals($inboxCanonical, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Staging manifest source is outside the configured OneDrive Inbox.'
     }
     $stagedPath = Get-HerdrCanonicalPath -Path (Get-HerdrRequiredJsonString -Object $stage -Name 'path' -Description 'Bridge-stage record')
     $manifestStagedPath = Get-HerdrCanonicalPath -Path (Get-HerdrRequiredJsonString -Object $document -Name 'staged_input_path' -Description 'Staging manifest')
-    if (-not $stagedPath.Equals($manifestStagedPath, [StringComparison]::OrdinalIgnoreCase) -or
-        -not (Test-HerdrPathSameOrDescendant -Candidate $stagedPath -Ancestor $allowedManifestRoot)) {
+    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $stagedPath -RootPath $allowedManifestRoot -Description 'Bridge-stage boundary' | Out-Null
+    if (-not $stagedPath.Equals($manifestStagedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Staging manifest bridge path is outside the job-specific exchange input directory.'
     }
     $allowedExtensions = @($document.allowed_extensions | ForEach-Object { ([string]$_).ToLowerInvariant() })
@@ -157,6 +325,11 @@ function Get-HerdrManifestRecord {
     $sourceHash = Assert-HerdrSha256 -Hash (Get-HerdrRequiredJsonString -Object $source -Name 'sha256' -Description 'Source record') -Name 'Source hash'
     $stageHash = Assert-HerdrSha256 -Hash (Get-HerdrRequiredJsonString -Object $stage -Name 'sha256' -Description 'Bridge-stage record') -Name 'Bridge-stage hash'
     if ($sourceHash -cne $stageHash) { throw 'Staging manifest source and bridge hashes do not match.' }
+    $sourceIdentityText = if ($null -ne $source.PSObject.Properties['file_identity'] -and $null -ne $source.file_identity) { [string]$source.file_identity } else { $null }
+    $stageIdentityText = if ($null -ne $stage.PSObject.Properties['file_identity'] -and $null -ne $stage.file_identity) { [string]$stage.file_identity } else { $null }
+    if ($null -ne $source.PSObject.Properties['number_of_links'] -and [int64]$source.number_of_links -gt 1) {
+        throw 'Staging manifest source has multiple hard links.'
+    }
     if ([int64]$source.size_bytes -lt 0 -or [int64]$stage.size_bytes -lt 0 -or [int64]$source.size_bytes -ne [int64]$stage.size_bytes) {
         throw 'Staging manifest source and bridge sizes do not match.'
     }
@@ -180,6 +353,20 @@ function Get-HerdrManifestRecord {
         SourceRoot = $inboxCanonical
         ExchangeRoot = $exchangeCanonical
         Extension = $stageExtension
+        SourceIdentity = [pscustomobject][ordered]@{
+            Exists = $true
+            VolumeSerialNumber = if ($null -ne $source.PSObject.Properties['volume_serial_number']) { $source.volume_serial_number } else { $null }
+            FileIndex = if ($null -ne $source.PSObject.Properties['file_index']) { $source.file_index } else { $null }
+            NumberOfLinks = if ($null -ne $source.PSObject.Properties['number_of_links']) { [int64]$source.number_of_links } else { [int64]1 }
+            FileIdentity = $sourceIdentityText
+        }
+        StagedIdentity = [pscustomobject][ordered]@{
+            Exists = $true
+            VolumeSerialNumber = if ($null -ne $stage.PSObject.Properties['volume_serial_number']) { $stage.volume_serial_number } else { $null }
+            FileIndex = if ($null -ne $stage.PSObject.Properties['file_index']) { $stage.file_index } else { $null }
+            NumberOfLinks = if ($null -ne $stage.PSObject.Properties['number_of_links']) { [int64]$stage.number_of_links } else { [int64]1 }
+            FileIdentity = $stageIdentityText
+        }
         Provenance = $provenance
     }
 }
@@ -194,11 +381,11 @@ function Read-HerdrExcelJob {
     $exchangeCanonical = Get-HerdrCanonicalPath -Path $ExchangeRoot
     $jobInputRoot = Get-HerdrCanonicalPath -Path (Join-Path $exchangeCanonical 'in')
     $jobCanonical = Get-HerdrCanonicalPath -Path $JobPath
-    if (-not (Test-HerdrPathSameOrDescendant -Candidate $jobCanonical -Ancestor $jobInputRoot) -or
-        [IO.Path]::GetExtension($jobCanonical).ToLowerInvariant() -ne '.json') {
+    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $jobCanonical -RootPath $jobInputRoot -Description 'Excel job boundary' | Out-Null
+    if ([IO.Path]::GetExtension($jobCanonical).ToLowerInvariant() -ne '.json') {
         throw 'Excel job definition must be a JSON file under the exchange input root.'
     }
-    $document = Read-HerdrJsonFile -Path $jobCanonical
+    $document = Read-HerdrJsonFile -Path $jobCanonical -TrustedRoot $jobInputRoot
     Assert-HerdrJsonProperties -Object $document -Allowed @(
         'schema', 'job_id', 'operation', 'staging_manifest', 'source_repository', 'source_branch', 'source_commit', 'trust_approval'
     ) -Description 'Excel job'
@@ -270,22 +457,40 @@ function Resolve-HerdrIdentitySid {
 
 function Get-HerdrBridgeGroupSids {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$BridgeAccount)
+    param([Parameter(Mandatory)][string]$ExpectedBridgeAccountSid)
 
     if (-not $IsWindows) { throw 'Bridge ACL inspection requires Windows.' }
     try {
-        $user = Get-LocalUser -Name $BridgeAccount -ErrorAction Stop
+        $user = Get-LocalUser -Name 'HerdrBridge' -ErrorAction Stop
+        $actualSid = Assert-HerdrSidValue -Sid $user.SID.Value -Name 'HerdrBridge account SID'
+        if ($actualSid -cne $ExpectedBridgeAccountSid) {
+            throw 'The fixed HerdrBridge account SID does not match deployment configuration.'
+        }
         $sids = [Collections.Generic.List[string]]::new()
-        $sids.Add($user.SID.Value)
-        $adsiUser = [ADSI]"WinNT://$env:COMPUTERNAME/$BridgeAccount,user"
+        $null = $sids.Add($actualSid)
+        $adsiUser = [ADSI]"WinNT://$env:COMPUTERNAME/HerdrBridge,user"
+        $groupsToVisit = [Collections.Generic.Queue[string]]::new()
         foreach ($group in @($adsiUser.psbase.Invoke('Groups'))) {
+            $groupName = [string]$group.GetType().InvokeMember('Name', 'GetProperty', $null, $group, $null)
             $sidBytes = $group.GetType().InvokeMember('objectSID', 'GetProperty', $null, $group, $null)
-            $sids.Add(([Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0)).Value)
+            $null = $sids.Add(([Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0)).Value)
+            if (-not [string]::IsNullOrWhiteSpace($groupName)) { $groupsToVisit.Enqueue($groupName) }
+        }
+        $visitedGroups = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        while ($groupsToVisit.Count -gt 0) {
+            $groupName = $groupsToVisit.Dequeue()
+            if (-not $visitedGroups.Add($groupName)) { continue }
+            $members = @(Get-LocalGroupMember -Group $groupName -ErrorAction Stop)
+            foreach ($member in $members) {
+                $memberSid = Resolve-HerdrIdentitySid -IdentityReference $member.SID
+                $null = $sids.Add($memberSid)
+                if ([string]$member.ObjectClass -match 'Group') { $groupsToVisit.Enqueue([string]$member.Name) }
+            }
         }
         return @($sids | Select-Object -Unique)
     }
     catch {
-        throw 'Could not resolve the bridge account group membership.'
+        throw "Could not resolve the complete HerdrBridge effective group membership: $($_.Exception.Message)"
     }
 }
 
@@ -309,16 +514,33 @@ function Assert-HerdrBridgeCannotWrite {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string[]]$Paths,
-        [string]$BridgeAccount = 'HerdrBridge',
+        [string]$ExpectedBridgeAccountSid,
         [scriptblock]$AclReader,
-        [scriptblock]$GroupSidReader
+        [scriptblock]$GroupSidReader,
+        [scriptblock]$BridgeIdentityProbe,
+        [switch]$TestMode
     )
 
-    $groupSids = @(
-        if ($null -ne $GroupSidReader) { & $GroupSidReader $BridgeAccount }
-        else { Get-HerdrBridgeGroupSids -BridgeAccount $BridgeAccount }
-    )
-    $groupSids = @($groupSids + @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') | Select-Object -Unique)
+    if (($null -ne $AclReader -or $null -ne $GroupSidReader -or $null -ne $BridgeIdentityProbe) -and -not $TestMode) {
+        throw 'Bridge identity and ACL probes are permitted only in explicit test mode.'
+    }
+    $observedBridgeSid = $null
+    if ($null -ne $BridgeIdentityProbe) {
+        $identity = & $BridgeIdentityProbe
+        $observedBridgeSid = if ($identity -is [string]) { [string]$identity } else { [string]$identity.UserSid }
+        Assert-HerdrSidValue -Sid $observedBridgeSid -Name 'Observed bridge account SID' | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid) -and $observedBridgeSid -cne $ExpectedBridgeAccountSid) {
+            throw 'Bridge account identity substitution was detected.'
+        }
+    }
+    $groupSids = if ($null -ne $GroupSidReader) {
+        @(& $GroupSidReader 'HerdrBridge')
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($ExpectedBridgeAccountSid)) { throw 'Expected HerdrBridge account SID is required.' }
+        @(Get-HerdrBridgeGroupSids -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid)
+    }
+    $groupSids = @(@($groupSids) + @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') | Select-Object -Unique)
     if ($groupSids.Count -eq 0) { throw 'Bridge account group membership is empty; refusing to continue.' }
     foreach ($path in $Paths) {
         $canonicalPath = Get-HerdrCanonicalPath -Path $path
@@ -333,9 +555,11 @@ function Assert-HerdrBridgeCannotWrite {
         }
         if (-not $acl.AreAccessRulesProtected) { throw "Host-owned path inherits access rules: '$canonicalPath'." }
         foreach ($rule in @($acl.Access)) {
-            $sid = Resolve-HerdrIdentitySid -IdentityReference $rule.IdentityReference
-            if ($sid -in $groupSids -and $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-                (Test-HerdrWriteRights -Rights $rule.FileSystemRights)) {
+            $sid = [string](Resolve-HerdrIdentitySid -IdentityReference $rule.IdentityReference)
+            $isBridgeSid = @($groupSids | ForEach-Object { [string]$_ }) -contains $sid
+            $isAllow = [string]$rule.AccessControlType -ceq 'Allow'
+            $hasWrite = [bool](Test-HerdrWriteRights -Rights $rule.FileSystemRights)
+            if ($isBridgeSid -and $isAllow -and $hasWrite) {
                 throw "Bridge account has write access to host-owned path '$canonicalPath'."
             }
         }
@@ -364,11 +588,49 @@ function Disable-HerdrExcelConnections {
     }
 }
 
+function Assert-HerdrExcelProcessIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Excel,
+        [Parameter(Mandatory)][object]$Configuration,
+        [switch]$TestMode,
+        [scriptblock]$ExcelProcessProbe
+    )
+
+    if ($null -ne $ExcelProcessProbe -and -not $TestMode) {
+        throw 'Excel process probes are permitted only in explicit test mode.'
+    }
+    if ($TestMode -and $null -ne $ExcelProcessProbe) {
+        $observed = & $ExcelProcessProbe $Excel
+        if ($observed -is [bool] -and -not $observed) { throw 'Excel process identity proof failed.' }
+        return $observed
+    }
+    if (-not $IsWindows) { throw 'Excel process identity proof is Windows-only.' }
+    $hwnd = [IntPtr]0
+    try { $hwnd = [IntPtr]$Excel.Hwnd } catch { $hwnd = [IntPtr]0 }
+    $processId = if ($hwnd -ne [IntPtr]::Zero) { [Herdr.Security.NativeMethods]::ReadWindowProcessId($hwnd) } else { 0 }
+    if ($processId -le 0) {
+        $candidates = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $Configuration.InteractiveSessionId })
+        if ($candidates.Count -ne 1) { throw 'Excel process identity is ambiguous or unavailable.' }
+        $processId = [int]$candidates[0].Id
+    }
+    $proof = Get-HerdrProcessIdentityProof -ProcessId $processId
+    if ($proof.UserSid -cne $Configuration.InteractiveUserSid -or
+        $proof.SessionId -ne $Configuration.InteractiveSessionId -or
+        $proof.SessionId -eq 0) {
+        throw 'Excel is not running as the designated interactive user and session.'
+    }
+    return $proof
+}
+
 function Invoke-HerdrExcelRecalculate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$InputPath,
-        [Parameter(Mandatory)][string]$ResultPath
+        [Parameter(Mandatory)][string]$ResultPath,
+        [Parameter(Mandatory)][object]$IdentityConfiguration,
+        [switch]$TestMode,
+        [scriptblock]$ExcelProcessProbe
     )
 
     if (-not $IsWindows) { throw 'Excel COM execution is Windows-only.' }
@@ -381,10 +643,14 @@ function Invoke-HerdrExcelRecalculate {
         $excel.EnableEvents = $false
         $excel.AutomationSecurity = 3
         $excel.AskToUpdateLinks = $false
+        Assert-HerdrExcelProcessIdentity -Excel $excel -Configuration $IdentityConfiguration `
+            -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
         $workbook = $excel.Workbooks.Open($InputPath, 0, $false)
         Disable-HerdrExcelConnections -Workbook $workbook
         $workbook.UpdateLinks = 0
         $workbook.Calculate()
+        Assert-HerdrExcelProcessIdentity -Excel $excel -Configuration $IdentityConfiguration `
+            -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
         $workbook.SaveCopyAs($ResultPath)
         $workbook.Close($false)
         $workbook = $null
@@ -411,20 +677,39 @@ function Invoke-HerdrExcelJob {
         [string]$OneDriveInboxRoot,
         [string]$OneDriveOutboxRoot,
         [string]$OneDriveArchiveRoot,
-        [string]$BridgeAccount = 'HerdrBridge',
+        [string]$ExpectedInteractiveUserSid,
+        [int]$ExpectedInteractiveSessionId = -1,
+        [string]$ExpectedBridgeAccountSid,
+        [switch]$TestMode,
         [scriptblock]$InteractiveSessionProbe,
+        [scriptblock]$IdentityProbe,
         [scriptblock]$HostOwnedAccessProbe,
         [scriptblock]$ExcelInvoker,
+        [scriptblock]$ExcelProcessProbe,
         [scriptblock]$AfterExcelHook
     )
 
+    if (-not $TestMode -and ($null -ne $InteractiveSessionProbe -or $null -ne $IdentityProbe -or
+        $null -ne $HostOwnedAccessProbe -or $null -ne $ExcelInvoker -or $null -ne $ExcelProcessProbe -or
+        $null -ne $AfterExcelHook)) {
+        throw 'Test probes are permitted only in explicit test mode.'
+    }
+    if ($null -ne $InteractiveSessionProbe -and $null -ne $IdentityProbe) {
+        throw 'Specify one interactive identity probe.'
+    }
+    $identityConfiguration = Get-HerdrIdentityConfiguration `
+        -ExpectedInteractiveUserSid $ExpectedInteractiveUserSid `
+        -ExpectedInteractiveSessionId $ExpectedInteractiveSessionId `
+        -ExpectedBridgeAccountSid $ExpectedBridgeAccountSid `
+        -TestMode:$TestMode
     if ([string]::IsNullOrWhiteSpace($OneDriveInboxRoot)) { $OneDriveInboxRoot = Get-HerdrDefaultOneDriveInboxRoot }
     if ([string]::IsNullOrWhiteSpace($OneDriveOutboxRoot)) { $OneDriveOutboxRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Outbox }
     if ([string]::IsNullOrWhiteSpace($OneDriveArchiveRoot)) { $OneDriveArchiveRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Archive }
-    $exchangeCanonical = Assert-HerdrConfiguredLocalPath -Path $ExchangeRoot
+    $exchangeCanonical = Ensure-HerdrManagedDirectory -Path (Assert-HerdrConfiguredLocalPath -Path $ExchangeRoot) -Description 'Exchange root'
     $reviewCanonical = Assert-HerdrConfiguredLocalPath -Path $ReviewJobsRoot
     $toolsCanonical = Assert-HerdrConfiguredLocalPath -Path $ToolsRoot
-    $outboxCanonical = Get-HerdrCanonicalPath -Path (Join-Path $exchangeCanonical 'out')
+    $outboxCanonical = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeCanonical 'out') `
+        -TrustedRoot $exchangeCanonical -Description 'Exchange output root'
     $oneDriveOutboxCanonical = Assert-HerdrConfiguredLocalPath -Path $OneDriveOutboxRoot
     $oneDriveArchiveCanonical = Assert-HerdrConfiguredLocalPath -Path $OneDriveArchiveRoot
     Assert-HerdrExistingPathIsNotReparsePoint -Path $exchangeCanonical | Out-Null
@@ -433,10 +718,14 @@ function Invoke-HerdrExcelJob {
     Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxCanonical -AllowMissing | Out-Null
     Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveOutboxCanonical | Out-Null
     Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveArchiveCanonical | Out-Null
+    $exchangeInputCanonical = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeCanonical 'in') `
+        -TrustedRoot $exchangeCanonical -Description 'Exchange input root'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $reviewCanonical -Description 'exchange and review-job'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $toolsCanonical -Description 'exchange and tools'
     Assert-HerdrPathDoesNotOverlap -Left $reviewCanonical -Right $toolsCanonical -Description 'review-job and tools'
-    Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right (Assert-HerdrConfiguredLocalPath -Path $OneDriveInboxRoot) -Description 'exchange and OneDrive'
+    $oneDriveInboxCanonical = Assert-HerdrConfiguredLocalPath -Path $OneDriveInboxRoot
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveInboxCanonical | Out-Null
+    Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveInboxCanonical -Description 'exchange and OneDrive'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveOutboxCanonical -Description 'exchange and OneDrive Outbox'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveArchiveCanonical -Description 'exchange and OneDrive Archive'
     $job = Read-HerdrExcelJob -JobPath $JobPath -ExchangeRoot $exchangeCanonical
@@ -446,9 +735,8 @@ function Invoke-HerdrExcelJob {
     if ($job.SourceRepository -ne 'NOT-PROVIDED' -and $job.SourceRepository -cne $manifest.Provenance.repository) { throw 'Excel job repository provenance does not match the staging manifest.' }
     if ($job.SourceBranch -ne 'NOT-PROVIDED' -and $job.SourceBranch -cne $manifest.Provenance.branch) { throw 'Excel job branch provenance does not match the staging manifest.' }
     if ($job.SourceCommit -ne 'NOT-PROVIDED' -and $job.SourceCommit -cne $manifest.Provenance.commit) { throw 'Excel job commit provenance does not match the staging manifest.' }
-    $jobLogsRoot = Get-HerdrCanonicalPath -Path (Join-Path $exchangeCanonical 'logs')
-    if (Test-Path -LiteralPath $jobLogsRoot -PathType Leaf) { throw 'Exchange log root is not a directory.' }
-    [IO.Directory]::CreateDirectory($jobLogsRoot) | Out-Null
+    $jobLogsRoot = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeCanonical 'logs') `
+        -TrustedRoot $exchangeCanonical -Description 'Exchange log root'
     $logPath = Get-HerdrCanonicalPath -Path (Join-Path $jobLogsRoot ($job.JobId + '.json'))
     if (Test-Path -LiteralPath $logPath) { throw "Job log collision for '$($job.JobId)'." }
     $reviewJobPath = Get-HerdrCanonicalPath -Path (Join-Path $reviewCanonical $job.JobId)
@@ -457,58 +745,65 @@ function Invoke-HerdrExcelJob {
     if (Test-Path -LiteralPath $reviewJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Review-job collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $outboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Outbox collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $oneDriveOutboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "OneDrive Outbox collision for '$($job.JobId)'." }
-    $interactive = if ($null -ne $InteractiveSessionProbe) { [bool](& $InteractiveSessionProbe) } else { Test-HerdrInteractiveSession }
-    if (-not $interactive) { throw 'Designated interactive Windows session is unavailable.' }
+    $interactiveProbe = if ($null -ne $IdentityProbe) { $IdentityProbe } else { $InteractiveSessionProbe }
+    Assert-HerdrInteractiveIdentity -Configuration $identityConfiguration -TestMode:$TestMode -IdentityProbe $interactiveProbe | Out-Null
     if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical)
     }
     else {
-        Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical) -BridgeAccount $BridgeAccount | Out-Null
+        Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical) `
+            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode | Out-Null
     }
-    $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath
+    $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical -ExpectedIdentity $manifest.SourceIdentity
     if ($sourceBefore.Sha256 -cne $manifest.SourceHash -or $sourceBefore.SizeBytes -ne $manifest.SourceSizeBytes) { throw 'Canonical source workbook hash changed before execution.' }
-    $stageBefore = Get-HerdrFileSnapshot -Path $manifest.StagedPath
+    $stageBefore = Get-HerdrFileSnapshot -Path $manifest.StagedPath `
+        -TrustedRoot (Join-Path (Join-Path $exchangeCanonical 'in') $job.JobId) -ExpectedIdentity $manifest.StagedIdentity
     if ($stageBefore.Sha256 -cne $manifest.StagedHash -or $stageBefore.SizeBytes -ne $manifest.StagedSizeBytes) { throw 'Bridge-stage workbook hash changed before execution.' }
-    [IO.Directory]::CreateDirectory($reviewJobPath) | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $reviewJobPath | Out-Null
+    $reviewJobPath = Ensure-HerdrManagedDirectory -Path $reviewJobPath `
+        -TrustedRoot $reviewCanonical -Description 'Excel review-job directory'
     if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical, $reviewJobPath)
     }
     else {
-        Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical, $reviewJobPath) -BridgeAccount $BridgeAccount | Out-Null
+        Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical, $reviewJobPath) `
+            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode | Out-Null
     }
     $extension = $manifest.Extension
     $lastMilePath = Get-HerdrCanonicalPath -Path (Join-Path $reviewJobPath ('input' + $extension))
     $resultWorkingPath = Get-HerdrCanonicalPath -Path (Join-Path $reviewJobPath ('result' + $extension))
     $completed = $false
     try {
-        Copy-HerdrFileExclusive -SourcePath $manifest.StagedPath -DestinationPath $lastMilePath | Out-Null
-        $lastMileBefore = Get-HerdrFileSnapshot -Path $lastMilePath
+        Copy-HerdrFileExclusive -SourcePath $manifest.StagedPath -DestinationPath $lastMilePath `
+            -TrustedRoot (Join-Path (Join-Path $exchangeCanonical 'in') $job.JobId) `
+            -ExpectedSourceIdentity $stageBefore -TrustedDestinationRoot $reviewJobPath | Out-Null
+        $lastMileBefore = Get-HerdrFileSnapshot -Path $lastMilePath -TrustedRoot $reviewJobPath
         Assert-HerdrSnapshotContentEqual -Expected $stageBefore -Actual $lastMileBefore -Description 'Protected last-mile copy'
         if ($null -ne $ExcelInvoker) {
             & $ExcelInvoker $lastMilePath $resultWorkingPath
         }
         else {
-            Invoke-HerdrExcelRecalculate -InputPath $lastMilePath -ResultPath $resultWorkingPath
+            Invoke-HerdrExcelRecalculate -InputPath $lastMilePath -ResultPath $resultWorkingPath `
+                -IdentityConfiguration $identityConfiguration -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe
         }
         if ($null -ne $AfterExcelHook) { & $AfterExcelHook }
-        $lastMileAfter = Get-HerdrFileSnapshot -Path $lastMilePath
+        $lastMileAfter = Get-HerdrFileSnapshot -Path $lastMilePath -TrustedRoot $reviewJobPath -ExpectedIdentity $lastMileBefore
         Assert-HerdrSnapshotsEqual -Expected $lastMileBefore -Actual $lastMileAfter -Description 'Protected last-mile workbook'
-        $sourceAfter = Get-HerdrFileSnapshot -Path $manifest.SourcePath
+        $sourceAfter = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical -ExpectedIdentity $sourceBefore
         if ($sourceAfter.Sha256 -cne $sourceBefore.Sha256 -or $sourceAfter.SizeBytes -ne $sourceBefore.SizeBytes) { throw 'Canonical source workbook changed during execution.' }
-        $resultWorking = Get-HerdrFileSnapshot -Path $resultWorkingPath
-        [IO.Directory]::CreateDirectory($outboxCanonical) | Out-Null
-        [IO.Directory]::CreateDirectory($outboxJobPath) | Out-Null
-        Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxJobPath | Out-Null
+        $resultWorking = Get-HerdrFileSnapshot -Path $resultWorkingPath -TrustedRoot $reviewJobPath
+        $outboxJobPath = Ensure-HerdrManagedDirectory -Path $outboxJobPath `
+            -TrustedRoot $outboxCanonical -Description 'Exchange output job directory'
         $resultPath = Get-HerdrCanonicalPath -Path (Join-Path $outboxJobPath ('result' + $extension))
-        Copy-HerdrFileExclusive -SourcePath $resultWorkingPath -DestinationPath $resultPath | Out-Null
-        $result = Get-HerdrFileSnapshot -Path $resultPath
+        Copy-HerdrFileExclusive -SourcePath $resultWorkingPath -DestinationPath $resultPath `
+            -TrustedRoot $reviewJobPath -ExpectedSourceIdentity $resultWorking -TrustedDestinationRoot $outboxJobPath | Out-Null
+        $result = Get-HerdrFileSnapshot -Path $resultPath -TrustedRoot $outboxJobPath
         Assert-HerdrSnapshotContentEqual -Expected $resultWorking -Actual $result -Description 'Outbox result copy'
-        [IO.Directory]::CreateDirectory($oneDriveOutboxJobPath) | Out-Null
-        Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveOutboxJobPath | Out-Null
+        $oneDriveOutboxJobPath = Ensure-HerdrManagedDirectory -Path $oneDriveOutboxJobPath `
+            -TrustedRoot $oneDriveOutboxCanonical -Description 'OneDrive output job directory'
         $oneDriveResultPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath ('result' + $extension))
-        Copy-HerdrFileExclusive -SourcePath $resultPath -DestinationPath $oneDriveResultPath | Out-Null
-        $oneDriveResult = Get-HerdrFileSnapshot -Path $oneDriveResultPath
+        Copy-HerdrFileExclusive -SourcePath $resultPath -DestinationPath $oneDriveResultPath `
+            -TrustedRoot $outboxJobPath -ExpectedSourceIdentity $result -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
+        $oneDriveResult = Get-HerdrFileSnapshot -Path $oneDriveResultPath -TrustedRoot $oneDriveOutboxJobPath
         Assert-HerdrSnapshotContentEqual -Expected $result -Actual $oneDriveResult -Description 'OneDrive Outbox result copy'
         $completedUtc = [DateTime]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         $provenance = [ordered]@{
@@ -554,6 +849,9 @@ function Invoke-HerdrExcelJob {
             trust_approval = $job.TrustApproval
             security = [ordered]@{
                 interactive_session_required = $true
+                designated_interactive_user_sid = $identityConfiguration.InteractiveUserSid
+                designated_interactive_session_id = $identityConfiguration.InteractiveSessionId
+                bridge_account_sid = $identityConfiguration.BridgeAccountSid
                 macros = 'disabled'
                 external_links = 'not-updated'
                 data_connections = 'disabled'
@@ -563,9 +861,10 @@ function Invoke-HerdrExcelJob {
         }
         $manifestOutputPath = Get-HerdrCanonicalPath -Path (Join-Path $outboxJobPath 'provenance.json')
         $json = $provenance | ConvertTo-Json -Depth 12 -Compress
-        Write-HerdrAtomicText -Path $manifestOutputPath -Content $json | Out-Null
+        Write-HerdrAtomicText -Path $manifestOutputPath -Content $json -TrustedRoot $outboxJobPath | Out-Null
         $oneDriveManifestPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath 'provenance.json')
-        Copy-HerdrFileExclusive -SourcePath $manifestOutputPath -DestinationPath $oneDriveManifestPath | Out-Null
+        Copy-HerdrFileExclusive -SourcePath $manifestOutputPath -DestinationPath $oneDriveManifestPath `
+            -TrustedRoot $outboxJobPath -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
         $logRecord = [ordered]@{
             schema = 'herdr-excel-job-log-v1'
             job_id = $job.JobId
@@ -577,7 +876,8 @@ function Invoke-HerdrExcelJob {
             result_sha256 = $result.Sha256
             one_drive_result_path = $oneDriveResultPath
         }
-        Write-HerdrAtomicText -Path $logPath -Content ($logRecord | ConvertTo-Json -Depth 8 -Compress) | Out-Null
+        Write-HerdrAtomicText -Path $logPath -Content ($logRecord | ConvertTo-Json -Depth 8 -Compress) `
+            -TrustedRoot $jobLogsRoot | Out-Null
         $completed = $true
         return [pscustomobject][ordered]@{
             Schema = $provenance.schema

@@ -7,8 +7,7 @@ param(
     [string]$ToolsRoot = 'C:\HerdrTools',
     [string]$OneDriveInboxRoot,
     [string]$OneDriveOutboxRoot,
-    [string]$OneDriveArchiveRoot,
-    [string]$BridgeAccount = 'HerdrBridge'
+    [string]$OneDriveArchiveRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +20,7 @@ try {
     $result = Invoke-HerdrExcelJob -JobPath $JobPath -ExchangeRoot $ExchangeRoot `
         -ReviewJobsRoot $ReviewJobsRoot -ToolsRoot $ToolsRoot `
         -OneDriveInboxRoot $OneDriveInboxRoot -OneDriveOutboxRoot $OneDriveOutboxRoot `
-        -OneDriveArchiveRoot $OneDriveArchiveRoot -BridgeAccount $BridgeAccount
+        -OneDriveArchiveRoot $OneDriveArchiveRoot
     $result | ConvertTo-Json -Depth 5 -Compress
 }
 catch {

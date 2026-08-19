@@ -15,9 +15,13 @@ allowlist, repository/branch/commit provenance, and `source_preserved=true`.
 
 The exact workbook allowlist is `.xlsx`, `.xlsm`, and `.xlsb`. The helper rejects
 all other extensions, device/UNC paths, traversal outside the configured Inbox,
-reparse points, Offline/Recall attributes, unstable exclusive reads, collisions,
-and source/stage size or hash mismatches. It never deletes or moves the Inbox
-original.
+reparse points (including every ancestor), Offline/Recall attributes, hard-linked
+sources, unstable exclusive reads, collisions, and source/stage size, hash, or
+physical file-identity mismatches. Windows production paths are proven through
+no-follow handles, final-handle paths, volume/file identities, and revalidation
+before and after read/copy/hash transitions. Destination parents are likewise
+tied to their trusted job root before commit and the committed leaf is re-proven
+afterward. It never deletes or moves the Inbox original.
 
 ## Job schema
 
@@ -49,3 +53,13 @@ bridge-stage, last-mile, and result paths/hashes, timestamps, repository
 provenance, the operation, approval record, and security decisions. A compact
 job log is written under `C:\HerdrExchange\logs`; neither contains workbook
 content or credentials.
+
+Production execution requires deployment configuration for
+`HERDR_DESIGNATED_INTERACTIVE_USER_SID`,
+`HERDR_DESIGNATED_INTERACTIVE_SESSION_ID`, and
+`HERDR_BRIDGE_ACCOUNT_SID`. The runner proves the current process, Explorer,
+and Excel owner/session against the first two values. The fixed local
+`HerdrBridge` account and its complete effective group membership are checked
+against the third value and are denied write access to every host-owned tools or
+review-jobs root. Test probes are available only behind the explicit hermetic
+`-TestMode` seam; the production wrapper exposes no bridge-account override.

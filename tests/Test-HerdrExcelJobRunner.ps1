@@ -71,6 +71,7 @@ try {
     $success = New-TestJob
     $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
         -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+        -TestMode `
         -InteractiveSessionProbe $interactiveProbe `
         -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe
     Assert-True ($successResult.Status -ceq 'succeeded') 'The hermetic runner did not succeed.'
@@ -112,6 +113,7 @@ try {
     Assert-Throws {
         Invoke-HerdrExcelJob -JobPath $noInteractive.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode `
             -InteractiveSessionProbe { $false } `
             -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe
     } 'interactive Windows session' 'interactive-session gate'
@@ -121,6 +123,7 @@ try {
     Assert-Throws {
         Invoke-HerdrExcelJob -JobPath $bridgeWrite.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode `
             -InteractiveSessionProbe $interactiveProbe `
             -HostOwnedAccessProbe $bridgeProbe -ExcelInvoker $excelProbe
     } 'bridge write probe failed' 'bridge ACL gate'
@@ -130,6 +133,7 @@ try {
     Assert-Throws {
         Invoke-HerdrExcelJob -JobPath $sourceMutation.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode `
             -InteractiveSessionProbe $interactiveProbe `
             -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateSource
     } 'changed during execution' 'canonical source after-hash gate'
@@ -150,11 +154,11 @@ try {
     $aclReader = { param([string]$Path) $acl }.GetNewClosure()
     $groups = { param([string]$Account) @('S-1-5-32-545') }
     Assert-Throws {
-        Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $aclReader -GroupSidReader $groups
+        Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $aclReader -GroupSidReader $groups -TestMode
     } 'write access' 'ACL write deny'
     $safeAcl = [pscustomobject]@{ AreAccessRulesProtected = $true; Access = @($readRule) }
     $safeReader = { param([string]$Path) $safeAcl }.GetNewClosure()
-    Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $safeReader -GroupSidReader $groups | Out-Null
+    Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -AclReader $safeReader -GroupSidReader $groups -TestMode | Out-Null
 
     $runnerText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1')
     foreach ($required in @('AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'SaveCopyAs', 'canonical_workbook_mutated')) {
