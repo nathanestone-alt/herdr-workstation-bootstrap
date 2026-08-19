@@ -225,17 +225,17 @@ fence_open_parent() {
   local anchor_name="$3"
   local parent_name="$4"
   local expected_fd="${5:-}"
-  local parent="${path%/*}"
-  local base="${path##*/}"
-  local fd
+  local fence_open_parent_path="${path%/*}"
+  local fence_open_parent_base="${path##*/}"
+  local fence_open_parent_fd
   if [[ -n "$expected_fd" ]]; then
-    fd="$expected_fd"
+    fence_open_parent_fd="$expected_fd"
   else
-    fence_open_directory "$parent" fd
+    fence_open_directory "$fence_open_parent_path" fence_open_parent_fd
   fi
-  printf -v "$fd_name" '%s' "$fd"
-  printf -v "$anchor_name" '/proc/self/fd/%s/%s' "$fd" "$base"
-  printf -v "$parent_name" '%s' "$parent"
+  printf -v "$fd_name" '%s' "$fence_open_parent_fd"
+  printf -v "$anchor_name" '/proc/self/fd/%s/%s' "$fence_open_parent_fd" "$fence_open_parent_base"
+  printf -v "$parent_name" '%s' "$fence_open_parent_path"
 }
 
 fence_require_parent() {
