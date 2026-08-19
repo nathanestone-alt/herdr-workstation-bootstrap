@@ -294,6 +294,7 @@ Keep passwords, tokens, recovery keys, SMB credentials, private SSH keys and Off
 - Whether Node 24 is needed beyond plugin requirements.
 - Whether the pinned RTK revision remains necessary.
 - The validated `pytest` and Windows Python dependency lock.
-- The narrow command schema for the Windows Excel job runner.
-- The retention period and exact provenance-manifest schema for the OneDrive review exchange.
+- The retention period for the OneDrive review exchange. The narrow command
+  schema and provenance records are locked in
+  `docs/issue-961-bridge-runner-contract.md`.
 - The exact deferred 20 TB backup-drive model and final Veeam/Backblaze schedule.
