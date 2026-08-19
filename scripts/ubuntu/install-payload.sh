@@ -655,7 +655,7 @@ load_toolchain_lock() {
   # shellcheck disable=SC1090
   source "$toolchain_lock_file"
   local required_key
-  for required_key in UV_VERSION UV_PLATFORM UV_URL UV_SHA256 PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256 TAILSCALE_VERSION; do
+  for required_key in UV_VERSION UV_PLATFORM UV_URL UV_SHA256 PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256 TAILSCALE_VERSION RUSTUP_VERSION RUST_TOOLCHAIN NODE_VERSION CODEX_VERSION CLAUDE_VERSION BUN_VERSION HERDR_VERSION POWERSHELL_VERSION; do
     [[ -n "${!required_key:-}" ]] || fail_closed "Toolchain lock key is missing: $required_key"
   done
   [[ "$UV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock uv version is not exact.'
@@ -670,6 +670,92 @@ load_toolchain_lock() {
   [[ "$PYTHON_URL" == "$expected_python_url" ]] || fail_closed 'Toolchain lock Python URL is inconsistent.'
   [[ "$UV_SHA256" =~ ^[0-9a-f]{64}$ && "$PYTHON_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_closed 'Toolchain lock runtime checksum is not exact.'
   [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock Tailscale version is not exact.'
+  for version_key in RUSTUP_VERSION RUST_TOOLCHAIN NODE_VERSION CODEX_VERSION CLAUDE_VERSION BUN_VERSION HERDR_VERSION POWERSHELL_VERSION; do
+    [[ "${!version_key}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed "Toolchain lock version is not exact: $version_key"
+  done
+}
+
+capture_receipt_command() {
+  local key="$1"
+  shift
+  local output
+  output="$("$@" 2>&1)" || fail_closed "toolchain receipt runtime probe failed: $key"
+  [[ -n "$output" && "$output" != *$'\n'* ]] || fail_closed "toolchain receipt runtime probe was malformed: $key"
+  expected_by_key["$key"]="$output"
+}
+
+capture_receipt_first_line() {
+  local key="$1"
+  shift
+  local output
+  output="$("$@" 2>&1)" || fail_closed "toolchain receipt runtime probe failed: $key"
+  output="${output%%$'\n'*}"
+  [[ -n "$output" && "$output" != *$'\n'* ]] || fail_closed "toolchain receipt runtime probe was malformed: $key"
+  expected_by_key["$key"]="$output"
+}
+
+validate_locked_receipt_value() {
+  local key="$1"
+  local value="${expected_by_key[$key]}"
+  local escaped_version
+  case "$key" in
+    rustup)
+      escaped_version="${RUSTUP_VERSION//./\\.}"
+      [[ "$value" =~ ^rustup[[:space:]]${escaped_version}([[:space:]]\([^[:space:]]+[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}\))?$ ]] || fail_closed "rustup receipt value does not match the locked version contract."
+      ;;
+    rustc)
+      escaped_version="${RUST_TOOLCHAIN//./\\.}"
+      [[ "$value" =~ ^rustc[[:space:]]${escaped_version}([[:space:]]\([^[:space:]]+[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}\))?$ ]] || fail_closed "rustc receipt value does not match the locked version contract."
+      ;;
+    node)
+      [[ "$value" == "v$NODE_VERSION" ]] || fail_closed 'Node receipt value does not match the locked version contract.'
+      ;;
+    npm)
+      [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || fail_closed 'npm receipt value is not a bounded semantic version.'
+      ;;
+    codex)
+      escaped_version="${CODEX_VERSION//./\\.}"
+      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || fail_closed 'Codex receipt value does not match the locked version contract.'
+      ;;
+    claude)
+      escaped_version="${CLAUDE_VERSION//./\\.}"
+      [[ "$value" =~ ^${escaped_version}([[:space:]]+\([^()]+\))?$ ]] || fail_closed 'Claude receipt value does not match the locked version contract.'
+      ;;
+    bun)
+      [[ "$value" == "$BUN_VERSION" ]] || fail_closed 'Bun receipt value does not match the locked version contract.'
+      ;;
+    herdr)
+      escaped_version="${HERDR_VERSION//./\\.}"
+      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || fail_closed 'Herdr receipt value does not match the locked version contract.'
+      ;;
+    powershell)
+      [[ "$value" == "$POWERSHELL_VERSION" ]] || fail_closed 'PowerShell receipt value does not match the locked version contract.'
+      ;;
+  esac
+}
+
+append_apt_receipt_expectations() {
+  local package
+  local apt_line
+  local apt_key
+  local apt_value
+  local apt_arch
+  local -a apt_packages=(
+    cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+  )
+  for package in "${apt_packages[@]}"; do
+    apt_line="$(dpkg-query -W -f='apt:${binary:Package}=${Version}\n' "$package" 2>/dev/null)" || fail_closed "unable to resolve locked APT receipt key: $package"
+    [[ "$apt_line" != *$'\n'* && "$apt_line" == apt:* && "$apt_line" == *"="* ]] || fail_closed "malformed APT receipt value: $package"
+    apt_key="${apt_line%%=*}"
+    apt_value="${apt_line#*=}"
+    if [[ "$apt_key" != "apt:$package" ]]; then
+      apt_arch="${apt_key#apt:$package}"
+      [[ "$apt_arch" =~ ^:[A-Za-z0-9_.+-]+$ ]] || fail_closed "unexpected locked APT receipt key: $apt_key"
+    fi
+    [[ -n "$apt_value" && "$apt_value" != *[[:space:]=]* ]] || fail_closed "malformed APT receipt version: $apt_key"
+    required_keys+=("$apt_key")
+    expected_by_key["$apt_key"]="$apt_value"
+  done
 }
 
 validate_toolchain_receipt() {
@@ -684,6 +770,7 @@ validate_toolchain_receipt() {
     uv_path python3.13_path py_path uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
+    rustup rustc node npm codex claude bun herdr powershell
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -711,9 +798,29 @@ validate_toolchain_receipt() {
   expected_by_key[tailscale]="$TAILSCALE_VERSION"
 
   [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || fail_closed "Missing bootstrap toolchain receipt: $receipt_path"
+  for managed_tool in rustup rustc herdr; do
+    validate_managed_tool "$managed_tool" "$HOME/.local/bin/$managed_tool"
+  done
+  for managed_tool in node npm codex claude bun; do
+    validate_managed_node_tool "$managed_tool"
+  done
+  command -v pwsh >/dev/null 2>&1 || fail_closed 'PowerShell is not discoverable.'
+  capture_receipt_first_line rustup rustup --version
+  capture_receipt_command rustc rustc --version
+  capture_receipt_command node node --version
+  capture_receipt_command npm npm --version
+  capture_receipt_command codex codex --version
+  capture_receipt_command claude claude --version
+  capture_receipt_command bun bun --version
+  capture_receipt_command herdr herdr --version
+  capture_receipt_command powershell pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  for runtime_key in rustup rustc node npm codex claude bun herdr powershell; do
+    validate_locked_receipt_value "$runtime_key"
+  done
+  append_apt_receipt_expectations
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_number=$((line_number + 1))
-    [[ "$line" =~ ^([A-Za-z][A-Za-z0-9_.-]*)=(.*)$ ]] || {
+    [[ "$line" =~ ^([A-Za-z][A-Za-z0-9_.:-]*)=(.*)$ ]] || {
       fail_closed "malformed toolchain receipt line $line_number"
     }
     key="${BASH_REMATCH[1]}"
@@ -739,6 +846,13 @@ validate_managed_tool() {
   [[ "$actual_path" == "$expected_path" ]] || fail_closed "$name is not managed: ${actual_path:-unavailable}"
   resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
   path_is_under "$resolved_path" "$home_real" || fail_closed "$name resolves outside HOME: $expected_path"
+}
+
+validate_managed_node_tool() {
+  local name="$1"
+  local node_root="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
+  validate_managed_tool "$name" "$HOME/.local/bin/$name"
+  path_is_under "$resolved_path" "$node_root" || fail_closed "$name resolves outside the locked Node prefix: $resolved_path"
 }
 
 validate_managed_toolchain() {

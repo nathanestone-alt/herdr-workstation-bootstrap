@@ -43,6 +43,63 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$managed_bin/uv" "$managed_bin/python3.13" "$managed_bin/py"
+cat > "$managed_bin/rustup" <<EOF
+#!/usr/bin/env bash
+printf 'rustup %s (fixturehash 2026-08-19)\\n' '$RUSTUP_VERSION'
+EOF
+cat > "$managed_bin/rustc" <<EOF
+#!/usr/bin/env bash
+printf 'rustc %s (fixturehash 2026-08-19)\\n' '$RUST_TOOLCHAIN'
+EOF
+cat > "$managed_bin/node" <<EOF
+#!/usr/bin/env bash
+printf 'v%s\\n' '$NODE_VERSION'
+EOF
+cat > "$managed_bin/npm" <<'EOF'
+#!/usr/bin/env bash
+printf '11.6.0\n'
+EOF
+cat > "$managed_bin/codex" <<EOF
+#!/usr/bin/env bash
+printf 'codex-cli %s\\n' '$CODEX_VERSION'
+EOF
+cat > "$managed_bin/claude" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$CLAUDE_VERSION'
+EOF
+cat > "$managed_bin/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$BUN_VERSION'
+EOF
+cat > "$managed_bin/herdr" <<EOF
+#!/usr/bin/env bash
+printf 'herdr %s\\n' '$HERDR_VERSION'
+EOF
+cat > "$managed_bin/pwsh" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$POWERSHELL_VERSION'
+EOF
+cat > "$managed_bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+package="${@: -1}"
+case "$package" in
+  cifs-utils|curl|git|git-lfs|gh|jq|mosh|openssh-client|openssh-server|ripgrep|rsync)
+    printf 'apt:%s=fixture-%s\n' "$package" "$package"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+node_bin="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64/bin"
+mkdir -p "$node_bin"
+for node_tool in node npm codex claude bun; do
+  mv "$managed_bin/$node_tool" "$node_bin/$node_tool"
+  ln -s "$node_bin/$node_tool" "$managed_bin/$node_tool"
+done
+chmod +x \
+  "$managed_bin/rustup" "$managed_bin/rustc" "$managed_bin/node" "$managed_bin/npm" \
+  "$managed_bin/codex" "$managed_bin/claude" "$managed_bin/bun" "$managed_bin/herdr" \
+  "$managed_bin/pwsh" "$managed_bin/dpkg-query"
 mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
 {
   printf 'receipt_format=issue-961-toolchain-v2\n'
@@ -66,6 +123,18 @@ mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
   printf 'python_url=%s\n' "$PYTHON_URL"
   printf 'python_sha256=%s\n' "$PYTHON_SHA256"
   printf 'tailscale=%s\n' "$TAILSCALE_VERSION"
+  printf 'rustup=rustup %s (fixturehash 2026-08-19)\n' "$RUSTUP_VERSION"
+  printf 'rustc=rustc %s (fixturehash 2026-08-19)\n' "$RUST_TOOLCHAIN"
+  printf 'node=v%s\n' "$NODE_VERSION"
+  printf 'npm=11.6.0\n'
+  printf 'codex=codex-cli %s\n' "$CODEX_VERSION"
+  printf 'claude=%s\n' "$CLAUDE_VERSION"
+  printf 'bun=%s\n' "$BUN_VERSION"
+  printf 'herdr=herdr %s\n' "$HERDR_VERSION"
+  printf 'powershell=%s\n' "$POWERSHELL_VERSION"
+  for package in cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
+    printf 'apt:%s=fixture-%s\n' "$package" "$package"
+  done
 } > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 
 # Exercise verify.sh's real bash -lc branch without allowing Git Bash's
@@ -180,10 +249,35 @@ receipt_fields=(
   uv_path python3.13_path py_path uv_version python3.13_version
   py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
   python_version python_platform python_release python_archive python_url python_sha256 tailscale
+  rustup rustc node npm codex claude bun herdr powershell
 )
 for receipt_field in "${receipt_fields[@]}"; do
   expect_receipt_field_failure "$receipt_field"
 done
+expect_receipt_field_failure 'apt:cifs-utils'
+
+expect_receipt_missing_field() {
+  local field="$1"
+  local receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+  local backup="$test_root/receipt-missing-$field.before"
+  local output="$test_root/verify-output-missing-$field.txt"
+  cp "$receipt" "$backup"
+  sed -i "/^${field}=/d" "$receipt"
+  set +e
+  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  local status=$?
+  set -e
+  mv "$backup" "$receipt"
+  [[ "$status" -ne 0 ]] || { cat "$output" >&2; echo "verify.sh accepted missing $field." >&2; exit 1; }
+  grep -Fq "FAIL receipt missing $field" "$output" || {
+    cat "$output" >&2
+    echo "verify.sh did not report missing $field." >&2
+    exit 1
+  }
+}
+
+expect_receipt_missing_field rustup
+expect_receipt_missing_field 'apt:cifs-utils'
 
 expect_receipt_structure_failure() {
   local case_name="$1"
@@ -209,8 +303,10 @@ expect_receipt_structure_failure() {
 expect_receipt_structure_failure duplicate-same "uv_version=uv $UV_VERSION ($UV_PLATFORM)"
 expect_receipt_structure_failure duplicate-conflict 'uv_version=uv 0.0.0 (x86_64-unknown-linux-gnu)'
 expect_receipt_structure_failure duplicate-tailscale "tailscale=$TAILSCALE_VERSION"
+expect_receipt_structure_failure duplicate-rustup "rustup=rustup $RUSTUP_VERSION (fixturehash 2026-08-19)"
 expect_receipt_structure_failure malformed 'not a receipt assignment'
 expect_receipt_structure_failure unknown 'future_key=not-allowed'
+expect_receipt_structure_failure extra-apt 'apt:future-package=fixture-1'
 
 rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
 : > "$HOME/.profile"

@@ -14,6 +14,15 @@ make_tool_fixtures() {
   local uv_platform="${FIXTURE_UV_PLATFORM:-x86_64-unknown-linux-gnu}"
   local python_version="${FIXTURE_PYTHON_VERSION:-3.13.15}"
   local py_probe="${FIXTURE_PY_PROBE:-3.13.15|x86_64|linux}"
+  local rustup_version="${FIXTURE_RUSTUP_VERSION:-$RUSTUP_VERSION}"
+  local rustc_version="${FIXTURE_RUSTC_VERSION:-$RUST_TOOLCHAIN}"
+  local node_version="${FIXTURE_NODE_VERSION:-$NODE_VERSION}"
+  local npm_version="${FIXTURE_NPM_VERSION:-11.6.0}"
+  local codex_version="${FIXTURE_CODEX_VERSION:-$CODEX_VERSION}"
+  local claude_version="${FIXTURE_CLAUDE_VERSION:-$CLAUDE_VERSION}"
+  local bun_version="${FIXTURE_BUN_VERSION:-$BUN_VERSION}"
+  local herdr_version="${FIXTURE_HERDR_VERSION:-$HERDR_VERSION}"
+  local powershell_version="${FIXTURE_POWERSHELL_VERSION:-$POWERSHELL_VERSION}"
   mkdir -p "$home/.local/bin"
   cat > "$home/.local/bin/uv" <<EOF
 #!/usr/bin/env bash
@@ -35,6 +44,64 @@ case "\${1:-}" in
 esac
 EOF
   chmod 0755 "$home/.local/bin/uv" "$home/.local/bin/python3.13" "$home/.local/bin/py"
+  cat > "$home/.local/bin/rustup" <<EOF
+#!/usr/bin/env bash
+printf 'rustup %s (fixturehash 2026-08-19)\\n' '$rustup_version'
+EOF
+  cat > "$home/.local/bin/rustc" <<EOF
+#!/usr/bin/env bash
+printf 'rustc %s (fixturehash 2026-08-19)\\n' '$rustc_version'
+EOF
+  cat > "$home/.local/bin/node" <<EOF
+#!/usr/bin/env bash
+printf 'v%s\\n' '$node_version'
+EOF
+  cat > "$home/.local/bin/npm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$npm_version'
+EOF
+  cat > "$home/.local/bin/codex" <<EOF
+#!/usr/bin/env bash
+printf 'codex-cli %s\\n' '$codex_version'
+EOF
+  cat > "$home/.local/bin/claude" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$claude_version'
+EOF
+  cat > "$home/.local/bin/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$bun_version'
+EOF
+  cat > "$home/.local/bin/herdr" <<EOF
+#!/usr/bin/env bash
+printf 'herdr %s\\n' '$herdr_version'
+EOF
+  cat > "$home/.local/bin/pwsh" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' '$powershell_version'
+EOF
+  cat > "$home/.local/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+package="${@: -1}"
+case "$package" in
+  cifs-utils|curl|git|git-lfs|gh|jq|mosh|openssh-client|openssh-server|ripgrep|rsync)
+    printf 'apt:%s=fixture-%s\n' "$package" "$package"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  node_bin="$home/.local/lib/node-v${NODE_VERSION}-linux-x64/bin"
+  mkdir -p "$node_bin"
+  for node_tool in node npm codex claude bun; do
+    mv "$home/.local/bin/$node_tool" "$node_bin/$node_tool"
+    ln -s "$node_bin/$node_tool" "$home/.local/bin/$node_tool"
+  done
+  chmod 0755 \
+    "$home/.local/bin/rustup" "$home/.local/bin/rustc" "$home/.local/bin/node" \
+    "$home/.local/bin/npm" "$home/.local/bin/codex" "$home/.local/bin/claude" \
+    "$home/.local/bin/bun" "$home/.local/bin/herdr" "$home/.local/bin/pwsh" \
+    "$home/.local/bin/dpkg-query"
 }
 
 make_fixture() {
@@ -101,6 +168,18 @@ write_toolchain_receipt() {
     printf 'python_url=%s\n' "$PYTHON_URL"
     printf 'python_sha256=%s\n' "$PYTHON_SHA256"
     printf 'tailscale=%s\n' "$TAILSCALE_VERSION"
+    printf 'rustup=rustup %s (fixturehash 2026-08-19)\n' "$RUSTUP_VERSION"
+    printf 'rustc=rustc %s (fixturehash 2026-08-19)\n' "$RUST_TOOLCHAIN"
+    printf 'node=v%s\n' "$NODE_VERSION"
+    printf 'npm=11.6.0\n'
+    printf 'codex=codex-cli %s\n' "$CODEX_VERSION"
+    printf 'claude=%s\n' "$CLAUDE_VERSION"
+    printf 'bun=%s\n' "$BUN_VERSION"
+    printf 'herdr=herdr %s\n' "$HERDR_VERSION"
+    printf 'powershell=%s\n' "$POWERSHELL_VERSION"
+    for package in cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
+      printf 'apt:%s=fixture-%s\n' "$package" "$package"
+    done
   } > "$home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 }
 
@@ -420,8 +499,8 @@ set -e
 assert_no_owned_transaction_residue "$success_home"
 [[ "$(< "$success_foreign/sentinel.txt")" == 'foreign success sentinel' ]] || exit 1
 
-# The current bootstrap producer emits a tailscale field. Prove the exact
-# starting consumer rejects that producer-shaped receipt, then prove the
+# The current bootstrap producer emits the complete strict receipt. Prove the
+# exact starting consumer rejects that producer-shaped receipt, then prove the
 # corrected consumer accepts it without touching a real HOME.
 make_fixture
 starting_receipt_home="$(new_home producer-shaped-starting)"
@@ -455,8 +534,57 @@ set -e
 [[ "$(< "$candidate_receipt_home/.agents/skills/demo/SKILL.md")" == '# fixture agents skill' ]] || exit 1
 [[ "$(< "$candidate_receipt_home/.claude/skills/demo/SKILL.md")" == '# fixture claude skill' ]] || exit 1
 assert_no_owned_transaction_residue "$candidate_receipt_home"
-printf 'Tailscale receipt compatibility: starting_status=%s (rejected), candidate_status=%s (accepted).\n' \
+printf 'Full toolchain receipt compatibility: starting_status=%s (rejected), candidate_status=%s (accepted).\n' \
   "$starting_receipt_status" "$candidate_receipt_status"
+
+# Every producer field is required exactly once, and runtime/managed-tool
+# contracts remain fail-closed before any payload destination mutation.
+make_fixture
+unknown_receipt_home="$(new_home unknown-receipt-key)"
+printf 'future_key=not-allowed\n' >> "$unknown_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked unknown-receipt-key "$unknown_receipt_home" 'unknown toolchain receipt key: future_key'
+
+make_fixture
+missing_receipt_key_home="$(new_home missing-receipt-key)"
+sed -i '/^rustc=/d' "$missing_receipt_key_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked missing-receipt-key "$missing_receipt_key_home" 'missing toolchain receipt key: rustc'
+
+make_fixture
+duplicate_receipt_key_home="$(new_home duplicate-receipt-key)"
+printf 'rustup=rustup %s (fixturehash 2026-08-19)\n' "$RUSTUP_VERSION" >> \
+  "$duplicate_receipt_key_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked duplicate-receipt-key "$duplicate_receipt_key_home" 'duplicate toolchain receipt key: rustup'
+
+make_fixture
+malformed_receipt_home="$(new_home malformed-receipt)"
+printf 'not a receipt assignment\n' >> "$malformed_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked malformed-receipt "$malformed_receipt_home" 'malformed toolchain receipt line'
+
+make_fixture
+extra_apt_receipt_home="$(new_home extra-apt-receipt)"
+printf 'apt:future-package=fixture-1\n' >> "$extra_apt_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+expect_receipt_blocked extra-apt-receipt "$extra_apt_receipt_home" 'unknown toolchain receipt key: apt:future-package'
+
+make_fixture
+rustup_contract_home="$(FIXTURE_RUSTUP_VERSION=0.0.1 new_home rustup-contract)"
+expect_receipt_blocked rustup-contract "$rustup_contract_home" 'rustup receipt value does not match the locked version contract'
+
+make_fixture
+node_contract_home="$(FIXTURE_NODE_VERSION=0.0.1 new_home node-contract)"
+expect_receipt_blocked node-contract "$node_contract_home" 'Node receipt value does not match the locked version contract'
+
+make_fixture
+npm_contract_home="$(FIXTURE_NPM_VERSION=not-a-version new_home npm-contract)"
+expect_receipt_blocked npm-contract "$npm_contract_home" 'npm receipt value is not a bounded semantic version'
+
+make_fixture
+managed_tool_home="$(new_home managed-tool-path)"
+mv "$managed_tool_home/.local/bin/node" "$managed_tool_home/.local/bin/node-missing"
+expect_receipt_blocked managed-tool-path "$managed_tool_home" 'managed tool is missing or not executable'
+
+make_fixture
+powershell_contract_home="$(FIXTURE_POWERSHELL_VERSION=7.6.4 new_home powershell-contract)"
+expect_receipt_blocked powershell-contract "$powershell_contract_home" 'PowerShell receipt value does not match the locked version contract'
 
 # Locked toolchain provenance is required before any payload destination move.
 make_fixture
