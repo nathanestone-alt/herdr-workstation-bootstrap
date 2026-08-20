@@ -139,7 +139,11 @@ function Invoke-HerdrText {
     }
 
     if ($LASTEXITCODE -ne 0) {
-        throw "herdr $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
+        $failureText = $output -join [Environment]::NewLine
+        if ($failureText -match '(?i)PermissionDenied|Operation not permitted') {
+            throw "host_access_unavailable: native Herdr access for 'herdr $($Arguments -join ' ')' returned PermissionDenied/Operation not permitted. HERDR_ENV=1 is not sufficient; obtain host-level execution before issuing any workflow or naming command."
+        }
+        throw "herdr $($Arguments -join ' ') failed: $failureText"
     }
 
     return $output -join [Environment]::NewLine
@@ -2504,6 +2508,7 @@ $NamingAppliedBodyPattern =
     '\s+\[APPLIED-TAB (?<tab>w[0-9A-Za-z]+:t[0-9A-Za-z]+)\]' +
     '\s+\[APPLIED-COORDINATOR (?<coordinator>w[0-9A-Za-z]+:p[0-9A-Za-z]+)\]' +
     '\s+applied; canonical_name=(?<name>[^;\s]+); subtitle_b64=(?<subtitle>[A-Za-z0-9+/=]*);' +
+    '(?: pane_label=(?<panelabel>[^;\s]+);)?' +
     ' coordinator_session=(?<coordsession>[^;\s]+); target_session=(?<targetsession>[^;\s]+)$'
 $NamingDispositionBodyPattern =
     '^\[HD:(?<proof>[0-9a-fA-F]{8})\](?:\s+\[ROUTE[^\]]+\])?' +
@@ -2547,6 +2552,7 @@ function ConvertTo-NamingAppliedProof {
         target_tab_id = [string]$Matches['tab']
         coordinator_pane_id = [string]$Matches['coordinator']
         canonical_name = [string]$Matches['name']
+        pane_label = if ($Matches['panelabel']) { [string]$Matches['panelabel'] } else { [string]$Matches['name'] }
         subtitle = $subtitle
         coordinator_session = [string]$Matches['coordsession']
         target_session = [string]$Matches['targetsession']
@@ -2862,9 +2868,16 @@ function Get-NamingRequesterProof {
     else {
         $null
     }
+    # Claude's managed hook may not export HERDR_AGENT_SESSION_ID to the
+    # command shell that submits the name request. When there is no explicit
+    # hint, use the live pane/session plus the caller-process lease already
+    # proven by Get-CurrentRelayReaderProof. This is a fallback to native
+    # Herdr identity, not reconstruction from a transcript, cwd, or UI label.
+    $allowLiveSessionFallback = [string]::IsNullOrWhiteSpace($sessionHint)
     return Get-CurrentRelayReaderProof `
         -TargetPaneId $SenderPaneId `
-        -CallerSession $sessionHint
+        -CallerSession $sessionHint `
+        -AllowSessionRotation:$allowLiveSessionFallback
 }
 
 function Test-HerdrPaneNotFoundException {
@@ -3037,6 +3050,86 @@ function Assert-CoordinatorCaller {
     }
 }
 
+function Get-CoordinatorVisiblePaneLabel {
+    param([Parameter(Mandatory)][object]$Pane)
+
+    foreach ($name in @("label", "pane_label")) {
+        $property = $Pane.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim()
+        }
+    }
+    return ""
+}
+
+function Set-AtomicCanonicalPaneAndTabLabel {
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$TabId,
+        [Parameter(Mandatory)][string]$CanonicalName,
+        [AllowEmptyString()][string]$PreviousPaneLabel = "",
+        [AllowEmptyString()][string]$PreviousTabLabel = ""
+    )
+
+    $tabChanged = $false
+    $paneChanged = $false
+    try {
+        if ($PreviousTabLabel -cne $CanonicalName) {
+            $null = Invoke-HerdrJson -Arguments @("tab", "rename", $TabId, $CanonicalName)
+            $tabChanged = $true
+        }
+        if ($PreviousPaneLabel -cne $CanonicalName) {
+            $null = Invoke-HerdrJson -Arguments @("pane", "rename", $PaneId, $CanonicalName)
+            $paneChanged = $true
+        }
+
+        $afterPane = (Invoke-HerdrJson -Arguments @("pane", "get", $PaneId)).result.pane
+        $afterVisibleLabel = Get-CoordinatorVisiblePaneLabel -Pane $afterPane
+        $afterTab = (Invoke-HerdrJson -Arguments @("tab", "get", $TabId)).result.tab
+        $afterTabLabel = [string]$afterTab.label
+        if ($afterVisibleLabel -cne $CanonicalName -or $afterTabLabel -cne $CanonicalName) {
+            throw "canonical label verification failed: pane='$afterVisibleLabel', tab='$afterTabLabel', expected='$CanonicalName'."
+        }
+        return [pscustomobject]@{
+            pane = $afterPane
+            pane_label = $afterVisibleLabel
+            tab = $afterTab
+            tab_label = $afterTabLabel
+        }
+    }
+    catch {
+        $original = $_.Exception.Message
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
+        if ($paneChanged) {
+            try {
+                if ([string]::IsNullOrWhiteSpace($PreviousPaneLabel)) {
+                    $null = Invoke-HerdrJson -Arguments @("pane", "rename", $PaneId, "--clear")
+                }
+                else {
+                    $null = Invoke-HerdrJson -Arguments @("pane", "rename", $PaneId, $PreviousPaneLabel)
+                }
+            }
+            catch { $rollbackErrors.Add("pane rollback: $($_.Exception.Message)") }
+        }
+        if ($tabChanged) {
+            try {
+                if ([string]::IsNullOrWhiteSpace($PreviousTabLabel)) {
+                    $null = Invoke-HerdrJson -Arguments @("tab", "rename", $TabId, "")
+                }
+                else {
+                    $null = Invoke-HerdrJson -Arguments @("tab", "rename", $TabId, $PreviousTabLabel)
+                }
+            }
+            catch { $rollbackErrors.Add("tab rollback: $($_.Exception.Message)") }
+        }
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Atomic canonical label reconciliation failed: $original Rollback was not proven: $($rollbackErrors -join '; ')"
+        }
+        throw "Atomic canonical label reconciliation failed before metadata mutation: $original"
+    }
+}
+
 function Invoke-CoordinatorApplyName {
     param(
         [Parameter(Mandatory)][string]$CoordinatorPaneId,
@@ -3044,7 +3137,7 @@ function Invoke-CoordinatorApplyName {
         [Parameter(Mandatory)][string]$CanonicalName,
         [Parameter(Mandatory)][string]$Subtitle,
         [Parameter(Mandatory)][string]$ExpectedCurrentLabel,
-        [string]$RequiredTargetSession
+    [string]$RequiredTargetSession
     )
 
     $effectiveSubtitle = Normalize-PaneMetadataValue -Value $Subtitle
@@ -3074,9 +3167,13 @@ function Invoke-CoordinatorApplyName {
     if ([string]$targetAgent.pane_id -ne $TargetPaneId -or [string]$targetPane.tab_id -ne $labelProof.tab_id) {
         throw "Target pane/session tuple changed before apply-name mutation."
     }
-    if ($labelProof.tab_label -cne $CanonicalName) {
-        $null = Invoke-HerdrJson -Arguments @("tab", "rename", $labelProof.tab_id, $CanonicalName)
-    }
+    $previousPaneLabel = Get-CoordinatorVisiblePaneLabel -Pane $targetPane
+    $labelReconciliation = Set-AtomicCanonicalPaneAndTabLabel `
+        -PaneId $TargetPaneId `
+        -TabId $labelProof.tab_id `
+        -CanonicalName $CanonicalName `
+        -PreviousPaneLabel $previousPaneLabel `
+        -PreviousTabLabel ([string]$labelProof.tab_label)
     $null = Invoke-HerdrJson -Arguments @(
         "pane", "report-metadata", $TargetPaneId,
         "--source", "herdr-coordination",
@@ -3088,11 +3185,13 @@ function Invoke-CoordinatorApplyName {
     )
     $afterPane = (Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)).result.pane
     $afterLabel = (Invoke-HerdrJson -Arguments @("tab", "get", [string]$afterPane.tab_id)).result.tab.label
+    $afterPaneLabel = Get-CoordinatorVisiblePaneLabel -Pane $afterPane
     $afterAgent = (Invoke-HerdrJson -Arguments @("agent", "get", $TargetPaneId)).result.agent
     $afterTitle = if ($afterAgent.PSObject.Properties["title"]) { [string]$afterAgent.title } else { $null }
     $afterDisplay = if ($afterAgent.PSObject.Properties["display_agent"]) { [string]$afterAgent.display_agent } else { $null }
-    if ([string]$afterLabel -cne $CanonicalName -or $afterTitle -cne $effectiveSubtitle -or $afterDisplay -cne $effectiveSubtitle) {
-        throw "apply-name verification failed: label='$afterLabel', title='$afterTitle', display-agent='$afterDisplay'."
+    if ([string]$afterLabel -cne $CanonicalName -or $afterPaneLabel -cne $CanonicalName -or
+        $afterTitle -cne $effectiveSubtitle -or $afterDisplay -cne $effectiveSubtitle) {
+        throw "apply-name verification failed: pane-label='$afterPaneLabel', label='$afterLabel', title='$afterTitle', display-agent='$afterDisplay'."
     }
 
     return [pscustomobject]@{
@@ -3103,6 +3202,7 @@ function Invoke-CoordinatorApplyName {
         target_session = $targetSession
         tab_id = [string]$afterPane.tab_id
         tab_label = [string]$afterLabel
+        pane_label = $afterPaneLabel
         title = $afterTitle
         display_agent = $afterDisplay
     }
@@ -3124,7 +3224,7 @@ function Add-NamingAppliedProof {
         " [APPLIED-TAB $($Applied.tab_id)]" +
         " [APPLIED-COORDINATOR $($Applied.coordinator_pane_id)]" +
         " applied; canonical_name=$($Applied.tab_label); subtitle_b64=$subtitleB64;" +
-        " coordinator_session=$($Applied.coordinator_session); target_session=$($Applied.target_session)"
+        " pane_label=$($Applied.pane_label); coordinator_session=$($Applied.coordinator_session); target_session=$($Applied.target_session)"
     $entry = Add-CoordinationEntry `
         -Path $Path `
         -Sender ([string]$Applied.coordinator_pane_id) `
@@ -3137,6 +3237,7 @@ function Add-NamingAppliedProof {
         target_tab_id = [string]$Applied.tab_id
         coordinator_pane_id = [string]$Applied.coordinator_pane_id
         canonical_name = [string]$Applied.tab_label
+        pane_label = [string]$Applied.pane_label
         subtitle = [string]$Applied.title
         coordinator_session = [string]$Applied.coordinator_session
         target_session = [string]$Applied.target_session
@@ -3398,6 +3499,7 @@ function Invoke-NamingRequestConsumption {
             target_session = [string]$existing.target_session
             tab_id = [string]$existing.target_tab_id
             tab_label = [string]$existing.canonical_name
+            pane_label = if ($existing.PSObject.Properties['pane_label']) { [string]$existing.pane_label } else { [string]$existing.canonical_name }
             title = [string]$existing.subtitle
             display_agent = [string]$existing.subtitle
         }
@@ -3417,6 +3519,7 @@ function Invoke-NamingRequestConsumption {
             target_session = [string]$existingDisposition.requester_session
             tab_id = $null
             tab_label = $null
+            pane_label = $null
             title = $null
             display_agent = $null
         }
@@ -3439,6 +3542,7 @@ function Invoke-NamingRequestConsumption {
             target_session = $null
             tab_id = $null
             tab_label = $null
+            pane_label = $null
             title = $null
             display_agent = $null
         }
@@ -3485,6 +3589,7 @@ function Invoke-NamingRequestConsumption {
                 target_session = [string]$disposition.requester_session
                 tab_id = $null
                 tab_label = $null
+                pane_label = $null
                 title = $null
                 display_agent = $null
             }
@@ -3566,6 +3671,7 @@ function Invoke-NamingRequestConsumption {
         target_session = [string]$applied.target_session
         tab_id = [string]$applied.tab_id
         tab_label = [string]$applied.tab_label
+        pane_label = [string]$applied.pane_label
         title = [string]$applied.title
         display_agent = [string]$applied.display_agent
     }
@@ -3813,6 +3919,7 @@ switch ($Action) {
                 target_session = $applied.target_session
                 tab_id = $applied.tab_id
                 tab_label = $applied.tab_label
+                pane_label = $applied.pane_label
                 title = $applied.title
                 display_agent = $applied.display_agent
             } | ConvertTo-Json -Depth 16
@@ -3848,6 +3955,7 @@ switch ($Action) {
             target_session = $result.target_session
             tab_id = $result.tab_id
             tab_label = $result.tab_label
+            pane_label = $result.pane_label
             title = $result.title
             display_agent = $result.display_agent
         } | ConvertTo-Json -Depth 16

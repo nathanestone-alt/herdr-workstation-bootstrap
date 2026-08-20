@@ -9,8 +9,8 @@ description: "Coordinate live Claude and Codex sessions through Herdr using stab
 
 Treat `the tracked coordination-skill repository checkout` as the editable source of
 truth. Do not make durable edits directly in the installed
-`$HOME/.agents/skills/herdr-coordination` checkout. Commit and push
-source changes to its configured origin, then run:
+`$HOME/.agents/skills/herdr-coordination` checkout. Commit source changes, then
+run:
 
 ```powershell
 rtk pwsh -NoProfile -File scripts/sync_installed_skill.ps1 -Action install
@@ -19,7 +19,16 @@ rtk pwsh -NoProfile -File scripts/sync_installed_skill.ps1 -Action install
 Use `-Action check` to prove that the installed skill is clean and at the exact
 source commit. The synchronizer refuses dirty source or installed checkouts and
 uses only a fast-forward Git update; it never reconstructs files from the
-currently focused pane.
+currently focused pane. A pushed commit is preferred for reproducible installs;
+when the clean source commit is not yet on the remote, `-Action install` can
+fetch that exact committed local `HEAD` while retaining the configured origin.
+If an older environment has a plain copied directory
+at the install path, the first `-Action install` migrates it by cloning the
+exact committed source beside it, swapping in the Git checkout only after the
+clone succeeds, and retaining the old copy as a timestamped sibling backup.
+Later installs use a fast-forward from the pushed origin when available, or the
+same exact local-commit fallback for this machine; push the source branch for
+other machines to consume it.
 
 Coordinate existing agents without hard-coding workspace, tab, pane, terminal, or native session IDs. Use the official `herdr` skill as the authority for topology changes and pane control; this skill adds a shared-message protocol and deterministic coordinator discovery.
 
@@ -27,7 +36,7 @@ Coordinate existing agents without hard-coding workspace, tab, pane, terminal, o
 
 1. Verify `HERDR_ENV=1` before any Herdr control command using the agent's native host-shell tool. Never make this decision inside context-mode, an MCP server, a sandboxed executor, or a detached helper because those subprocesses may strip pane-scoped `HERDR_*` variables. If such a subprocess reports them missing, recheck directly; stop only when the direct host-shell check fails.
 
-   For registration and any pane/agent operation that requires live pane metadata, make an explicit host-access preflight by running `herdr pane get <live-pane-id>` from that native host shell; `HERDR_ENV=1` alone is not proof that pane access is available. If the preflight returns `PermissionDenied` or `Operation not permitted`, classify the attempt as `host_access_unavailable`, do not issue or retry registration from the same sandbox, and obtain host-level execution before retrying the preflight. Run the authorized initialization command only after the preflight succeeds. If a legacy attempt already failed before that preflight, allow at most one host-level retry, then stop and report that no session identity was returned.
+   For registration, workflow, naming, and any pane/agent operation that requires live pane metadata, make an explicit host-access preflight by running `herdr pane get <live-pane-id>` from that native host shell; `HERDR_ENV=1` alone is not proof that pane access is available. If the preflight returns `PermissionDenied` or `Operation not permitted`, classify the attempt as `host_access_unavailable`, issue no workflow, naming, registration, prompt, or metadata mutation from the same sandbox, and obtain host-level execution before retrying the preflight. The helper scripts preserve this classification instead of swallowing the error. Run the authorized initialization or bootstrap command only after the preflight succeeds. If a legacy attempt already failed before that preflight, allow at most one host-level retry, then stop and report that no session identity was returned. Do not issue or retry registration from the same sandbox after this classification.
 2. Run `herdr --help` and the relevant command group when command syntax has not been established in the current turn.
 3. Discover live IDs from Herdr JSON. Never persist or predict an ID. The reviewed 0.8.0 preview still lets `--current` fall back to UI focus when `HERDR_PANE_ID` is absent, so require the native workspace/tab/pane IDs and use the explicit pane ID; never use `--current` as identity recovery.
 4. Read a target pane before waiting for new output or recovering input.
@@ -348,6 +357,37 @@ session-bound Herdr metadata report, and fails closed if Herdr cannot expose
 the exact values. Workflow preflight reads this native report (or equivalent
 native agent fields) and never infers execution profile from UI text.
 
+The tracked workflow helper also exposes one bounded `bootstrap-request` path for
+a fresh or unlabeled standing pane. It accepts the target cwd, provider/model,
+reasoning effort/service tier, role/name metadata, brief, artifact, and task in
+one invocation. It first proves host access and the native agent workspace/process
+cwd from `agent get` when available (falling back to pane `cwd`; `foreground_cwd`
+is retained only as child-process diagnostic data), starts an agent only in the
+existing shell pane when no agent is present, sends one setup prompt for native
+profile reporting plus naming, reads and consumes the naming relay, re-preflights
+the pane, and dispatches the same tracked request. A missing or stale native
+session or inconsistent visible pane/tab label remains fail-closed; the path
+never asks for a benign `ok` prompt or reconstructs identity.
+
+```powershell
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
+  -Action bootstrap-request -PaneId <fresh-pane> `
+  -ExpectedCwd "/exact/worktree" -ExpectedTabLabel "shell" `
+  -TargetAgentKind codex -Provider openai -Model gpt-5.6-luna `
+  -ReasoningEffort max -ServiceTier priority `
+  -RepoCode STM -LaneCode T -RoleCode O -WorkKind issue `
+  -IssueNumber 961 -WorkTitle "Bridge correction" `
+  -TaskId "#961" -CandidateId "<candidate>" -ReviewType "independent review" `
+  -Message "<brief>" -ArtifactPath "/tmp/review-961.md"
+```
+
+For exact worktree proof, launch a standing pane by changing the shell into the
+worktree before starting Codex (`cd /exact/worktree; codex`). Codex `-C` may set
+the UI workspace while Herdr still reports the shell/foreground cwd; it is not a
+substitute for the explicit `-ExpectedCwd` proof. Reused panes must report the
+profile again after a native process/session change; stale workflow profile
+tokens are invalidated automatically during preflight.
+
 If a reviewer produced a durable verdict but `complete` was refused during a temporary native-session proof gap, never fabricate completion or close the ledger from pane identity alone. Prefer having the original target retry `complete` after its exact native session is restored. When that is impractical, only the dynamically discovered `Coordination` pane may run `-Action reconcile-completion`, and only while all of these proofs agree:
 
 - the request and work ACK name the same target pane, agent, and native session;
@@ -417,6 +457,14 @@ a payload, borrow one from another session, or bind its session to the current
 pane from UI focus.
 
 For Codex, keep Herdr's managed `SessionStart` hook and register a separate local refresh hook for `UserPromptSubmit` and `Stop`; the refresh hook must accept only a native payload carrying its own `session_id` and delegate through Herdr's managed Codex provenance checks. Do not edit either managed integration file because integration updates overwrite it.
+
+If a managed Claude invocation does not export `HERDR_AGENT_SESSION_ID`, the
+naming helper may fall back to the live Herdr agent session only when the exact
+caller pane and process-bound lease are proven. It never borrows a session from
+another pane or reconstructs one from cwd, UI text, or a transcript filename.
+For a fresh or resumed Codex pane whose SessionStart report has not registered
+yet, use `bootstrap-request`: it starts/resumes the exact existing pane and
+performs profile and naming setup without a manual benign prompt.
 
 After every `herdr integration install codex`, rerun the Codex refresh test
 against the newly installed managed schema. Integration v7 requires the native

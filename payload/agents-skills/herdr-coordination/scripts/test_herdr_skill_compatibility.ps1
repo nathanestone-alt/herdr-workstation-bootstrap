@@ -406,7 +406,8 @@ if ($coordinationSkillContent -notmatch "native host-shell tool" -or
     $coordinationSkillContent -notmatch "subprocesses may strip pane-scoped" -or
     $coordinationSkillContent -notmatch "host-access preflight" -or
     $coordinationSkillContent -notmatch "PermissionDenied" -or
-    $coordinationSkillContent -notmatch "do not issue or retry registration from the same sandbox") {
+    $coordinationSkillContent -notmatch "do not issue or retry registration from the same sandbox" -or
+    $coordinationSkillContent -notmatch "no workflow, naming, registration, prompt, or metadata mutation") {
     Add-Failure "Coordination skill is missing sandboxed HERDR_ENV false-negative containment."
 }
 if ($coordinationSkillContent -notmatch '`--current` fall back to UI focus' -or
@@ -482,6 +483,25 @@ if ($workflowHelperContent -notmatch 'Assert-WorkflowCallerProof' -or
     $workflowHelperContent -notmatch 'Read-WorkflowArtifactSnapshot' -or
     $workflowHelperContent -notmatch 'request_reserved') {
     Add-Failure "Workflow helper is missing caller-process proof, tab continuity, atomic ACK/completion gating, artifact snapshots, or reservation recovery."
+}
+if ($workflowHelperContent -notmatch 'bootstrap-request' -or
+    $workflowHelperContent -notmatch 'ExpectedCwd' -or
+    $workflowHelperContent -notmatch 'foreground_cwd' -or
+    $workflowHelperContent -notmatch 'Get-WorkflowAgentWorkspaceCwd' -or
+    $workflowHelperContent -notmatch 'agent_workspace_cwd' -or
+    $workflowHelperContent -notmatch 'labels_consistent' -or
+    $workflowHelperContent -notmatch 'stale_profile_cleared' -or
+    $workflowHelperContent -notmatch 'agent start' -or
+    $workflowHelperContent -notmatch 'WorkflowPath' -or
+    $workflowHelperContent -notmatch 'CoordinationPath') {
+    Add-Failure "Workflow helper is missing atomic bootstrap, exact cwd proof, or stale-profile invalidation."
+}
+if ($coordinationHelperContent -notmatch 'host_access_unavailable' -or
+    $coordinationHelperContent -notmatch 'AllowSessionRotation:\$allowLiveSessionFallback' -or
+    $coordinationHelperContent -notmatch 'Set-AtomicCanonicalPaneAndTabLabel' -or
+    $registryHelperContent -notmatch 'Set-AtomicRegistryPaneAndTabLabel' -or
+    $registryHelperContent -notmatch '"pane"\s*,\s*"rename"') {
+    Add-Failure "Herdr helpers are missing host-access classification, live-session naming fallback, or atomic visible-label reconciliation."
 }
 
 $codexRoot = Join-Path -Path $homePath -ChildPath ".codex"

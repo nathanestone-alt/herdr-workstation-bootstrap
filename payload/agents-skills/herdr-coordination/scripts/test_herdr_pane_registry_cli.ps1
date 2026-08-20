@@ -79,6 +79,7 @@ function Invoke-Registry {
 try {
     $mockState = [ordered]@{
         target_tab_label = "E1"
+        target_pane_label = "Target"
         target_title = ""
         target_display_agent = ""
         target_tokens = [ordered]@{}
@@ -104,7 +105,7 @@ function Pane-Data([string]$paneId) {
         return [ordered]@{ pane_id="w1:p1"; workspace_id="w1"; tab_id="w1:t1"; terminal_id="term-coord"; terminal_title="Coordinator"; terminal_title_stripped="Coordinator"; agent="codex"; agent_status="idle"; revision=10; cwd="C:\dev\Codex\Herder" }
     }
     if ($paneId -eq "w2:p1") {
-        return [ordered]@{ pane_id="w2:p1"; workspace_id="w2"; tab_id="w2:t1"; terminal_id="term-target"; terminal_title="Target"; terminal_title_stripped="Target"; agent="claude"; agent_status="idle"; revision=20; cwd="C:\dev\stmodel" }
+        return [ordered]@{ pane_id="w2:p1"; workspace_id="w2"; tab_id="w2:t1"; terminal_id="term-target"; terminal_title="Target"; terminal_title_stripped="Target"; label=[string]$state.target_pane_label; agent="claude"; agent_status="idle"; revision=20; cwd="C:\dev\stmodel" }
     }
     throw "unknown pane $paneId"
 }
@@ -159,6 +160,13 @@ if ($arguments[0] -eq "tab" -and $arguments[1] -eq "rename") {
     $state.target_tab_label = $arguments[3]
     Save-State
     [ordered]@{ id="test"; result=[ordered]@{ type="tab_renamed"; tab_id="w2:t1"; label=$arguments[3] } } | ConvertTo-Json -Depth 16 -Compress
+    exit 0
+}
+if ($arguments[0] -eq "pane" -and $arguments[1] -eq "rename") {
+    if ($arguments[2] -ne "w2:p1") { throw "unexpected pane rename" }
+    $state.target_pane_label = if ($arguments.Count -gt 3 -and $arguments[3] -eq "--clear") { "" } else { [string]$arguments[3] }
+    Save-State
+    [ordered]@{ id="test"; result=[ordered]@{ type="pane_renamed"; pane_id="w2:p1"; label=$state.target_pane_label } } | ConvertTo-Json -Depth 16 -Compress
     exit 0
 }
 if ($arguments[0] -eq "pane" -and $arguments[1] -eq "report-metadata") {
@@ -222,6 +230,7 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Assert-Equal $assignment.canonical_name "STM-E1" "Prepared assignment changed canonical name"
     $updatedState = Get-Content -Raw $statePath | ConvertFrom-Json -Depth 16
     Assert-Equal $updatedState.target_tab_label "STM-E1" "Canonical tab rename was not applied"
+    Assert-Equal $updatedState.target_pane_label "STM-E1" "Canonical visible pane label was not applied"
     Assert-Equal $updatedState.target_title "EXPLORE · unassigned" "Work subname was not applied"
     Assert-Equal $updatedState.target_display_agent "EXPLORE · unassigned" "Sidebar work subtitle was not applied"
     Assert-Equal $updatedState.target_tokens.canonical_name "STM-E1" "Registry metadata token was not applied"
