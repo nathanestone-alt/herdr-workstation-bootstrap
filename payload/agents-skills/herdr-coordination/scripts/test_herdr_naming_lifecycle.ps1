@@ -83,6 +83,7 @@ function Reset-MockState {
     )
     $state = [ordered]@{
         target_tab_label = $TargetTabLabel
+        target_pane_label = "shell"
         target_title = ""
         target_display_agent = ""
         target_error = $TargetError
@@ -189,7 +190,7 @@ function Get-PaneData([string]$paneId) {
         return [ordered]@{ pane_id="w1:p1"; workspace_id="w1"; tab_id="w1:t1"; terminal_id="term-coord"; revision=3; agent="codex"; agent_status="idle"; cwd="C:\dev\Codex\Herder" }
     }
     if ($paneId -eq "w2:p2") {
-        return [ordered]@{ pane_id="w2:p2"; workspace_id="w2"; tab_id="w2:t2"; terminal_id="term-target"; revision=5; agent="codex"; agent_status="idle"; cwd="C:\dev\stmodel" }
+        return [ordered]@{ pane_id="w2:p2"; workspace_id="w2"; tab_id="w2:t2"; terminal_id="term-target"; revision=5; agent="codex"; agent_status="idle"; cwd="C:\dev\stmodel"; label=[string]$state.target_pane_label }
     }
     throw "unknown pane $paneId"
 }
@@ -257,6 +258,13 @@ if ($arguments[0] -eq "tab" -and $arguments[1] -eq "rename") {
     $state.target_tab_label = $arguments[3]
     Save-State
     [ordered]@{ id="test"; result=[ordered]@{ type="tab_renamed"; tab_id=$arguments[2]; label=$arguments[3] } } | ConvertTo-Json -Depth 16 -Compress
+    exit 0
+}
+if ($arguments[0] -eq "pane" -and $arguments[1] -eq "rename") {
+    if ($arguments[2] -ne "w2:p2") { throw "unexpected pane rename target $($arguments[2])" }
+    $state.target_pane_label = if ($arguments.Count -gt 3 -and $arguments[3] -eq "--clear") { "" } else { [string]$arguments[3] }
+    Save-State
+    [ordered]@{ id="test"; result=[ordered]@{ type="pane_renamed"; pane_id=$arguments[2]; label=$state.target_pane_label } } | ConvertTo-Json -Depth 16 -Compress
     exit 0
 }
 if ($arguments[0] -eq "pane" -and $arguments[1] -eq "report-metadata") {
@@ -348,6 +356,7 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
 
     $applyCalls = Get-MockCalls
     Assert-True ($applyCalls -match "tab rename w2:t2 $([regex]::Escape($expectedName))") "Coordinator did not rename the exact target tab"
+    Assert-True ($applyCalls -match "pane rename w2:p2 $([regex]::Escape($expectedName))") "Coordinator did not reconcile the exact visible pane label"
     Assert-True ($applyCalls -match "pane report-metadata w2:p2") "Coordinator did not report the work subtitle"
 
     $applyLogText = (Get-Content -LiteralPath $applyLog) -join "`n"

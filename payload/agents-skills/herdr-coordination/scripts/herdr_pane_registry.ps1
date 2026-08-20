@@ -46,7 +46,11 @@ function Invoke-HerdrRegistryJson {
 
     $output = & rtk proxy herdr @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "herdr $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
+        $failureText = $output -join [Environment]::NewLine
+        if ($failureText -match '(?i)PermissionDenied|Operation not permitted') {
+            throw "host_access_unavailable: native Herdr access for 'herdr $($Arguments -join ' ')' returned PermissionDenied/Operation not permitted. HERDR_ENV=1 is not sufficient; obtain host-level execution before registry, workflow, or naming mutation."
+        }
+        throw "herdr $($Arguments -join ' ') failed: $failureText"
     }
     $text = ($output -join [Environment]::NewLine).Trim()
     try {
@@ -54,6 +58,80 @@ function Invoke-HerdrRegistryJson {
     }
     catch {
         throw "herdr $($Arguments -join ' ') returned invalid JSON: $text"
+    }
+}
+
+function Get-RegistryVisiblePaneLabel {
+    param([Parameter(Mandatory)][object]$Pane)
+
+    foreach ($name in @("label", "pane_label")) {
+        $property = $Pane.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim()
+        }
+    }
+    return ""
+}
+
+function Set-AtomicRegistryPaneAndTabLabel {
+    param(
+        [Parameter(Mandatory)][string]$PaneId,
+        [Parameter(Mandatory)][string]$TabId,
+        [Parameter(Mandatory)][string]$CanonicalName,
+        [AllowEmptyString()][string]$PreviousPaneLabel = "",
+        [AllowEmptyString()][string]$PreviousTabLabel = ""
+    )
+
+    $tabChanged = $false
+    $paneChanged = $false
+    try {
+        if ($PreviousTabLabel -cne $CanonicalName) {
+            $null = Invoke-HerdrRegistryJson -Arguments @("tab", "rename", $TabId, $CanonicalName)
+            $tabChanged = $true
+        }
+        if ($PreviousPaneLabel -cne $CanonicalName) {
+            $null = Invoke-HerdrRegistryJson -Arguments @("pane", "rename", $PaneId, $CanonicalName)
+            $paneChanged = $true
+        }
+        $afterPane = (Invoke-HerdrRegistryJson -Arguments @("pane", "get", $PaneId)).result.pane
+        $afterTab = (Invoke-HerdrRegistryJson -Arguments @("tab", "get", $TabId)).result.tab
+        $afterPaneLabel = Get-RegistryVisiblePaneLabel -Pane $afterPane
+        $afterTabLabel = [string]$afterTab.label
+        if ($afterPaneLabel -cne $CanonicalName -or $afterTabLabel -cne $CanonicalName) {
+            throw "canonical label verification failed: pane='$afterPaneLabel', tab='$afterTabLabel', expected='$CanonicalName'."
+        }
+        return [pscustomobject]@{
+            pane = $afterPane
+            pane_label = $afterPaneLabel
+            tab = $afterTab
+            tab_label = $afterTabLabel
+        }
+    }
+    catch {
+        $original = $_.Exception.Message
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
+        if ($paneChanged) {
+            try {
+                if ([string]::IsNullOrWhiteSpace($PreviousPaneLabel)) {
+                    $null = Invoke-HerdrRegistryJson -Arguments @("pane", "rename", $PaneId, "--clear")
+                }
+                else {
+                    $null = Invoke-HerdrRegistryJson -Arguments @("pane", "rename", $PaneId, $PreviousPaneLabel)
+                }
+            }
+            catch { $rollbackErrors.Add("pane rollback: $($_.Exception.Message)") }
+        }
+        if ($tabChanged) {
+            try {
+                $null = Invoke-HerdrRegistryJson -Arguments @("tab", "rename", $TabId, $PreviousTabLabel)
+            }
+            catch { $rollbackErrors.Add("tab rollback: $($_.Exception.Message)") }
+        }
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Atomic canonical label reconciliation failed: $original Rollback was not proven: $($rollbackErrors -join '; ')"
+        }
+        throw "Atomic canonical label reconciliation failed before registry metadata mutation: $original"
     }
 }
 
@@ -104,7 +182,9 @@ function Get-LivePaneTuple {
         tab_id = [string]$pane.tab_id
         tab_label = [string]$tab.label
         pane_id = [string]$pane.pane_id
-        pane_label = [string]$pane.terminal_title_stripped
+        # `label` is the visible Herdr pane label used by pane list/get. The
+        # terminal title is process-owned UI text and is not a registry name.
+        pane_label = Get-RegistryVisiblePaneLabel -Pane $pane
         terminal_id = [string]$pane.terminal_id
         agent = [string]$agent.agent
         agent_session = $session
@@ -157,8 +237,13 @@ function Assert-LiveTupleMatchesEvent {
     if ([string]$Tuple.workspace_label -cne [string]$Event.canonical_workspace) {
         throw "Live workspace label changed for registry binding '$($Event.binding_id)'."
     }
-    if ($RequireCanonicalLabel -and [string]$Tuple.tab_label -cne [string]$Event.canonical_name) {
-        throw "Live tab label changed for registry binding '$($Event.binding_id)'."
+    if ($RequireCanonicalLabel) {
+        if ([string]$Tuple.tab_label -cne [string]$Event.canonical_name) {
+            throw "Live tab label changed for registry binding '$($Event.binding_id)'."
+        }
+        if ([string]$Tuple.pane_label -cne [string]$Event.canonical_name) {
+            throw "Live pane label changed for registry binding '$($Event.binding_id)'."
+        }
     }
 }
 
@@ -592,14 +677,21 @@ switch ($Action) {
         $target = Get-LivePaneTuple -TargetPaneId ([string]$reserve.pane_id)
         Assert-LiveTupleMatchesEvent -Tuple $target -Event $reserve
         if ([string]$latest.transaction_phase -eq "reserved") {
-            $null = Invoke-HerdrRegistryJson -Arguments @("tab", "rename", [string]$reserve.tab_id, [string]$reserve.canonical_name)
+            $null = Set-AtomicRegistryPaneAndTabLabel `
+                -PaneId ([string]$reserve.pane_id) `
+                -TabId ([string]$reserve.tab_id) `
+                -CanonicalName ([string]$reserve.canonical_name) `
+                -PreviousPaneLabel ([string]$target.pane_label) `
+                -PreviousTabLabel ([string]$target.tab_label)
             $renamed = Get-LivePaneTuple -TargetPaneId ([string]$reserve.pane_id)
             Assert-LiveTupleMatchesEvent -Tuple $renamed -Event $reserve
-            if ([string]$renamed.tab_label -cne [string]$reserve.canonical_name) {
-                throw "Tab rename verification failed."
+            if ([string]$renamed.tab_label -cne [string]$reserve.canonical_name -or
+                [string]$renamed.pane_label -cne [string]$reserve.canonical_name) {
+                throw "Canonical pane/tab rename verification failed."
             }
             Add-HerdrPaneRegistryEvent -RegistryPath $RegistryPath -ReceiptPath $ReceiptPath -Fields (Copy-ReservationFields -Reserve $reserve -EventAction "renamed" -Phase "renamed" -Extra ([ordered]@{
                 tab_label = [string]$reserve.canonical_name
+                pane_label = [string]$reserve.canonical_name
                 predecessor_event = [string]$latest.event_id
                 coordinator_pane_id = $coordinator.pane_id
                 coordinator_session = $coordinator.agent_session
@@ -609,6 +701,8 @@ switch ($Action) {
             $latest = Get-ReservationEvent -State $state -Id $ReservationId
         }
         if ([string]$latest.transaction_phase -eq "renamed") {
+            $preparedTuple = Get-LivePaneTuple -TargetPaneId ([string]$reserve.pane_id)
+            Assert-LiveTupleMatchesEvent -Tuple $preparedTuple -Event $reserve -RequireCanonicalLabel
             $metadataResult = Invoke-HerdrRegistryJson -Arguments @(
                 "pane", "report-metadata", [string]$reserve.pane_id,
                 "--source", "herdr-registry",
@@ -622,6 +716,7 @@ switch ($Action) {
             $assignment = "assignment_$([Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant())"
             $metadataEvent = Add-HerdrPaneRegistryEvent -RegistryPath $RegistryPath -ReceiptPath $ReceiptPath -Fields (Copy-ReservationFields -Reserve $reserve -EventAction "metadata-update" -Phase "metadata-set" -Extra ([ordered]@{
                 tab_label = [string]$reserve.canonical_name
+                pane_label = [string]$reserve.canonical_name
                 predecessor_event = [string]$latest.event_id
                 coordinator_pane_id = $coordinator.pane_id
                 coordinator_session = $coordinator.agent_session

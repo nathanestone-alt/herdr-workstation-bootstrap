@@ -76,6 +76,10 @@ setlocal EnableDelayedExpansion
 if /I "%~1"=="proxy" shift
 if /I not "%~1"=="herdr" exit /b 2
 shift
+if /I "%~1"=="pane" if /I "%~2"=="get" (
+  echo {"id":"stress:pane:get","result":{"type":"pane_info","pane":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"stress-terminal","cwd":"C:\dev\stmodel","foreground_cwd":"C:\dev\stmodel"}}}
+  exit /b 0
+)
 if /I "%~1"=="agent" if /I "%~2"=="get" (
   set "testSession=session-stress"
   if /I "%~3"=="w2:p1" set "testSession=session-source"
@@ -103,6 +107,10 @@ $arguments = @($args)
 if ($arguments.Count -gt 0 -and $arguments[0] -ieq "proxy") { $arguments = @($arguments[1..($arguments.Count - 1)]) }
 if ($arguments.Count -lt 1 -or $arguments[0] -ine "herdr") { exit 2 }
 $arguments = @($arguments[1..($arguments.Count - 1)])
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "pane" -and $arguments[1] -ieq "get") {
+    [ordered]@{ id = "stress:pane:get"; result = [ordered]@{ type = "pane_info"; pane = [ordered]@{ pane_id = [string]$arguments[2]; workspace_id = "w1"; tab_id = "w1:t2"; terminal_id = "stress-terminal"; cwd = "C:\dev\stmodel"; foreground_cwd = "C:\dev\stmodel" } } } | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
 if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "get") {
     $paneId = [string]$arguments[2]
     $session = if ($paneId -ieq "w2:p1") { "session-source" } else { "session-stress" }

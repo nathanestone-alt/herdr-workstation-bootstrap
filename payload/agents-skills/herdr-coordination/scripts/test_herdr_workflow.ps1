@@ -84,6 +84,19 @@ echo %*>>"%HERDR_TEST_CALL_LOG%"
 if /I "%~1"=="proxy" shift
 if /I not "%~1"=="herdr" exit /b 2
 shift
+if /I "%~1"=="pane" if /I "%~2"=="get" (
+  if "%HERDR_TEST_PERMISSION_DENIED%"=="1" (
+    echo {"id":"test:pane:get","error":{"code":"PermissionDenied","message":"PermissionDenied: native pane access unavailable"}}
+    exit /b 1
+  )
+  set "paneCwd=C:\dev\stmodel"
+  if /I "%~3"=="w2:p1" set "paneCwd=C:\dev\Codex\Herder"
+  if not "%HERDR_TEST_PANE_CWD%"=="" set "paneCwd=%HERDR_TEST_PANE_CWD%"
+  set "paneForeground=!paneCwd!"
+  if not "%HERDR_TEST_PANE_FOREGROUND_CWD%"=="" set "paneForeground=%HERDR_TEST_PANE_FOREGROUND_CWD%"
+  echo {"id":"test:pane:get","result":{"type":"pane_info","pane":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","cwd":"!paneCwd!","foreground_cwd":"!paneForeground!","label":"%HERDR_TEST_PANE_LABEL%"}}}
+  exit /b 0
+)
 if /I "%~1"=="agent" if /I "%~2"=="get" if not "%HERDR_TEST_PANE_SUBTITLE%"=="" (
   set "namedSession=session-target"
   if /I "%~3"=="w2:p1" set "namedSession=session-source"
@@ -92,9 +105,12 @@ if /I "%~1"=="agent" if /I "%~2"=="get" if not "%HERDR_TEST_PANE_SUBTITLE%"=="" 
   if "%HERDR_TEST_PROFILE_MISMATCH%"=="1" set "profileFields=,"provider":"anthropic","model":"terra","reasoning_effort":"xhigh","service_tier":"standard""
   if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"provider":"openai","model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
   if "%HERDR_TEST_TARGET_SESSION_ROTATED%"=="1" if /I "%~3"=="w1:p2" set "namedSession=session-replaced"
+  set "agentKind=codex"
+  if not "%HERDR_TEST_AGENT_KIND%"=="" set "agentKind=%HERDR_TEST_AGENT_KIND%"
+  set "agentCwd=%HERDR_TEST_AGENT_CWD%"
   set "testTabId=w1:t2"
   if not "%HERDR_TEST_TARGET_TAB_ID%"=="" if /I "%~3"=="w1:p2" set "testTabId=%HERDR_TEST_TARGET_TAB_ID%"
-  echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%","title":"%HERDR_TEST_PANE_SUBTITLE%","display_agent":"%HERDR_TEST_PANE_SUBTITLE%","agent_session":{"agent":"codex","value":"!namedSession!"}!profileFields!}}}
+  echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"!agentKind!","agent_status":"%HERDR_TEST_STATUS%","cwd":"!agentCwd!","title":"%HERDR_TEST_PANE_SUBTITLE%","display_agent":"%HERDR_TEST_PANE_SUBTITLE%","agent_session":{"agent":"!agentKind!","value":"!namedSession!"}!profileFields!}}}
   exit /b 0
 )
 if /I "%~1"=="agent" if /I "%~2"=="get" (
@@ -102,8 +118,11 @@ if /I "%~1"=="agent" if /I "%~2"=="get" (
   if /I "%~3"=="w2:p1" set "testSession=session-source"
   if "%HERDR_TEST_TARGET_SESSION_ROTATED%"=="1" if /I "%~3"=="w1:p2" set "testSession=session-replaced"
   if /I "%~3"=="w2:p1" if "%HERDR_TEST_SOURCE_SESSION_MISMATCH%"=="1" set "testSession=session-replaced"
+  set "agentKind=codex"
+  if not "%HERDR_TEST_AGENT_KIND%"=="" set "agentKind=%HERDR_TEST_AGENT_KIND%"
+  set "agentCwd=%HERDR_TEST_AGENT_CWD%"
   if "%HERDR_TEST_MISSING_SESSION%"=="1" (
-    echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%"}}}
+    echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"!agentKind!","agent_status":"%HERDR_TEST_STATUS%","cwd":"!agentCwd!"}}}
   ) else (
     set "profileFields="
     if "%HERDR_TEST_PROFILE%"=="1" set "profileFields=,"provider":"openai","model":"luna-max","reasoning_effort":"max","service_tier":"priority""
@@ -111,7 +130,7 @@ if /I "%~1"=="agent" if /I "%~2"=="get" (
     if "%HERDR_TEST_PROFILE_MALFORMED%"=="1" set "profileFields=,"provider":"openai","model":{"name":"luna-max"},"reasoning_effort":"max","service_tier":"priority""
     set "testTabId=w1:t2"
     if not "%HERDR_TEST_TARGET_TAB_ID%"=="" if /I "%~3"=="w1:p2" set "testTabId=%HERDR_TEST_TARGET_TAB_ID%"
-    echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"codex","agent_status":"%HERDR_TEST_STATUS%","agent_session":{"agent":"codex","value":"!testSession!"}!profileFields!}}}
+    echo {"id":"test:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"!testTabId!","terminal_id":"term-test","revision":7,"state_change_seq":42,"agent":"!agentKind!","agent_status":"%HERDR_TEST_STATUS%","cwd":"!agentCwd!","agent_session":{"agent":"!agentKind!","value":"!testSession!"}!profileFields!}}}
   )
   exit /b 0
 )
@@ -150,6 +169,16 @@ function Write-Result {
     $Value | ConvertTo-Json -Depth 12 -Compress
     exit 0
 }
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "pane" -and $arguments[1] -ieq "get") {
+    if ($env:HERDR_TEST_PERMISSION_DENIED -eq "1") {
+        Write-Error "PermissionDenied: native pane access unavailable"
+        exit 1
+    }
+    $cwd = if ($env:HERDR_TEST_PANE_CWD) { $env:HERDR_TEST_PANE_CWD } elseif ([string]$arguments[2] -ieq "w2:p1") { "C:\dev\Codex\Herder" } else { "C:\dev\stmodel" }
+    $foregroundCwd = if ($env:HERDR_TEST_PANE_FOREGROUND_CWD) { $env:HERDR_TEST_PANE_FOREGROUND_CWD } else { $cwd }
+    $paneLabel = if ($env:HERDR_TEST_PANE_LABEL) { $env:HERDR_TEST_PANE_LABEL } else { "" }
+    Write-Result ([ordered]@{ id = "test:pane:get"; result = [ordered]@{ type = "pane_info"; pane = [ordered]@{ pane_id = [string]$arguments[2]; workspace_id = "w1"; tab_id = "w1:t2"; terminal_id = "term-test"; cwd = $cwd; foreground_cwd = $foregroundCwd; label = $paneLabel } } })
+}
 if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "get") {
     $paneId = [string]$arguments[2]
     $session = if ($paneId -ieq "w2:p1") { "session-source" } else { "session-target" }
@@ -157,16 +186,18 @@ if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -i
     if ($paneId -ieq "w2:p1" -and $env:HERDR_TEST_SOURCE_SESSION_MISMATCH -eq "1") { $session = "session-replaced" }
     $tabId = "w1:t2"
     if ($env:HERDR_TEST_TARGET_TAB_ID -and $paneId -ieq "w1:p2") { $tabId = $env:HERDR_TEST_TARGET_TAB_ID }
+    $agentKind = if ($env:HERDR_TEST_AGENT_KIND) { $env:HERDR_TEST_AGENT_KIND } else { "codex" }
+    $agentCwd = if ($env:HERDR_TEST_AGENT_CWD) { $env:HERDR_TEST_AGENT_CWD } else { "" }
     $agent = [ordered]@{
         pane_id = $paneId; workspace_id = "w1"; tab_id = $tabId; terminal_id = "term-test"
-        revision = 7; state_change_seq = 42; agent = "codex"; agent_status = $env:HERDR_TEST_STATUS
+        revision = 7; state_change_seq = 42; agent = $agentKind; agent_status = $env:HERDR_TEST_STATUS; cwd = $agentCwd
     }
     if ($env:HERDR_TEST_PANE_SUBTITLE) {
         $agent.title = $env:HERDR_TEST_PANE_SUBTITLE
         $agent.display_agent = $env:HERDR_TEST_PANE_SUBTITLE
     }
     if ($env:HERDR_TEST_MISSING_SESSION -ne "1") {
-        $agent.agent_session = [ordered]@{ agent = "codex"; value = $session }
+        $agent.agent_session = [ordered]@{ agent = $agentKind; value = $session }
     }
     $profile = if ($env:HERDR_TEST_PROFILE_MALFORMED -eq "1") {
         [ordered]@{ provider = "openai"; model = [ordered]@{ name = "luna-max" }; reasoning_effort = "max"; service_tier = "priority" }
@@ -382,12 +413,18 @@ switch ($Action) {
         $env:HERDR_TEST_CALL_LOG = $callLogPath
         $env:HERDR_TEST_STATUS = "idle"
         $env:HERDR_TEST_MISSING_SESSION = "0"
+        $env:HERDR_TEST_PERMISSION_DENIED = "0"
         $env:HERDR_TEST_SOURCE_SESSION_MISMATCH = "0"
         $env:HERDR_TEST_TARGET_SESSION_ROTATED = "0"
         $env:HERDR_TEST_PROFILE = "1"
         $env:HERDR_TEST_PROFILE_MISMATCH = "0"
         $env:HERDR_TEST_PROFILE_MALFORMED = "0"
         $env:HERDR_TEST_TARGET_TAB_ID = ""
+        $env:HERDR_TEST_AGENT_KIND = ""
+        $env:HERDR_TEST_AGENT_CWD = ""
+        $env:HERDR_TEST_PANE_CWD = ""
+        $env:HERDR_TEST_PANE_FOREGROUND_CWD = ""
+        $env:HERDR_TEST_PANE_LABEL = ""
         $env:HERDR_TEST_DETECTION = "ready prompt"
         $env:HERDR_TEST_DELIVERY_FAIL = "0"
         Set-Content -LiteralPath $completionArtifactPath -Value "PASS. All correction checks succeeded; no authorization is implied." -Encoding utf8
@@ -400,6 +437,67 @@ switch ($Action) {
         )
         Assert-True -Condition ([bool]$preflight.preflight.ready) -Message "Ready reviewer failed preflight."
         Assert-Equal -Actual $preflight.preflight.session_id -Expected "session-target" -Message "Preflight lost native session proof."
+        Assert-Equal -Actual $preflight.preflight.cwd -Expected "C:\dev\stmodel" -Message "Preflight did not expose the live foreground cwd."
+
+        Write-Output "CASE: Claude agent workspace cwd outranks context-mode child cwd"
+        $claudeWorkspaceCwd = "/tmp/herdr-bootstrap-961-review-1eef5ef"
+        $env:HERDR_TEST_AGENT_KIND = "claude"
+        $env:HERDR_TEST_AGENT_CWD = $claudeWorkspaceCwd
+        $env:HERDR_TEST_PANE_CWD = $claudeWorkspaceCwd
+        $env:HERDR_TEST_PANE_FOREGROUND_CWD = "/home/nathan/.claude/plugins/cache/context-mode/context-mode/1.0.169"
+        $env:HERDR_TEST_TAB_LABEL = "STM-T-C1"
+        $env:HERDR_TEST_PANE_LABEL = ""
+        $claudePreflight = Invoke-Workflow -Arguments @(
+            "-Action", "preflight", "-PaneId", "w1:p2", "-ExpectedTabLabel", "STM-T-C1",
+            "-ExpectedCwd", $claudeWorkspaceCwd
+        )
+        Assert-True -Condition ([bool]$claudePreflight.preflight.ready) -Message "Claude child-process cwd incorrectly failed the exact-worktree preflight."
+        Assert-Equal -Actual $claudePreflight.preflight.cwd -Expected $claudeWorkspaceCwd -Message "Preflight selected the context-mode child cwd instead of the Claude workspace cwd."
+        Assert-Equal -Actual $claudePreflight.preflight.cwd_source -Expected "agent.workspace_cwd" -Message "Preflight did not identify the native agent workspace cwd source."
+        Assert-Equal -Actual $claudePreflight.preflight.agent_workspace_cwd -Expected $claudeWorkspaceCwd -Message "Preflight lost the native Claude workspace cwd."
+        Assert-Equal -Actual $claudePreflight.preflight.foreground_cwd -Expected $env:HERDR_TEST_PANE_FOREGROUND_CWD -Message "Preflight did not retain the child foreground cwd as diagnostic data."
+
+        Write-Output "CASE: pane label mismatch fails closed against canonical tab label"
+        $env:HERDR_TEST_PANE_LABEL = "STM-T-A1"
+        $paneLabelMismatch = Invoke-Workflow -Arguments @(
+            "-Action", "preflight", "-PaneId", "w1:p2", "-ExpectedTabLabel", "STM-T-C1",
+            "-ExpectedCwd", $claudeWorkspaceCwd
+        )
+        Assert-True -Condition (-not [bool]$paneLabelMismatch.preflight.ready) -Message "A visible pane label mismatch passed preflight."
+        Assert-True -Condition ([bool](@($paneLabelMismatch.preflight.reasons) -match "pane label mismatch")) -Message "Pane label mismatch was not reported by preflight."
+        Assert-Equal -Actual $paneLabelMismatch.preflight.tab_label -Expected "STM-T-C1" -Message "Preflight lost the canonical tab label while reporting pane-label drift."
+        Assert-Equal -Actual $paneLabelMismatch.preflight.pane_label -Expected "STM-T-A1" -Message "Preflight lost the visible pane label while reporting pane-label drift."
+        Assert-True -Condition (-not [bool]$paneLabelMismatch.preflight.labels_consistent) -Message "Pane/tab label inconsistency was reported as consistent."
+
+        $env:HERDR_TEST_AGENT_KIND = ""
+        $env:HERDR_TEST_AGENT_CWD = ""
+        $env:HERDR_TEST_PANE_CWD = ""
+        $env:HERDR_TEST_PANE_FOREGROUND_CWD = ""
+        $env:HERDR_TEST_PANE_LABEL = ""
+        $env:HERDR_TEST_TAB_LABEL = ""
+        $cwdMismatch = Invoke-Workflow -Arguments @(
+            "-Action", "preflight", "-PaneId", "w1:p2", "-ExpectedTabLabel", "#600 - Review",
+            "-ExpectedCwd", "C:\dev\other"
+        )
+        Assert-True -Condition (-not [bool]$cwdMismatch.preflight.ready) -Message "A mismatched expected cwd passed preflight."
+        Assert-True -Condition ([bool](@($cwdMismatch.preflight.reasons) -match "cwd mismatch")) -Message "Cwd mismatch was not reported by preflight."
+
+        Write-Output "CASE: sandbox host access denial fails closed before workflow mutation"
+        $ledgerBeforeHostAccess = if (Test-Path -LiteralPath $ledgerPath) { @(Get-Content -LiteralPath $ledgerPath).Count } else { 0 }
+        $env:HERDR_TEST_PERMISSION_DENIED = "1"
+        $hostAccessRefusal = Invoke-Workflow -Arguments @(
+            "-Action", "request",
+            "-TaskId", "#host-access",
+            "-CandidateId", "sandbox-denied",
+            "-ReviewType", "host-access-gate",
+            "-PaneId", "w1:p2",
+            "-ExpectedTabLabel", "#600 - Review",
+            "-Message", "Must stop before workflow or naming mutation."
+        ) -ExpectFailure
+        $env:HERDR_TEST_PERMISSION_DENIED = "0"
+        $ledgerAfterHostAccess = if (Test-Path -LiteralPath $ledgerPath) { @(Get-Content -LiteralPath $ledgerPath).Count } else { 0 }
+        Assert-True -Condition ($hostAccessRefusal.Text -match "host_access_unavailable") -Message "PermissionDenied was not classified as host_access_unavailable."
+        Assert-Equal -Actual $ledgerAfterHostAccess -Expected $ledgerBeforeHostAccess -Message "Host-access refusal mutated the workflow ledger."
 
         Write-Output "CASE: suppressed composer preflight refusal"
         $env:HERDR_TEST_DETECTION = "Waiting for 2 background agents to finish"

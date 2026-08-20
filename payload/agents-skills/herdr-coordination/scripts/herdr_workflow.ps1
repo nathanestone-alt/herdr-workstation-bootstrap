@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("preflight", "report-profile", "request", "ack", "complete", "ack-return", "reconcile-return-read", "reconcile-completion", "status", "scan")]
+    [ValidateSet("preflight", "report-profile", "request", "bootstrap-request", "ack", "complete", "ack-return", "reconcile-return-read", "reconcile-completion", "status", "scan")]
     [string]$Action,
 
     [string]$TaskId,
@@ -22,6 +22,25 @@ param(
     [string]$ExpectedSourceSession,
     [string]$ExpectedTargetSession,
     [string]$ExpectedTabLabel,
+    [string]$ExpectedCwd,
+    [ValidateSet("codex", "claude")]
+    [string]$TargetAgentKind = "codex",
+
+    # Bootstrap-only naming metadata. The normal request path remains fully
+    # backwards compatible; bootstrap-request consumes these fields once to
+    # prepare a fresh or unlabeled standing pane before dispatching the same
+    # tracked workflow.
+    [ValidateSet("STM", "AGT", "HDR", "BUZ")]
+    [string]$RepoCode,
+    [ValidatePattern("^[A-Z][A-Z0-9]{0,7}$")]
+    [string]$LaneCode,
+    [ValidatePattern("^[A-Z]$")]
+    [string]$RoleCode,
+    [ValidateSet("explore", "issue", "pr", "no-issue")]
+    [string]$WorkKind,
+    [string]$IssueNumber,
+    [string]$WorkTitle,
+    [string]$Topic,
 
     # Short work title used when the subtitle-currency check auto-fires a pane
     # naming request for the CALLING pane. Omit to fall back to the review type.
@@ -32,6 +51,9 @@ param(
 
     [ValidateRange(60, 604800)]
     [int]$CompletionTimeoutSeconds = 3600,
+
+    [ValidateRange(5, 900)]
+    [int]$BootstrapTimeoutSeconds = 120,
 
     [switch]$AllowWorking,
     [switch]$Notify,
@@ -251,7 +273,11 @@ function Invoke-HerdrText {
         $output = & $herdr.Source @Arguments 2>&1
     }
     if ($LASTEXITCODE -ne 0) {
-        throw "herdr $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
+        $failureText = $output -join [Environment]::NewLine
+        if ($failureText -match '(?i)PermissionDenied|Operation not permitted') {
+            throw "host_access_unavailable: native Herdr access for 'herdr $($Arguments -join ' ')' returned PermissionDenied/Operation not permitted. HERDR_ENV=1 is not sufficient; obtain host-level execution before issuing any workflow or naming command."
+        }
+        throw "herdr $($Arguments -join ' ') failed: $failureText"
     }
     return $output -join [Environment]::NewLine
 }
@@ -638,19 +664,129 @@ function Get-CurrentInteractiveRegion {
     }
 }
 
+function Get-WorkflowPaneString {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+    foreach ($name in $Names) {
+        $property = $Object.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim()
+        }
+    }
+    return $null
+}
+
+function Normalize-WorkflowCwd {
+    param([AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try {
+        $full = [IO.Path]::GetFullPath($Path.Trim())
+        if ($full.Length -gt 1) {
+            $full = $full.TrimEnd([char]92, [char]47)
+        }
+        return $full
+    }
+    catch {
+        return $Path.Trim().TrimEnd([char]92, [char]47)
+    }
+}
+
+function Test-WorkflowCwdMatch {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Observed,
+        [AllowNull()][AllowEmptyString()][string]$Expected
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Expected)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Observed)) { return $false }
+    $observedNormalized = Normalize-WorkflowCwd -Path $Observed
+    $expectedNormalized = Normalize-WorkflowCwd -Path $Expected
+    $comparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    return $observedNormalized.Equals($expectedNormalized, $comparison)
+}
+
+function Get-WorkflowPaneVisibleLabel {
+    param($Pane)
+
+    return Get-WorkflowPaneString -Object $Pane -Names @("label", "pane_label")
+}
+
+function Get-WorkflowAgentWorkspaceCwd {
+    param($Agent)
+
+    # `agent get` reports the native agent workspace/process cwd. Prefer it
+    # over pane.foreground_cwd: context-mode, MCP, and other child processes
+    # can legitimately move the foreground process into their own cache while
+    # the reviewed agent remains rooted in the exact worktree.
+    return Get-WorkflowPaneString -Object $Agent -Names @(
+        "workspace_cwd",
+        "agent_cwd",
+        "cwd",
+        "working_directory"
+    )
+}
+
 function Get-Preflight {
     param(
         [Parameter(Mandatory)][string]$TargetPaneId,
         [string]$RequiredTabLabel,
+        [string]$ExpectedCwd,
         [switch]$PermitWorking
     )
 
     $reasons = [Collections.Generic.List[string]]::new()
     $flags = [Collections.Generic.List[string]]::new()
+    $paneResponse = Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)
+    $pane = if ($paneResponse -and $paneResponse.PSObject.Properties["result"] -and
+        $paneResponse.result -and $paneResponse.result.PSObject.Properties["pane"]) {
+        $paneResponse.result.pane
+    }
+    else {
+        $null
+    }
+    if ($null -eq $pane -or [string]$pane.pane_id -ne $TargetPaneId) {
+        throw "Preflight could not resolve the exact live pane $TargetPaneId."
+    }
     $agentResponse = Invoke-HerdrJson -Arguments @("agent", "get", $TargetPaneId)
     $agent = $agentResponse.result.agent
     if ([string]$agent.pane_id -ne $TargetPaneId) {
         throw "Preflight resolved a different pane than $TargetPaneId."
+    }
+    $shellCwd = Get-WorkflowPaneString -Object $pane -Names @("cwd")
+    $foregroundCwd = Get-WorkflowPaneString -Object $pane -Names @("foreground_cwd")
+    $agentWorkspaceCwd = Get-WorkflowAgentWorkspaceCwd -Agent $agent
+    $observedCwd = if (-not [string]::IsNullOrWhiteSpace($agentWorkspaceCwd)) {
+        $agentWorkspaceCwd
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($shellCwd)) {
+        $shellCwd
+    }
+    else {
+        $null
+    }
+    $cwdSource = if (-not [string]::IsNullOrWhiteSpace($agentWorkspaceCwd)) {
+        "agent.workspace_cwd"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($shellCwd)) {
+        "pane.cwd"
+    }
+    else {
+        $null
+    }
+    $cwdMatches = Test-WorkflowCwdMatch -Observed $observedCwd -Expected $ExpectedCwd
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCwd) -and -not $cwdMatches) {
+        $reasons.Add("cwd mismatch: expected '$ExpectedCwd', observed '$observedCwd' (source $cwdSource)")
     }
 
     $agentKind = [string]$agent.agent
@@ -702,6 +838,9 @@ function Get-Preflight {
 
     $tabLabel = $null
     $tabIdProperty = $agent.PSObject.Properties["tab_id"]
+    if (-not $tabIdProperty -or [string]::IsNullOrWhiteSpace([string]$tabIdProperty.Value)) {
+        $tabIdProperty = $pane.PSObject.Properties["tab_id"]
+    }
     if ($tabIdProperty -and -not [string]::IsNullOrWhiteSpace([string]$tabIdProperty.Value)) {
         try {
             $tabResponse = Invoke-HerdrJson -Arguments @("tab", "get", [string]$tabIdProperty.Value)
@@ -719,6 +858,13 @@ function Get-Preflight {
             $reasons.Add("tab label mismatch: expected '$RequiredTabLabel', observed '$tabLabel'")
         }
     }
+    $paneLabel = Get-WorkflowPaneVisibleLabel -Pane $pane
+    $labelsConsistent = [string]::IsNullOrWhiteSpace($paneLabel) -or
+        [string]::IsNullOrWhiteSpace($tabLabel) -or
+        $paneLabel -ceq $tabLabel
+    if (-not $labelsConsistent) {
+        $reasons.Add("pane label mismatch: canonical tab label '$tabLabel', observed pane label '$paneLabel'")
+    }
 
     $executionProfile = Get-WorkflowExecutionProfile `
         -TargetPaneId $TargetPaneId `
@@ -733,6 +879,15 @@ function Get-Preflight {
         pane_id = $TargetPaneId
         tab_id = if ($tabIdProperty) { [string]$tabIdProperty.Value } else { $null }
         tab_label = $tabLabel
+        pane_label = $paneLabel
+        labels_consistent = [bool]$labelsConsistent
+        shell_cwd = $shellCwd
+        foreground_cwd = $foregroundCwd
+        agent_workspace_cwd = $agentWorkspaceCwd
+        cwd = $observedCwd
+        cwd_source = $cwdSource
+        expected_cwd = if ([string]::IsNullOrWhiteSpace($ExpectedCwd)) { $null } else { $ExpectedCwd }
+        cwd_matches = [bool]$cwdMatches
         agent = $agentKind
         status = $status
         session_id = $sessionId
@@ -881,6 +1036,8 @@ function Get-TaskViews {
             target_pane = [string]$reserved.target_pane
             target_tab_label = Get-OptionalPropertyString -Object $reserved -Name "target_tab_label"
             target_tab_id = Get-OptionalPropertyString -Object $reserved -Name "target_tab_id"
+            target_cwd = Get-OptionalPropertyString -Object $reserved -Name "target_cwd"
+            target_expected_cwd = Get-OptionalPropertyString -Object $reserved -Name "target_expected_cwd"
             target_agent = Get-OptionalPropertyString -Object $reserved -Name "target_agent"
             target_provider = Get-OptionalProfileString -Object $reserved -Name "target_provider"
             target_model = Get-OptionalProfileString -Object $reserved -Name "target_model"
@@ -1392,20 +1549,26 @@ function Get-WorkflowExecutionProfile {
     $directMissing = @($directValues.Values | Where-Object { [string]::IsNullOrWhiteSpace([string]$_) }).Count
     $directComplete = $directMissing -eq 0
 
+    # Always read pane metadata. A reused pane can retain a complete-looking
+    # profile from the previous native process, so an agent-get-only path
+    # cannot prove that the profile tokens belong to this session. Permission
+    # failures are deliberately not swallowed: HERDR_ENV=1 does not grant the
+    # host access required for a safe workflow preflight.
     $pane = $null
-    if (-not $directComplete -or $directInvalid) {
-        try {
-            $paneResponse = Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)
-            if ($paneResponse -and $paneResponse.PSObject.Properties["result"] -and
-                $paneResponse.result -and $paneResponse.result.PSObject.Properties["pane"]) {
-                $pane = $paneResponse.result.pane
-            }
+    try {
+        $paneResponse = Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)
+        if ($paneResponse -and $paneResponse.PSObject.Properties["result"] -and
+            $paneResponse.result -and $paneResponse.result.PSObject.Properties["pane"]) {
+            $pane = $paneResponse.result.pane
         }
-        catch {
-            # Older Herdr runtimes may not expose pane metadata. Direct native
-            # agent fields remain usable; missing metadata is otherwise fail-closed.
-            $pane = $null
+    }
+    catch {
+        if ($_.Exception.Message -match '(?i)host_access_unavailable|PermissionDenied|Operation not permitted') {
+            throw
         }
+        # Older Herdr runtimes may not expose pane metadata. Direct native
+        # agent fields remain usable; missing metadata is otherwise fail-closed.
+        $pane = $null
     }
 
     $reportedValues = [ordered]@{
@@ -1417,6 +1580,40 @@ function Get-WorkflowExecutionProfile {
     $reportedSession = Get-WorkflowTokenString -Object $pane -Name "execution_profile_session"
     $reportedAgent = Get-WorkflowTokenString -Object $pane -Name "execution_profile_agent"
     $reportedSource = Get-WorkflowTokenString -Object $pane -Name "execution_profile_source"
+
+    $staleProfile = (-not [string]::IsNullOrWhiteSpace($reportedSession) -and
+        $reportedSession -cne $SessionId) -or
+        (-not [string]::IsNullOrWhiteSpace($reportedAgent) -and
+            $reportedAgent -cne [string]$Agent.agent)
+    if ($staleProfile) {
+        # Invalidate every workflow-owned execution token together. Clearing
+        # only the session token would leave a misleading provider/model pair
+        # that could be accepted by a later preflight.
+        $clearArguments = @(
+            "pane", "report-metadata", $TargetPaneId,
+            "--source", "herdr-workflow"
+        )
+        foreach ($tokenName in @(
+                "execution_provider",
+                "execution_model",
+                "execution_reasoning_effort",
+                "execution_service_tier",
+                "execution_profile_source",
+                "execution_profile_session",
+                "execution_profile_agent")) {
+            $clearArguments += @("--clear-token", $tokenName)
+        }
+        $null = Invoke-HerdrJson -Arguments $clearArguments
+        $reportedValues = [ordered]@{
+            provider = $null
+            model = $null
+            reasoning_effort = $null
+            service_tier = $null
+        }
+        $reportedSession = $null
+        $reportedAgent = $null
+        $reportedSource = $null
+    }
 
     $values = [ordered]@{}
     $conflict = $false
@@ -1452,6 +1649,7 @@ function Get-WorkflowExecutionProfile {
         source = if ($metadataBound) { "herdr-workflow" } elseif ($directComplete) { "herdr-agent" } else { $null }
         reported_session = $reportedSession
         reported_agent = $reportedAgent
+        stale_profile_cleared = [bool]$staleProfile
         execution_profile_proven = $proven
     }
 }
@@ -1846,6 +2044,8 @@ function Reserve-WorkflowRequest {
                 throw "Duplicate workflow request refused because its completion timeout differs from the original reservation."
             }
             if ([string]$existing[0].target_tab_id -ne [string]$Preflight.tab_id -or
+                (-not [string]::IsNullOrWhiteSpace([string]$existing[0].target_cwd) -and
+                    -not (Test-WorkflowCwdMatch -Observed ([string]$existing[0].target_cwd) -Expected ([string]$Preflight.cwd))) -or
                 [string]$existing[0].target_provider -cne [string]$Preflight.provider -or
                 [string]$existing[0].target_model -cne [string]$Preflight.model -or
                 [string]$existing[0].target_reasoning_effort -cne [string]$Preflight.reasoning_effort -or
@@ -1913,6 +2113,10 @@ function Reserve-WorkflowRequest {
             target_session = [string]$Preflight.session_id
             target_tab_id = [string]$Preflight.tab_id
             target_tab_label = [string]$Preflight.tab_label
+            target_cwd = [string]$Preflight.cwd
+            target_shell_cwd = [string]$Preflight.shell_cwd
+            target_foreground_cwd = [string]$Preflight.foreground_cwd
+            target_expected_cwd = [string]$Preflight.expected_cwd
             target_provider = [string]$Preflight.provider
             target_model = [string]$Preflight.model
             target_reasoning_effort = [string]$Preflight.reasoning_effort
@@ -2395,9 +2599,365 @@ function Invoke-CompletionReturn {
     }
 }
 
+function ConvertTo-WorkflowPowerShellLiteral {
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    if ($null -eq $Value) { return "''" }
+    return "'$(($Value -replace "'", "''"))'"
+}
+
+function Get-BootstrapPaneRecord {
+    param([Parameter(Mandatory)][string]$TargetPaneId)
+
+    $response = Invoke-HerdrJson -Arguments @("pane", "get", $TargetPaneId)
+    if ($null -eq $response -or $null -eq $response.result -or $null -eq $response.result.pane -or
+        [string]$response.result.pane.pane_id -ne $TargetPaneId) {
+        throw "bootstrap could not resolve the exact live pane $TargetPaneId."
+    }
+    return $response.result.pane
+}
+
+function Get-BootstrapAgentRecord {
+    param([Parameter(Mandatory)][string]$TargetPaneId)
+
+    try {
+        $response = Invoke-HerdrJson -Arguments @("agent", "get", $TargetPaneId)
+        if ($response -and $response.result -and $response.result.agent) {
+            return $response.result.agent
+        }
+        return $null
+    }
+    catch {
+        if ($_.Exception.Message -match '(?i)host_access_unavailable|PermissionDenied|Operation not permitted') {
+            throw
+        }
+        if ($_.Exception.Message -match '(?i)agent[_ -]?not[_ -]?found|no agent|unknown agent|not registered') {
+            return $null
+        }
+        throw
+    }
+}
+
+function Wait-BootstrapNativeAgent {
+    param(
+        [Parameter(Mandatory)][string]$TargetPaneId,
+        [Parameter(Mandatory)][string]$TargetAgent,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $agent = Get-BootstrapAgentRecord -TargetPaneId $TargetPaneId
+        if ($agent -and [string]$agent.agent -ceq $TargetAgent) {
+            $session = Get-AgentSessionId -Agent $agent
+            if (-not [string]::IsNullOrWhiteSpace($session)) {
+                return $agent
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "bootstrap could not obtain native $TargetAgent session proof for $TargetPaneId after starting the existing-pane agent."
+}
+
+function New-BootstrapSetupMessage {
+    param(
+        [Parameter(Mandatory)][string]$TargetPaneId,
+        [Parameter(Mandatory)][string]$ExpectedCwd,
+        [Parameter(Mandatory)][string]$TargetAgent,
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$ReasoningEffort,
+        [Parameter(Mandatory)][string]$ServiceTier,
+        [Parameter(Mandatory)][string]$WorkflowPath,
+        [Parameter(Mandatory)][string]$CoordinationPath,
+        [Parameter(Mandatory)][string]$RepoCode,
+        [Parameter(Mandatory)][string]$LaneCode,
+        [Parameter(Mandatory)][string]$RoleCode,
+        [Parameter(Mandatory)][string]$WorkKind,
+        [string]$IssueNumber,
+        [string]$WorkTitle,
+        [string]$Topic,
+        [string]$LogPath
+    )
+
+    foreach ($value in @($ExpectedCwd, $Provider, $Model, $ReasoningEffort, $ServiceTier,
+            $WorkflowPath, $CoordinationPath, $RepoCode, $LaneCode, $RoleCode, $WorkKind, $IssueNumber,
+            $WorkTitle, $Topic, $LogPath)) {
+        if ($null -ne $value -and $value -match '[\r\n]') {
+            throw "bootstrap fields cannot contain newlines."
+        }
+    }
+    $cwd = ConvertTo-WorkflowPowerShellLiteral -Value $ExpectedCwd
+    $workflow = ConvertTo-WorkflowPowerShellLiteral -Value $WorkflowPath
+    $coordination = ConvertTo-WorkflowPowerShellLiteral -Value $CoordinationPath
+    $profileCommand = 'pwsh -NoProfile -Command "' +
+        "Set-Location -LiteralPath $cwd; & $workflow -Action report-profile -Provider $(ConvertTo-WorkflowPowerShellLiteral $Provider) -Model $(ConvertTo-WorkflowPowerShellLiteral $Model) -ReasoningEffort $(ConvertTo-WorkflowPowerShellLiteral $ReasoningEffort) -ServiceTier $(ConvertTo-WorkflowPowerShellLiteral $ServiceTier)" +
+        '"'
+    $namingParts = [Collections.Generic.List[string]]::new()
+    foreach ($pair in @(
+            @("-RepoCode", $RepoCode),
+            @("-LaneCode", $LaneCode),
+            @("-RoleCode", $RoleCode),
+            @("-WorkKind", $WorkKind),
+            @("-NamingLifecycle", "assignment"),
+            @("-LogPath", $LogPath))) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$pair[1])) {
+            [void]$namingParts.Add("$($pair[0]) $(ConvertTo-WorkflowPowerShellLiteral -Value ([string]$pair[1]))")
+        }
+    }
+    foreach ($pair in @(
+            @("-IssueNumber", $IssueNumber),
+            @("-WorkTitle", $WorkTitle),
+            @("-Topic", $Topic))) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$pair[1])) {
+            [void]$namingParts.Add("$($pair[0]) $(ConvertTo-WorkflowPowerShellLiteral -Value ([string]$pair[1]))")
+        }
+    }
+    $namingCommand = 'pwsh -NoProfile -Command "' +
+        "Set-Location -LiteralPath $cwd; & $coordination -Action name-request $($namingParts -join ' ')" +
+        '"'
+    return @(
+        "HERDR BOOTSTRAP for $TargetPaneId ($TargetAgent): setup only; do not start the prepared task yet.",
+        "The exact native shell/worktree must be '$ExpectedCwd'. Run these two commands in order:",
+        "1. $profileCommand",
+        "2. $namingCommand",
+        "After both commands return JSON, stop and leave this pane idle. Do not type a benign 'ok' prompt and do not perform the task before the orchestrator re-preflights and dispatches it."
+    ) -join [Environment]::NewLine
+}
+
+function Wait-BootstrapNamingApplication {
+    param(
+        [Parameter(Mandatory)][string]$TargetPaneId,
+        [Parameter(Mandatory)][string]$CoordinatorSession,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [string[]]$ExistingRelayRefs = @()
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $acknowledged = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $oldRelays = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($oldRelay in @($ExistingRelayRefs)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$oldRelay)) {
+            [void]$oldRelays.Add([string]$oldRelay)
+        }
+    }
+    do {
+        $status = Invoke-CoordinationHelper -Arguments @(
+            "-Action", "naming-status",
+            "-LogPath", $CoordinationLogPath,
+            "-MaxNamingRequests", "500"
+        )
+        $requests = @($status.requests | Where-Object {
+                [string]$_.requesting_pane_id -eq $TargetPaneId -and
+                -not $oldRelays.Contains([string]$_.relay_ref)
+            })
+        $applied = @($requests | Where-Object { [string]$_.state -in @("applied", "retirement_target_gone") })
+        if ($applied.Count -gt 0) {
+            return [pscustomobject]@{ applied = $true; status = $status; request = $applied[-1] }
+        }
+        foreach ($pending in @($requests | Where-Object { [string]$_.state -in @("awaiting_read_ack", "read_acked_unapplied", "overdue_unapplied") })) {
+            $relayRef = [string]$pending.relay_ref
+            if ([string]::IsNullOrWhiteSpace($relayRef)) { continue }
+            if ([string]$pending.state -eq "awaiting_read_ack" -and $acknowledged.Add($relayRef)) {
+                $null = Invoke-CoordinationHelper -Arguments @(
+                    "-Action", "ack-read",
+                    "-RelayRef", $relayRef,
+                    "-ExpectedSession", $CoordinatorSession,
+                    "-LogPath", $CoordinationLogPath
+                )
+            }
+            $consumed = Invoke-CoordinationHelper -Arguments @(
+                "-Action", "consume-name-requests",
+                "-RelayRef", $relayRef,
+                "-LogPath", $CoordinationLogPath
+            )
+            $consumedApplied = @($consumed.results | Where-Object { [bool]$_.applied -and -not [bool]$_.duplicate })
+            if ($consumedApplied.Count -gt 0) {
+                return [pscustomobject]@{ applied = $true; status = $consumed; request = $consumedApplied[-1] }
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "bootstrap naming did not reach an applied or terminal proof for $TargetPaneId before dispatch."
+}
+
+function Invoke-BootstrapRequest {
+    if ([string]::IsNullOrWhiteSpace($PaneId) -or [string]::IsNullOrWhiteSpace($ExpectedCwd)) {
+        throw "bootstrap-request requires -PaneId and -ExpectedCwd."
+    }
+    foreach ($required in @(
+            @{ Name = "TaskId"; Value = $TaskId },
+            @{ Name = "CandidateId"; Value = $CandidateId },
+            @{ Name = "ReviewType"; Value = $ReviewType },
+            @{ Name = "ExpectedTabLabel"; Value = $ExpectedTabLabel },
+            @{ Name = "Message"; Value = $Message },
+            @{ Name = "Provider"; Value = $Provider },
+            @{ Name = "Model"; Value = $Model },
+            @{ Name = "ReasoningEffort"; Value = $ReasoningEffort },
+            @{ Name = "ServiceTier"; Value = $ServiceTier },
+            @{ Name = "RepoCode"; Value = $RepoCode },
+            @{ Name = "LaneCode"; Value = $LaneCode },
+            @{ Name = "RoleCode"; Value = $RoleCode },
+            @{ Name = "WorkKind"; Value = $WorkKind })) {
+        if ([string]::IsNullOrWhiteSpace([string]$required.Value)) {
+            throw "-$($required.Name) is required for bootstrap-request."
+        }
+    }
+    if (($WorkKind -in @("issue", "pr")) -and
+        ([string]::IsNullOrWhiteSpace($IssueNumber) -or [string]::IsNullOrWhiteSpace($WorkTitle))) {
+        throw "bootstrap-request issue/PR naming requires -IssueNumber and -WorkTitle."
+    }
+    if ($WorkKind -eq "explore" -and [string]::IsNullOrWhiteSpace($Topic)) {
+        throw "bootstrap-request explore naming requires -Topic."
+    }
+    $pane = Get-BootstrapPaneRecord -TargetPaneId $PaneId
+    $agent = Get-BootstrapAgentRecord -TargetPaneId $PaneId
+    $agentWorkspaceCwd = Get-WorkflowAgentWorkspaceCwd -Agent $agent
+    $shellCwd = Get-WorkflowPaneString -Object $pane -Names @("cwd")
+    $observedCwd = if (-not [string]::IsNullOrWhiteSpace($agentWorkspaceCwd)) {
+        $agentWorkspaceCwd
+    }
+    else {
+        $shellCwd
+    }
+    if (-not (Test-WorkflowCwdMatch -Observed $observedCwd -Expected $ExpectedCwd)) {
+        throw "bootstrap refused before agent start: expected cwd '$ExpectedCwd', observed '$observedCwd'. Start the standing pane with shell cd into the worktree and retry."
+    }
+    if ($agent -and -not [string]::IsNullOrWhiteSpace([string]$agent.agent)) {
+        if ([string]$agent.agent -cne $TargetAgentKind) {
+            throw "bootstrap refused because $PaneId already hosts '$($agent.agent)', not the requested '$TargetAgentKind'; no replacement agent was started."
+        }
+    }
+    else {
+        $null = Invoke-HerdrText -Arguments @(
+            "agent", "start", $TargetAgentKind,
+            "--kind", $TargetAgentKind,
+            "--pane", $PaneId
+        )
+        $agent = Wait-BootstrapNativeAgent `
+            -TargetPaneId $PaneId `
+            -TargetAgent $TargetAgentKind `
+            -TimeoutSeconds $BootstrapTimeoutSeconds
+        $agentWorkspaceCwd = Get-WorkflowAgentWorkspaceCwd -Agent $agent
+        $observedCwd = if (-not [string]::IsNullOrWhiteSpace($agentWorkspaceCwd)) {
+            $agentWorkspaceCwd
+        }
+        else {
+            $shellCwd
+        }
+        if (-not (Test-WorkflowCwdMatch -Observed $observedCwd -Expected $ExpectedCwd)) {
+            throw "bootstrap refused after agent start: expected cwd '$ExpectedCwd', observed '$observedCwd'."
+        }
+    }
+    $targetSession = Get-AgentSessionId -Agent $agent
+    $targetTabId = Get-OptionalPropertyString -Object $agent -Name "tab_id"
+    $setupMessage = New-BootstrapSetupMessage `
+        -TargetPaneId $PaneId `
+        -ExpectedCwd $ExpectedCwd `
+        -TargetAgent $TargetAgentKind `
+        -Provider $Provider `
+        -Model $Model `
+        -ReasoningEffort $ReasoningEffort `
+        -ServiceTier $ServiceTier `
+        -WorkflowPath ([IO.Path]::GetFullPath($PSCommandPath)) `
+        -CoordinationPath ([IO.Path]::GetFullPath($CoordinationHelperPath)) `
+        -RepoCode $RepoCode `
+        -LaneCode $LaneCode `
+        -RoleCode $RoleCode `
+        -WorkKind $WorkKind `
+        -IssueNumber $IssueNumber `
+        -WorkTitle $WorkTitle `
+        -Topic $Topic `
+        -LogPath $CoordinationLogPath
+    $namingBeforeSetup = Invoke-CoordinationHelper -Arguments @(
+        "-Action", "naming-status",
+        "-LogPath", $CoordinationLogPath,
+        "-MaxNamingRequests", "500"
+    )
+    $existingNamingRelays = @($namingBeforeSetup.requests | ForEach-Object { [string]$_.relay_ref })
+    $setupDeliveryArguments = [Collections.Generic.List[string]]::new()
+    foreach ($value in @(
+            "-Action", "deliver", "-PaneId", $PaneId,
+            "-Message", $setupMessage,
+            "-ExpectedAgent", $TargetAgentKind,
+            "-ExpectedTabLabel", $ExpectedTabLabel,
+            "-ExpectedTabId", $targetTabId,
+            "-LogPath", $CoordinationLogPath)) {
+        [void]$setupDeliveryArguments.Add([string]$value)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($targetSession)) {
+        [void]$setupDeliveryArguments.Insert(8, "-ExpectedSession")
+        [void]$setupDeliveryArguments.Insert(9, [string]$targetSession)
+    }
+    $setupDelivery = Invoke-CoordinationHelper -Arguments @($setupDeliveryArguments.ToArray())
+    if ([string]::IsNullOrWhiteSpace($targetSession)) {
+        $agent = Wait-BootstrapNativeAgent `
+            -TargetPaneId $PaneId `
+            -TargetAgent $TargetAgentKind `
+            -TimeoutSeconds $BootstrapTimeoutSeconds
+        $targetSession = Get-AgentSessionId -Agent $agent
+    }
+    $sourceProof = Get-WorkflowSourceProof
+    $naming = Wait-BootstrapNamingApplication `
+        -TargetPaneId $PaneId `
+        -CoordinatorSession ([string]$sourceProof.session_id) `
+        -TimeoutSeconds $BootstrapTimeoutSeconds `
+        -ExistingRelayRefs $existingNamingRelays
+    $preflight = Get-Preflight `
+        -TargetPaneId $PaneId `
+        -RequiredTabLabel $ExpectedTabLabel `
+        -ExpectedCwd $ExpectedCwd `
+        -PermitWorking:$AllowWorking
+    if (-not $preflight.ready) {
+        throw "bootstrap re-preflight failed before tracked dispatch: $($preflight.reasons -join '; ')"
+    }
+
+    $requestArguments = [Collections.Generic.List[string]]::new()
+    foreach ($pair in @(
+            @("-Action", "request"), @("-TaskId", $TaskId), @("-CandidateId", $CandidateId),
+            @("-ReviewType", $ReviewType), @("-PaneId", $PaneId), @("-Message", $Message),
+            @("-ExpectedTabLabel", $ExpectedTabLabel), @("-ExpectedCwd", $ExpectedCwd),
+            @("-ArtifactPath", $ArtifactPath), @("-ArtifactSha256", $ArtifactSha256),
+            @("-ExpectedTargetSession", $preflight.session_id), @("-SubtitleWorkTitle", $SubtitleWorkTitle),
+            @("-AckTimeoutSeconds", [string]$AckTimeoutSeconds), @("-CompletionTimeoutSeconds", [string]$CompletionTimeoutSeconds),
+            @("-LedgerPath", $LedgerPath), @("-WatchLogPath", $WatchLogPath),
+            @("-CoordinationLogPath", $CoordinationLogPath), @("-CoordinationHelperPath", $CoordinationHelperPath),
+            @("-PaneRegistryPath", $PaneRegistryPath), @("-PaneRegistryHelperPath", $PaneRegistryHelperPath))) {
+        if ($pair[0] -in @("-ArtifactPath", "-ArtifactSha256", "-ExpectedTargetSession", "-SubtitleWorkTitle") -and
+            [string]::IsNullOrWhiteSpace([string]$pair[1])) { continue }
+        if ($pair[0] -in @("-ArtifactPath", "-ArtifactSha256", "-ExpectedTargetSession", "-SubtitleWorkTitle") -or
+            $pair[0] -notin @("-ArtifactPath", "-ArtifactSha256", "-ExpectedTargetSession", "-SubtitleWorkTitle")) {
+            [void]$requestArguments.Add([string]$pair[0])
+            [void]$requestArguments.Add([string]$pair[1])
+        }
+    }
+    if ($AllowWorking) { [void]$requestArguments.Add("-AllowWorking") }
+    if ($Notify) { [void]$requestArguments.Add("-Notify") }
+    if ($NoCoordinatorNotice) { [void]$requestArguments.Add("-NoCoordinatorNotice") }
+    $dispatchOutput = & $PSCommandPath @($requestArguments) 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "bootstrap tracked dispatch failed: $($dispatchOutput -join [Environment]::NewLine)"
+    }
+    $dispatch = ($dispatchOutput -join [Environment]::NewLine) | ConvertFrom-Json -Depth 32
+    return [pscustomobject]@{
+        action = "bootstrap-request"
+        pane_id = $PaneId
+        target_agent = $TargetAgentKind
+        target_session = $preflight.session_id
+        expected_cwd = $ExpectedCwd
+        setup_delivery = $setupDelivery
+        naming = $naming
+        preflight = $preflight
+        dispatch = $dispatch
+    }
+}
+
 $NowUtc = $NowUtc.ToUniversalTime()
 
 switch ($Action) {
+    "bootstrap-request" {
+        Invoke-BootstrapRequest | ConvertTo-Json -Depth 32
+    }
     "report-profile" {
         $callerPane = [string]$env:HERDR_PANE_ID
         if ([string]::IsNullOrWhiteSpace($callerPane)) {
@@ -2483,6 +3043,7 @@ switch ($Action) {
             preflight = Get-Preflight `
                 -TargetPaneId $PaneId `
                 -RequiredTabLabel $ExpectedTabLabel `
+                -ExpectedCwd $ExpectedCwd `
                 -PermitWorking:$AllowWorking
         } | ConvertTo-Json -Depth 10
     }
@@ -2515,6 +3076,7 @@ switch ($Action) {
         $preflight = Get-Preflight `
             -TargetPaneId $PaneId `
             -RequiredTabLabel $ExpectedTabLabel `
+            -ExpectedCwd $ExpectedCwd `
             -PermitWorking:$AllowWorking
         if (-not $preflight.ready) {
             [pscustomobject]@{
@@ -2686,6 +3248,8 @@ switch ($Action) {
             target_session = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_session"
             target_tab_id = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_tab_id"
             target_tab_label = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_tab_label"
+            target_cwd = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_cwd"
+            target_expected_cwd = Get-OptionalPropertyString -Object $reservationResult.reservation -Name "target_expected_cwd"
             target_provider = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_provider"
             target_model = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_model"
             target_reasoning_effort = Get-OptionalProfileString -Object $reservationResult.reservation -Name "target_reasoning_effort"
