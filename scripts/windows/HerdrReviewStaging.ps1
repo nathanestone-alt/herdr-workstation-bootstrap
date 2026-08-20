@@ -12,6 +12,7 @@ using System.IO;
 namespace Herdr.Security {
     public sealed class FileIdentity {
         public uint Attributes { get; set; }
+        public uint ReparseTag { get; set; }
         public uint VolumeSerialNumber { get; set; }
         public ulong FileIndex { get; set; }
         public uint NumberOfLinks { get; set; }
@@ -45,11 +46,12 @@ namespace Herdr.Security {
         public const uint FileFlagBackupSemantics = 0x02000000;
         public const uint FileFlagSequentialScan = 0x08000000;
         public const uint FileAttributeReparsePoint = 0x00000400;
+        private const int FileAttributeTagInfoClass = 9;
         public const uint InvalidHandleValue = 0xffffffff;
         public const uint ProcessQueryLimitedInformation = 0x1000;
         public const uint TokenQuery = 0x0008;
         public const int TokenUser = 1;
-        private const int FileRenameInformation = 3;
+        private const int NativeFileRenameInformation = 10;
         private const int FileDispositionInformation = 4;
         private const uint FileGenericWrite = 0x00120116;
 
@@ -68,6 +70,12 @@ namespace Herdr.Security {
             public uint NumberOfLinks;
             public uint FileIndexHigh;
             public uint FileIndexLow;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileAttributeTagInformation {
+            public uint FileAttributes;
+            public uint ReparseTag;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -132,6 +140,13 @@ namespace Herdr.Security {
             out ByHandleFileInformation fileInformation);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            IntPtr fileHandle,
+            int fileInformationClass,
+            out FileAttributeTagInformation fileInformation,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetFileInformationByHandle(
             IntPtr fileHandle,
             int fileInformationClass,
@@ -181,6 +196,14 @@ namespace Herdr.Security {
             uint createOptions,
             IntPtr eaBuffer,
             uint eaLength);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtSetInformationFile(
+            IntPtr fileHandle,
+            out IoStatusBlock ioStatusBlock,
+            IntPtr fileInformation,
+            uint length,
+            int fileInformationClass);
 
         [DllImport("ntdll.dll")]
         private static extern uint RtlNtStatusToDosError(int status);
@@ -356,9 +379,10 @@ namespace Herdr.Security {
                 byte[] nameBytesArray = new byte[nameBytes];
                 Marshal.Copy(nameBuffer, nameBytesArray, 0, nameBytes);
                 Marshal.Copy(nameBytesArray, 0, IntPtr.Add(buffer, nameOffset), nameBytes);
-                if (!SetFileInformationByHandle(fileHandle, FileRenameInformation, buffer, (uint)(nameOffset + nameBytes))) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Handle-relative rename failed");
-                }
+                IoStatusBlock ioStatus;
+                int status = NtSetInformationFile(fileHandle, out ioStatus, buffer,
+                    (uint)(nameOffset + nameBytes), NativeFileRenameInformation);
+                ThrowNtStatus(status, "Handle-relative rename");
             }
             finally {
                 Marshal.FreeHGlobal(nameBuffer);
@@ -457,8 +481,14 @@ namespace Herdr.Security {
             if (!GetFileInformationByHandle(handle, out info)) {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
+            FileAttributeTagInformation tagInfo;
+            if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfoClass, out tagInfo,
+                (uint)Marshal.SizeOf<FileAttributeTagInformation>())) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Reading file reparse metadata failed");
+            }
             return new FileIdentity {
                 Attributes = info.FileAttributes,
+                ReparseTag = tagInfo.ReparseTag,
                 VolumeSerialNumber = info.VolumeSerialNumber,
                 FileIndex = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow,
                 NumberOfLinks = info.NumberOfLinks
@@ -542,6 +572,11 @@ function Get-HerdrCanonicalPath {
         throw "Path is not valid: '$Path'."
     }
     while ($fullPath.Length -gt 1 -and ($fullPath.EndsWith('\') -or $fullPath.EndsWith('/'))) {
+        $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+        if (-not [string]::IsNullOrWhiteSpace($pathRoot) -and
+            $fullPath.Equals($pathRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
         $fullPath = $fullPath.Substring(0, $fullPath.Length - 1)
     }
     return $fullPath
@@ -561,6 +596,9 @@ function ConvertTo-HerdrFinalPath {
     }
     if ($isExtendedLocalPath) {
         $value = $value.Substring(4)
+        if ($value -notmatch '^[A-Za-z]:\\') {
+            throw "Windows resolved a non-local extended-length path: '$Path'."
+        }
     }
     $canonical = Get-HerdrCanonicalPath -Path $value
     if ($IsWindows -and $canonical -notmatch '^[A-Za-z]:\\') {
@@ -604,6 +642,7 @@ function Get-HerdrPortableIdentity {
     }
     [pscustomobject][ordered]@{
         Attributes = [int64]$Item.Attributes
+        ReparseTag = $null
         VolumeSerialNumber = $null
         FileIndex = $null
         NumberOfLinks = [int64]1
@@ -611,15 +650,83 @@ function Get-HerdrPortableIdentity {
     }
 }
 
+function Test-HerdrCloudFilesReparseTag {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][uint32]$ReparseTag)
+
+    # IO_REPARSE_TAG_CLOUD through IO_REPARSE_TAG_CLOUD_F differ only in the
+    # four Cloud Files variant bits (0x0000F000). Keep the Microsoft Cloud
+    # Files family narrow; OneDrive, links, junctions, mount points, and all
+    # other reparse tags remain denied by this policy.
+    $cloudFilesBaseTag = [Convert]::ToUInt32('9000001A', 16)
+    $cloudFilesVariantMask = [Convert]::ToUInt32('FFFF0FFF', 16)
+    return (($ReparseTag -band $cloudFilesVariantMask) -eq $cloudFilesBaseTag)
+}
+
+function Assert-HerdrAllowedReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][uint32]$ReparseTag,
+        [Parameter(Mandatory)][bool]$IsDirectory,
+        [Parameter(Mandatory)][string]$ComponentPath,
+        [Parameter(Mandatory)][string]$CandidatePath,
+        [string]$AllowedCloudFilesRoot
+    )
+
+    $isCloudFilesTag = Test-HerdrCloudFilesReparseTag -ReparseTag $ReparseTag
+    $tagDescription = if ($isCloudFilesTag) {
+        'Cloud Files'
+    }
+    elseif ($ReparseTag -eq [Convert]::ToUInt32('A000000C', 16)) {
+        'symbolic-link'
+    }
+    elseif ($ReparseTag -eq [Convert]::ToUInt32('A0000003', 16)) {
+        'junction or mount-point'
+    }
+    else {
+        'unrecognized'
+    }
+    if (-not $IsDirectory) {
+        throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
+    }
+    if (-not $isCloudFilesTag) {
+        throw "Refusing $tagDescription reparse point with tag 0x{0:x8}: '$ComponentPath'." -f $ReparseTag
+    }
+    if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
+        throw "Refusing Cloud Files reparse point outside a configured OneDrive exchange boundary: '$ComponentPath'."
+    }
+    $candidateCanonical = Get-HerdrCanonicalPath -Path $CandidatePath
+    $boundaryCanonical = Get-HerdrCanonicalPath -Path $AllowedCloudFilesRoot
+    $componentCanonical = Get-HerdrCanonicalPath -Path $ComponentPath
+    $componentOnBoundaryPath =
+        (Test-HerdrPathSameOrDescendant -Candidate $componentCanonical -Ancestor $boundaryCanonical) -or
+        (Test-HerdrPathSameOrDescendant -Candidate $boundaryCanonical -Ancestor $componentCanonical)
+    if (-not (Test-HerdrPathSameOrDescendant -Candidate $candidateCanonical -Ancestor $boundaryCanonical) -or
+        -not $componentOnBoundaryPath) {
+        throw "Cloud Files reparse point is outside the configured OneDrive exchange boundary: '$ComponentPath'."
+    }
+    return $true
+}
+
 function Get-HerdrPhysicalPathProof {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
         [switch]$AllowMissingLeaf,
-        [object]$ExistingLeafHandle
+        [object]$ExistingLeafHandle,
+        [string]$AllowedCloudFilesRoot
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
+    # This optional root scopes Cloud Files reparse-tag admission below. It is
+    # not a lexical or physical containment root; those checks belong to the
+    # dedicated trusted-root and exchange-boundary callers.
+    $allowedCloudFilesRootCanonical = if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
+        $null
+    }
+    else {
+        Get-HerdrCanonicalPath -Path $AllowedCloudFilesRoot
+    }
     if ($null -ne $ExistingLeafHandle) {
         if (-not $IsWindows) { throw 'An existing native leaf handle is available only on Windows.' }
         if ($null -eq $ExistingLeafHandle.SafeHandle -or
@@ -646,7 +753,8 @@ function Get-HerdrPhysicalPathProof {
                 $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity(
                     $ExistingLeafHandle.SafeHandle.DangerousGetHandle())
                 if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-                    throw "Path component is a reparse point: '$component'."
+                    Assert-HerdrAllowedReparsePoint -ReparseTag $identity.ReparseTag -IsDirectory:$false `
+                        -ComponentPath $component -CandidatePath $canonical -AllowedCloudFilesRoot $allowedCloudFilesRootCanonical | Out-Null
                 }
                 if ([int64]$identity.NumberOfLinks -gt 1) {
                     throw "Path component has multiple hard links: '$component'."
@@ -664,6 +772,7 @@ function Get-HerdrPhysicalPathProof {
                     FinalPath = $finalPath
                     IsDirectory = $false
                     Attributes = [int64]$identity.Attributes
+                    ReparseTag = [uint32]$identity.ReparseTag
                     VolumeSerialNumber = [uint64]$identity.VolumeSerialNumber
                     FileIndex = [uint64]$identity.FileIndex
                     NumberOfLinks = [uint64]$identity.NumberOfLinks
@@ -688,7 +797,8 @@ function Get-HerdrPhysicalPathProof {
                 $rawHandle = [Herdr.Security.NativeMethods]::OpenPath($component, $isDirectory, $false)
                 $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity($rawHandle)
                 if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-                    throw "Path component is a reparse point: '$component'."
+                    Assert-HerdrAllowedReparsePoint -ReparseTag $identity.ReparseTag -IsDirectory:$isDirectory `
+                        -ComponentPath $component -CandidatePath $canonical -AllowedCloudFilesRoot $allowedCloudFilesRootCanonical | Out-Null
                 }
                 $finalPath = ConvertTo-HerdrFinalPath -Path ([Herdr.Security.NativeMethods]::ReadFinalPath($rawHandle))
                 $record = [pscustomobject][ordered]@{
@@ -696,6 +806,7 @@ function Get-HerdrPhysicalPathProof {
                     FinalPath = $finalPath
                     IsDirectory = $isDirectory
                     Attributes = [int64]$identity.Attributes
+                    ReparseTag = [uint32]$identity.ReparseTag
                     VolumeSerialNumber = [uint64]$identity.VolumeSerialNumber
                     FileIndex = [uint64]$identity.FileIndex
                     NumberOfLinks = [uint64]$identity.NumberOfLinks
@@ -731,6 +842,7 @@ function Get-HerdrPhysicalPathProof {
                 FinalPath = Get-HerdrCanonicalPath -Path $component
                 IsDirectory = [bool]$item.PSIsContainer
                 Attributes = $identity.Attributes
+                ReparseTag = $identity.ReparseTag
                 VolumeSerialNumber = $identity.VolumeSerialNumber
                 FileIndex = $identity.FileIndex
                 NumberOfLinks = $identity.NumberOfLinks
@@ -777,6 +889,10 @@ function Compare-HerdrPhysicalIdentity {
             throw "$Description physical file identity changed."
         }
     }
+    if ($expectedIdentity.PSObject.Properties['ReparseTag'] -and $actualIdentity.PSObject.Properties['ReparseTag'] -and
+        [uint32]$expectedIdentity.ReparseTag -ne [uint32]$actualIdentity.ReparseTag) {
+        throw "$Description reparse tag changed."
+    }
     if ($IncludeLinkCount -and [int64]$expectedIdentity.NumberOfLinks -ne [int64]$actualIdentity.NumberOfLinks) {
         throw "$Description hard-link count changed."
     }
@@ -792,15 +908,17 @@ function Assert-HerdrPhysicalPathUnderRoot {
         [object]$ExpectedRoot,
         [string]$Description = 'Configured path',
         [switch]$AllowEqual,
-        [object]$ExistingCandidateHandle
+        [object]$ExistingCandidateHandle,
+        [string]$AllowedCloudFilesRoot
     )
 
-    $rootProof = Get-HerdrPhysicalPathProof -Path $RootPath
+    $rootProof = Get-HerdrPhysicalPathProof -Path $RootPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     $candidateProof = if ($null -eq $ExistingCandidateHandle) {
-        Get-HerdrPhysicalPathProof -Path $CandidatePath
+        Get-HerdrPhysicalPathProof -Path $CandidatePath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
     else {
-        Get-HerdrPhysicalPathProof -Path $CandidatePath -ExistingLeafHandle $ExistingCandidateHandle
+        Get-HerdrPhysicalPathProof -Path $CandidatePath -ExistingLeafHandle $ExistingCandidateHandle `
+            -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
     if ($null -ne $ExpectedRoot) { Compare-HerdrPhysicalIdentity -Expected $ExpectedRoot -Actual $rootProof -Description "$Description root" | Out-Null }
     if ($null -ne $ExpectedCandidate) { Compare-HerdrPhysicalIdentity -Expected $ExpectedCandidate -Actual $candidateProof -Description "$Description candidate" -IncludeLinkCount | Out-Null }
@@ -821,7 +939,8 @@ function Ensure-HerdrManagedDirectory {
         [Parameter(Mandatory)][string]$Path,
         [string]$TrustedRoot,
         [string]$Description = 'Managed directory',
-        [switch]$RequireLeafCreation
+        [switch]$RequireLeafCreation,
+        [string]$AllowedCloudFilesRoot
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
@@ -829,12 +948,29 @@ function Ensure-HerdrManagedDirectory {
     if ($IsWindows) {
         $operationRoot = if ($null -eq $trustedRootCanonical) { [IO.Path]::GetPathRoot($canonical) } else { $trustedRootCanonical }
         $chain = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $canonical `
-            -CreateMissing -RequireLeafCreation:$RequireLeafCreation -Description $Description
+            -CreateMissing -RequireLeafCreation:$RequireLeafCreation -Description $Description `
+            -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         try {
-            $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity($chain.SafeHandle.DangerousGetHandle())
-            if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-                throw "$Description is a reparse point: '$canonical'."
+            $nativeIdentity = [Herdr.Security.NativeMethods]::ReadFileIdentity($chain.SafeHandle.DangerousGetHandle())
+            if (($nativeIdentity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
+                Assert-HerdrAllowedReparsePoint -ReparseTag $nativeIdentity.ReparseTag -IsDirectory:$true `
+                    -ComponentPath $canonical -CandidatePath $canonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
             }
+            $proof = Get-HerdrPhysicalPathProof -Path $canonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot
+            if (-not $proof.Exists -or -not $proof.Leaf.IsDirectory) {
+                throw "$Description is not a directory: '$canonical'."
+            }
+            $chainIdentity = [pscustomobject][ordered]@{
+                Exists = $true
+                IsDirectory = $true
+                Attributes = [int64]$nativeIdentity.Attributes
+                ReparseTag = [uint32]$nativeIdentity.ReparseTag
+                VolumeSerialNumber = [uint64]$nativeIdentity.VolumeSerialNumber
+                FileIndex = [uint64]$nativeIdentity.FileIndex
+                NumberOfLinks = [uint64]$nativeIdentity.NumberOfLinks
+                FileIdentity = '{0:x8}:{1:x16}' -f $nativeIdentity.VolumeSerialNumber, $nativeIdentity.FileIndex
+            }
+            Compare-HerdrPhysicalIdentity -Expected $chainIdentity -Actual $proof.Leaf -Description $Description -IncludeLinkCount | Out-Null
             return $canonical
         }
         finally {
@@ -852,32 +988,34 @@ function Ensure-HerdrManagedDirectory {
             if ($null -ne $trustedRootCanonical -and
                 -not $isTrustedAncestor -and
                 -not $componentPath.Equals($trustedRootCanonical, [StringComparison]::OrdinalIgnoreCase)) {
-                Assert-HerdrPhysicalPathUnderRoot -CandidatePath $componentPath -RootPath $trustedRootCanonical -Description $Description | Out-Null
+                Assert-HerdrPhysicalPathUnderRoot -CandidatePath $componentPath -RootPath $trustedRootCanonical -Description $Description `
+                    -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
             }
             else {
-                Get-HerdrPhysicalPathProof -Path $componentPath | Out-Null
+                Get-HerdrPhysicalPathProof -Path $componentPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
             }
             continue
         }
         $parent = Split-Path -Parent $componentPath
         if ($null -ne $trustedRootCanonical) {
-            Assert-HerdrPhysicalPathUnderRoot -CandidatePath $parent -RootPath $trustedRootCanonical -AllowEqual -Description "$Description parent" | Out-Null
+            Assert-HerdrPhysicalPathUnderRoot -CandidatePath $parent -RootPath $trustedRootCanonical -AllowEqual `
+                -Description "$Description parent" -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
         }
         else {
-            Get-HerdrPhysicalPathProof -Path $parent | Out-Null
+            Get-HerdrPhysicalPathProof -Path $parent -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
         }
         [IO.Directory]::CreateDirectory($componentPath) | Out-Null
-        $createdProof = Get-HerdrPhysicalPathProof -Path $componentPath
+        $createdProof = Get-HerdrPhysicalPathProof -Path $componentPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         if (-not $createdProof.Leaf.IsDirectory) { throw "$Description is not a directory: '$componentPath'." }
     }
     if ($null -ne $trustedRootCanonical -and
         -not $canonical.Equals($trustedRootCanonical, [StringComparison]::OrdinalIgnoreCase)) {
         $boundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $canonical -RootPath $trustedRootCanonical `
-            -ExpectedRoot $trustedRootProof -Description $Description
+            -ExpectedRoot $trustedRootProof -Description $Description -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         $candidateProof = $boundary.Candidate
     }
     else {
-        $candidateProof = Get-HerdrPhysicalPathProof -Path $canonical
+        $candidateProof = Get-HerdrPhysicalPathProof -Path $canonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
     if (-not $candidateProof.Leaf.IsDirectory) { throw "$Description is not a directory: '$canonical'." }
     return $canonical
@@ -926,11 +1064,13 @@ function Assert-HerdrExistingPathIsNotReparsePoint {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [switch]$AllowMissing
+        [switch]$AllowMissing,
+        [string]$AllowedCloudFilesRoot
     )
 
     $canonicalPath = Get-HerdrCanonicalPath -Path $Path
-    $proof = Get-HerdrPhysicalPathProof -Path $canonicalPath -AllowMissingLeaf:$AllowMissing
+    $proof = Get-HerdrPhysicalPathProof -Path $canonicalPath -AllowMissingLeaf:$AllowMissing `
+        -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     if (-not $proof.Exists) {
         if ($AllowMissing) { return $canonicalPath }
         throw "Configured path does not exist: '$canonicalPath'."
@@ -1125,9 +1265,12 @@ function Get-HerdrBlockedAttributeNames {
 
 function Assert-HerdrWorkbookFile {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$AllowedCloudFilesRoot
+    )
 
-    $proof = Get-HerdrPhysicalPathProof -Path $Path
+    $proof = Get-HerdrPhysicalPathProof -Path $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     if (-not $proof.Exists -or $null -eq $proof.Leaf -or $proof.Leaf.IsDirectory) {
         throw 'Workbook source must be a regular file.'
     }
@@ -1171,6 +1314,7 @@ function Open-HerdrNativeReadFile {
                 Exists = $true
                 IsDirectory = $false
                 Attributes = [int64]$identity.Attributes
+                ReparseTag = [uint32]$identity.ReparseTag
                 VolumeSerialNumber = [uint64]$identity.VolumeSerialNumber
                 FileIndex = [uint64]$identity.FileIndex
                 NumberOfLinks = [uint64]$identity.NumberOfLinks
@@ -1219,16 +1363,17 @@ function Open-HerdrNativeDirectoryChain {
         [Parameter(Mandatory)][string]$TargetPath,
         [switch]$CreateMissing,
         [switch]$RequireLeafCreation,
-        [string]$Description = 'Directory'
+        [string]$Description = 'Directory',
+        [string]$AllowedCloudFilesRoot
     )
 
     if (-not $IsWindows) { throw 'Handle-relative directory operations are Windows-only.' }
     $root = Get-HerdrCanonicalPath -Path $RootPath
     $target = Get-HerdrCanonicalPath -Path $TargetPath
     if (-not (Test-HerdrPathSameOrDescendant -Candidate $target -Ancestor $root)) {
-        throw "$Description is outside the trusted root: '$target'."
+        throw "$Description is outside the trusted physical root: '$target'."
     }
-    $rootProof = Get-HerdrPhysicalPathProof -Path $root
+    $rootProof = Get-HerdrPhysicalPathProof -Path $root -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     if (-not $rootProof.Exists -or -not $rootProof.Leaf.IsDirectory) { throw "$Description root is not a directory: '$root'." }
     $current = $null
     $rawHandle = [IntPtr]::Zero
@@ -1238,12 +1383,14 @@ function Open-HerdrNativeDirectoryChain {
         $rawHandle = [IntPtr]::Zero
         $rootNative = [Herdr.Security.NativeMethods]::ReadFileIdentity($current.DangerousGetHandle())
         if (($rootNative.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-            throw "$Description root is a reparse point: '$root'."
+            Assert-HerdrAllowedReparsePoint -ReparseTag $rootNative.ReparseTag -IsDirectory:$true `
+                -ComponentPath $root -CandidatePath $target -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
         }
         $rootIdentity = [pscustomobject][ordered]@{
             Exists = $true
             IsDirectory = $true
             Attributes = [int64]$rootNative.Attributes
+            ReparseTag = [uint32]$rootNative.ReparseTag
             VolumeSerialNumber = [uint64]$rootNative.VolumeSerialNumber
             FileIndex = [uint64]$rootNative.FileIndex
             NumberOfLinks = [uint64]$rootNative.NumberOfLinks
@@ -1251,15 +1398,35 @@ function Open-HerdrNativeDirectoryChain {
         }
         Compare-HerdrPhysicalIdentity -Expected $rootProof.Leaf -Actual $rootIdentity -Description "$Description root" -IncludeLinkCount | Out-Null
         $childNames = @(Get-HerdrRelativeChildNames -RootPath $root -TargetPath $target)
+        $currentLexicalPath = $root
+        $currentFinalPath = [string]$rootProof.FinalPath
         for ($childIndex = 0; $childIndex -lt $childNames.Count; $childIndex++) {
             $name = [string]$childNames[$childIndex]
             $isRequiredLeaf = $CreateMissing.IsPresent -and $RequireLeafCreation.IsPresent -and
                 $childIndex -eq ($childNames.Count - 1)
-            $childRaw = if ($isRequiredLeaf) {
-                [Herdr.Security.NativeMethods]::CreateDirectoryRelative($current.DangerousGetHandle(), $name)
+            try {
+                $childRaw = if ($isRequiredLeaf) {
+                    [Herdr.Security.NativeMethods]::CreateDirectoryRelative($current.DangerousGetHandle(), $name)
+                }
+                else {
+                    [Herdr.Security.NativeMethods]::OpenDirectoryRelative($current.DangerousGetHandle(), $name, $CreateMissing.IsPresent)
+                }
             }
-            else {
-                [Herdr.Security.NativeMethods]::OpenDirectoryRelative($current.DangerousGetHandle(), $name, $CreateMissing.IsPresent)
+            catch {
+                $nativeError = $_.Exception
+                $collision = $false
+                while ($null -ne $nativeError) {
+                    if ($nativeError.PSObject.Properties['NativeErrorCode'] -and
+                        [int]$nativeError.NativeErrorCode -in @(80, 183)) {
+                        $collision = $true
+                        break
+                    }
+                    $nativeError = $nativeError.InnerException
+                }
+                if ($isRequiredLeaf -and $collision) {
+                    throw "$Description collision at '$target'."
+                }
+                throw
             }
             $child = $null
             try {
@@ -1267,11 +1434,24 @@ function Open-HerdrNativeDirectoryChain {
                 $childRaw = [IntPtr]::Zero
                 $childIdentity = [Herdr.Security.NativeMethods]::ReadFileIdentity($child.DangerousGetHandle())
                 if (($childIdentity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-                    throw "$Description contains a reparse point: '$name'."
+                    Assert-HerdrAllowedReparsePoint -ReparseTag $childIdentity.ReparseTag -IsDirectory:$true `
+                        -ComponentPath (Join-Path $currentLexicalPath $name) -CandidatePath $target `
+                        -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
+                }
+                $childFinalPath = ConvertTo-HerdrFinalPath -Path (
+                    [Herdr.Security.NativeMethods]::ReadFinalPath($child.DangerousGetHandle()))
+                $expectedChildFinalPath = Get-HerdrCanonicalPath -Path (Join-Path $currentFinalPath $name)
+                if (-not $childFinalPath.Equals($expectedChildFinalPath, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "$Description crossed an unexpected final path at '$name'."
+                }
+                if (-not (Test-HerdrPathSameOrDescendant -Candidate $childFinalPath -Ancestor $rootProof.FinalPath)) {
+                    throw "$Description escaped its trusted physical root at '$name'."
                 }
                 $current.Dispose()
                 $current = $child
                 $child = $null
+                $currentLexicalPath = Join-Path $currentLexicalPath $name
+                $currentFinalPath = $childFinalPath
             }
             finally {
                 if ($null -ne $child) { $child.Dispose() }
@@ -1303,14 +1483,16 @@ function Remove-HerdrNativeRelativeEntry {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$TrustedRoot,
-        [switch]$Directory
+        [switch]$Directory,
+        [string]$AllowedCloudFilesRoot
     )
 
     if (-not $IsWindows) { throw 'Handle-relative cleanup is Windows-only.' }
     $canonical = Get-HerdrCanonicalPath -Path $Path
     $parent = Split-Path -Parent $canonical
     $leaf = Split-Path -Leaf $canonical
-    $parentHandle = Open-HerdrNativeDirectoryChain -RootPath $TrustedRoot -TargetPath $parent -Description 'Cleanup parent'
+    $parentHandle = Open-HerdrNativeDirectoryChain -RootPath $TrustedRoot -TargetPath $parent `
+        -Description 'Cleanup parent' -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     try {
         [Herdr.Security.NativeMethods]::DeleteRelative($parentHandle.SafeHandle.DangerousGetHandle(), $leaf, $Directory.IsPresent)
     }
@@ -1327,7 +1509,8 @@ function Remove-HerdrManagedTree {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$TrustedRoot,
-        [string[]]$KnownFileNames = @()
+        [string[]]$KnownFileNames = @(),
+        [string]$AllowedCloudFilesRoot
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
@@ -1336,9 +1519,11 @@ function Remove-HerdrManagedTree {
         return
     }
     foreach ($name in @($KnownFileNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        Remove-HerdrNativeRelativeEntry -Path (Join-Path $canonical $name) -TrustedRoot $TrustedRoot
+        Remove-HerdrNativeRelativeEntry -Path (Join-Path $canonical $name) -TrustedRoot $TrustedRoot `
+            -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
-    Remove-HerdrNativeRelativeEntry -Path $canonical -TrustedRoot $TrustedRoot -Directory
+    Remove-HerdrNativeRelativeEntry -Path $canonical -TrustedRoot $TrustedRoot -Directory `
+        -AllowedCloudFilesRoot $AllowedCloudFilesRoot
 }
 
 function ConvertTo-HerdrSha256 {
@@ -1353,15 +1538,17 @@ function Get-HerdrFileSnapshot {
     param(
         [Parameter(Mandatory)][string]$Path,
         [string]$TrustedRoot,
-        [object]$ExpectedIdentity
+        [object]$ExpectedIdentity,
+        [string]$AllowedCloudFilesRoot
     )
 
     $canonicalPath = Get-HerdrCanonicalPath -Path $Path
     $boundaryBefore = $null
     if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
-        $boundaryBefore = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $canonicalPath -RootPath $TrustedRoot -Description 'File boundary'
+        $boundaryBefore = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $canonicalPath -RootPath $TrustedRoot `
+            -Description 'File boundary' -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
-    $before = Assert-HerdrWorkbookFile -Path $canonicalPath
+    $before = Assert-HerdrWorkbookFile -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     $beforeLength = [int64]$before.Length
     $beforeWriteTime = $before.LastWriteTimeUtc
     $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
@@ -1405,7 +1592,7 @@ function Get-HerdrFileSnapshot {
         $hashAlgorithm.Dispose()
     }
     try {
-        $after = Assert-HerdrWorkbookFile -Path $canonicalPath
+        $after = Assert-HerdrWorkbookFile -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     }
     catch {
         throw "Workbook changed or disappeared during the exclusive read: '$canonicalPath'."
@@ -1413,11 +1600,12 @@ function Get-HerdrFileSnapshot {
     if ([int64]$after.Length -ne $beforeLength -or $after.LastWriteTimeUtc -ne $beforeWriteTime) {
         throw "Workbook changed during the exclusive read: '$canonicalPath'."
     }
-    $afterProof = Get-HerdrPhysicalPathProof -Path $canonicalPath
+    $afterProof = Get-HerdrPhysicalPathProof -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
     Compare-HerdrPhysicalIdentity -Expected $openedIdentity -Actual $afterProof.Leaf -Description 'Workbook source after read' -IncludeLinkCount | Out-Null
     if ($null -ne $boundaryBefore) {
         Assert-HerdrPhysicalPathUnderRoot -CandidatePath $canonicalPath -RootPath $TrustedRoot `
-            -ExpectedCandidate $boundaryBefore.Candidate -ExpectedRoot $boundaryBefore.Root -Description 'File boundary after read' | Out-Null
+            -ExpectedCandidate $boundaryBefore.Candidate -ExpectedRoot $boundaryBefore.Root -Description 'File boundary after read' `
+            -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
     }
     [pscustomobject][ordered]@{
         Path = $canonicalPath
@@ -1468,7 +1656,9 @@ function Copy-HerdrNativeFileExclusive {
         [Parameter(Mandatory)][string]$DestinationPath,
         [string]$TrustedRoot,
         [object]$ExpectedSourceIdentity,
-        [string]$TrustedDestinationRoot
+        [string]$TrustedDestinationRoot,
+        [string]$SourceAllowedCloudFilesRoot,
+        [string]$DestinationAllowedCloudFilesRoot
     )
 
     $source = Get-HerdrCanonicalPath -Path $SourcePath
@@ -1482,7 +1672,7 @@ function Copy-HerdrNativeFileExclusive {
         Get-HerdrCanonicalPath -Path $TrustedDestinationRoot
     }
     $destinationParent = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $parent `
-        -Description 'Copy destination parent'
+        -Description 'Copy destination parent' -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
     $temporaryName = '.herdr-copy-' + [Guid]::NewGuid().ToString('N') + '.tmp'
     $sourceStream = $null
     $destinationStream = $null
@@ -1536,15 +1726,16 @@ function Copy-HerdrNativeFileExclusive {
     }
     $destinationParent.SafeHandle.Dispose()
     if ($null -ne $sourceIdentity) {
-        $sourceAfter = Get-HerdrPhysicalPathProof -Path $source
+        $sourceAfter = Get-HerdrPhysicalPathProof -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
         Compare-HerdrPhysicalIdentity -Expected $sourceIdentity -Actual $sourceAfter.Leaf `
             -Description 'Copy source after read' -IncludeLinkCount | Out-Null
         if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
-                -ExpectedCandidate $sourceIdentity -Description 'Copy source boundary after read' | Out-Null
+                -ExpectedCandidate $sourceIdentity -Description 'Copy source boundary after read' `
+                -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot | Out-Null
         }
     }
-    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination
+    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
     if (-not $destinationProof.Exists -or $destinationProof.Leaf.IsDirectory -or
         [int64]$destinationProof.Leaf.NumberOfLinks -gt 1) {
         throw "Exclusive workbook copy produced an unsafe destination: '$destination'."
@@ -1559,7 +1750,9 @@ function Copy-HerdrFileExclusive {
         [Parameter(Mandatory)][string]$DestinationPath,
         [string]$TrustedRoot,
         [object]$ExpectedSourceIdentity,
-        [string]$TrustedDestinationRoot
+        [string]$TrustedDestinationRoot,
+        [string]$SourceAllowedCloudFilesRoot,
+        [string]$DestinationAllowedCloudFilesRoot
     )
 
     if ($IsWindows) {
@@ -1584,15 +1777,16 @@ function Copy-HerdrFileExclusive {
     try {
         if (-not [string]::IsNullOrWhiteSpace($TrustedDestinationRoot)) {
             $destinationBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $parent -RootPath $TrustedDestinationRoot `
-                -AllowEqual -Description 'Copy destination boundary'
+                -AllowEqual -Description 'Copy destination boundary' -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
             if (-not $destinationBoundary.Candidate.Leaf.IsDirectory) { throw 'Copy destination parent is not a directory.' }
         }
         else {
-            $destinationParentProof = Get-HerdrPhysicalPathProof -Path $parent
+            $destinationParentProof = Get-HerdrPhysicalPathProof -Path $parent -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
             if (-not $destinationParentProof.Leaf.IsDirectory) { throw 'Copy destination parent is not a directory.' }
         }
         if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
-            $sourceBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot -Description 'Copy source boundary'
+            $sourceBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
+                -Description 'Copy source boundary' -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
         }
         if ($IsWindows) {
             $opened = Open-HerdrNativeReadFile -Path $source
@@ -1622,10 +1816,11 @@ function Copy-HerdrFileExclusive {
         $destinationStream.Flush($true)
         if (-not [string]::IsNullOrWhiteSpace($TrustedDestinationRoot)) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $parent -RootPath $TrustedDestinationRoot `
-                -ExpectedRoot $destinationBoundary.Root -AllowEqual -Description 'Copy destination boundary before commit' | Out-Null
+                -ExpectedRoot $destinationBoundary.Root -AllowEqual -Description 'Copy destination boundary before commit' `
+                -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot | Out-Null
         }
         else {
-            $destinationParentProof = Get-HerdrPhysicalPathProof -Path $parent
+            $destinationParentProof = Get-HerdrPhysicalPathProof -Path $parent -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
             if (-not $destinationParentProof.Leaf.IsDirectory) { throw 'Copy destination parent changed to a non-directory.' }
         }
     }
@@ -1638,12 +1833,12 @@ function Copy-HerdrFileExclusive {
         if ($null -ne $opened -and $null -ne $opened.SafeHandle -and -not $opened.SafeHandle.IsClosed) { $opened.SafeHandle.Dispose() }
     }
     if ($null -ne $sourceIdentity) {
-        $sourceAfter = Get-HerdrPhysicalPathProof -Path $source
+        $sourceAfter = Get-HerdrPhysicalPathProof -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
         Compare-HerdrPhysicalIdentity -Expected $sourceIdentity -Actual $sourceAfter.Leaf -Description 'Copy source after read' -IncludeLinkCount | Out-Null
         if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
                 -ExpectedCandidate $sourceIdentity -ExpectedRoot $sourceBoundary.Root `
-                -Description 'Copy source boundary after read' | Out-Null
+                -Description 'Copy source boundary after read' -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot | Out-Null
         }
     }
     try {
@@ -1653,10 +1848,11 @@ function Copy-HerdrFileExclusive {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
         throw "Exclusive workbook copy could not be committed."
     }
-    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination
+    $destinationProof = Get-HerdrPhysicalPathProof -Path $destination -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
     if (-not [string]::IsNullOrWhiteSpace($TrustedDestinationRoot)) {
         Assert-HerdrPhysicalPathUnderRoot -CandidatePath $destination -RootPath $TrustedDestinationRoot `
-            -ExpectedRoot $destinationBoundary.Root -Description 'Copy destination boundary after commit' | Out-Null
+            -ExpectedRoot $destinationBoundary.Root -Description 'Copy destination boundary after commit' `
+            -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot | Out-Null
     }
     if (-not $destinationProof.Exists -or $destinationProof.Leaf.IsDirectory -or [int64]$destinationProof.Leaf.NumberOfLinks -gt 1) {
         throw "Exclusive workbook copy produced an unsafe destination: '$destination'."
@@ -1794,6 +1990,7 @@ function Invoke-HerdrReviewStaging {
         [Parameter(Mandatory)][string]$SourcePath,
         [Parameter(Mandatory)][string]$JobId,
         [Parameter(Mandatory)][string]$OneDriveInboxRoot,
+        [Parameter(Mandatory)][string]$OneDriveExchangeRoot,
         [Parameter(Mandatory)][string]$ExchangeRoot,
         [string]$OneDriveOutboxRoot,
         [string]$OneDriveArchiveRoot,
@@ -1808,9 +2005,10 @@ function Invoke-HerdrReviewStaging {
     Assert-HerdrMetadataValue -Value $Repository -Name 'Repository' | Out-Null
     Assert-HerdrMetadataValue -Value $Branch -Name 'Branch' | Out-Null
     Assert-HerdrMetadataValue -Value $Commit -Name 'Commit' | Out-Null
+    $oneDriveExchangeRootCanonical = Assert-HerdrConfiguredLocalPath -Path $OneDriveExchangeRoot
     $inboxRoot = Assert-HerdrConfiguredLocalPath -Path $OneDriveInboxRoot
     $exchangeRootCanonical = Assert-HerdrConfiguredLocalPath -Path $ExchangeRoot
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $inboxRoot | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $inboxRoot -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
     $exchangeRootCanonical = Ensure-HerdrManagedDirectory -Path $exchangeRootCanonical -Description 'Exchange root'
     if ([string]::IsNullOrWhiteSpace($OneDriveOutboxRoot)) {
         $OneDriveOutboxRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $inboxRoot -Name Outbox
@@ -1820,8 +2018,27 @@ function Invoke-HerdrReviewStaging {
     }
     $outboxRoot = Assert-HerdrConfiguredLocalPath -Path $OneDriveOutboxRoot
     $archiveRoot = Assert-HerdrConfiguredLocalPath -Path $OneDriveArchiveRoot
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxRoot | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $archiveRoot | Out-Null
+    foreach ($oneDrivePath in @(
+        [pscustomobject]@{ Name = 'OneDrive Inbox'; Path = $inboxRoot },
+        [pscustomobject]@{ Name = 'OneDrive Outbox'; Path = $outboxRoot },
+        [pscustomobject]@{ Name = 'OneDrive Archive'; Path = $archiveRoot }
+    )) {
+        if (-not (Test-HerdrPathSameOrDescendant -Candidate $oneDrivePath.Path -Ancestor $oneDriveExchangeRootCanonical) -or
+            $oneDrivePath.Path.Equals($oneDriveExchangeRootCanonical, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($oneDrivePath.Name) is outside the configured OneDrive exchange boundary."
+        }
+    }
+    foreach ($oneDrivePath in @(
+        [pscustomobject]@{ Name = 'OneDrive Inbox'; Path = $inboxRoot },
+        [pscustomobject]@{ Name = 'OneDrive Outbox'; Path = $outboxRoot },
+        [pscustomobject]@{ Name = 'OneDrive Archive'; Path = $archiveRoot }
+    )) {
+        Assert-HerdrPhysicalPathUnderRoot -CandidatePath $oneDrivePath.Path -RootPath $oneDriveExchangeRootCanonical `
+            -Description "$($oneDrivePath.Name) physical exchange boundary" `
+            -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
+    }
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxRoot -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $archiveRoot -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
     Assert-HerdrPathDoesNotOverlap -Left $inboxRoot -Right $exchangeRootCanonical -Description 'OneDrive and exchange'
     Assert-HerdrPathDoesNotOverlap -Left $inboxRoot -Right $outboxRoot -Description 'OneDrive Inbox and Outbox'
     Assert-HerdrPathDoesNotOverlap -Left $inboxRoot -Right $archiveRoot -Description 'OneDrive Inbox and Archive'
@@ -1833,8 +2050,9 @@ function Invoke-HerdrReviewStaging {
         $sourceCanonical.Equals($inboxRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Source workbook is outside the configured OneDrive Inbox.'
     }
-    $sourceBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourceCanonical -RootPath $inboxRoot -Description 'OneDrive source'
-    $sourceItem = Assert-HerdrWorkbookFile -Path $sourceCanonical
+    $sourceBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourceCanonical -RootPath $inboxRoot `
+        -Description 'OneDrive source' -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical
+    $sourceItem = Assert-HerdrWorkbookFile -Path $sourceCanonical -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical
     $stageRoot = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeRootCanonical 'in') `
         -TrustedRoot $exchangeRootCanonical -Description 'Exchange input root'
     $jobDirectory = Get-HerdrCanonicalPath -Path (Join-Path $stageRoot $JobId)
@@ -1843,22 +2061,26 @@ function Invoke-HerdrReviewStaging {
         -RequireLeafCreation -Description 'Staging job directory'
     $completed = $false
     try {
-        $firstSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot
+        $firstSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot `
+            -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical
         if ($null -ne $BetweenSourceReads) { & $BetweenSourceReads $sourceCanonical }
         if ($StabilityIntervalMilliseconds -gt 0) { Start-Sleep -Milliseconds $StabilityIntervalMilliseconds }
-        $secondSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot -ExpectedIdentity $firstSnapshot
+        $secondSnapshot = Get-HerdrFileSnapshot -Path $sourceCanonical -TrustedRoot $inboxRoot `
+            -ExpectedIdentity $firstSnapshot -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical
         Assert-HerdrSnapshotsEqual -Expected $firstSnapshot -Actual $secondSnapshot -Description 'OneDrive source'
         $extension = [IO.Path]::GetExtension($sourceItem.Name).ToLowerInvariant()
         $stagedPath = Get-HerdrCanonicalPath -Path (Join-Path $jobDirectory ('input' + $extension))
         Copy-HerdrFileExclusive -SourcePath $sourceCanonical -DestinationPath $stagedPath `
-            -TrustedRoot $inboxRoot -ExpectedSourceIdentity $firstSnapshot -TrustedDestinationRoot $jobDirectory | Out-Null
+            -TrustedRoot $inboxRoot -ExpectedSourceIdentity $firstSnapshot -TrustedDestinationRoot $jobDirectory `
+            -SourceAllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
         $stagedSnapshot = Get-HerdrFileSnapshot -Path $stagedPath -TrustedRoot $jobDirectory
         Assert-HerdrSnapshotContentEqual -Expected $firstSnapshot -Actual $stagedSnapshot -Description 'Bridge staging copy'
         if (-not (Test-Path -LiteralPath $sourceCanonical -PathType Leaf)) {
             throw 'OneDrive source was not preserved after staging.'
         }
         Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourceCanonical -RootPath $inboxRoot `
-            -ExpectedCandidate $firstSnapshot -ExpectedRoot $sourceBoundary.Root -Description 'Preserved OneDrive source' | Out-Null
+            -ExpectedCandidate $firstSnapshot -ExpectedRoot $sourceBoundary.Root -Description 'Preserved OneDrive source' `
+            -AllowedCloudFilesRoot $oneDriveExchangeRootCanonical | Out-Null
         $manifestPath = Get-HerdrCanonicalPath -Path (Join-Path $jobDirectory 'staging-provenance.json')
         $manifest = [ordered]@{
             schema = 'herdr-review-staging-v1'

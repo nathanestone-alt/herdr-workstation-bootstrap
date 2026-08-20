@@ -333,6 +333,7 @@ function Get-HerdrManifestRecord {
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)][string]$JobId,
         [Parameter(Mandatory)][string]$ExchangeRoot,
+        [Parameter(Mandatory)][string]$OneDriveExchangeRoot,
         [Parameter(Mandatory)][string]$OneDriveInboxRoot,
         [Parameter(Mandatory)][string]$OneDriveOutboxRoot,
         [Parameter(Mandatory)][string]$OneDriveArchiveRoot
@@ -340,12 +341,32 @@ function Get-HerdrManifestRecord {
 
     $manifestCanonical = Get-HerdrCanonicalPath -Path $ManifestPath
     $exchangeCanonical = Get-HerdrCanonicalPath -Path $ExchangeRoot
+    $oneDriveExchangeCanonical = Get-HerdrCanonicalPath -Path $OneDriveExchangeRoot
     $inboxCanonical = Get-HerdrCanonicalPath -Path $OneDriveInboxRoot
     $outboxCanonical = Get-HerdrCanonicalPath -Path $OneDriveOutboxRoot
     $archiveCanonical = Get-HerdrCanonicalPath -Path $OneDriveArchiveRoot
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $inboxCanonical | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxCanonical | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $archiveCanonical | Out-Null
+    foreach ($oneDrivePath in @(
+        [pscustomobject]@{ Name = 'OneDrive Inbox'; Path = $inboxCanonical },
+        [pscustomobject]@{ Name = 'OneDrive Outbox'; Path = $outboxCanonical },
+        [pscustomobject]@{ Name = 'OneDrive Archive'; Path = $archiveCanonical }
+    )) {
+        if (-not (Test-HerdrPathSameOrDescendant -Candidate $oneDrivePath.Path -Ancestor $oneDriveExchangeCanonical) -or
+            $oneDrivePath.Path.Equals($oneDriveExchangeCanonical, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($oneDrivePath.Name) is outside the configured OneDrive exchange boundary."
+        }
+    }
+    foreach ($oneDrivePath in @(
+        [pscustomobject]@{ Name = 'OneDrive Inbox'; Path = $inboxCanonical },
+        [pscustomobject]@{ Name = 'OneDrive Outbox'; Path = $outboxCanonical },
+        [pscustomobject]@{ Name = 'OneDrive Archive'; Path = $archiveCanonical }
+    )) {
+        Assert-HerdrPhysicalPathUnderRoot -CandidatePath $oneDrivePath.Path -RootPath $oneDriveExchangeCanonical `
+            -Description "$($oneDrivePath.Name) physical exchange boundary" `
+            -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
+    }
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $inboxCanonical -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxCanonical -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $archiveCanonical -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
     Assert-HerdrPathDoesNotOverlap -Left $inboxCanonical -Right $outboxCanonical -Description 'OneDrive Inbox and Outbox'
     Assert-HerdrPathDoesNotOverlap -Left $inboxCanonical -Right $archiveCanonical -Description 'OneDrive Inbox and Archive'
     Assert-HerdrPathDoesNotOverlap -Left $outboxCanonical -Right $archiveCanonical -Description 'OneDrive Outbox and Archive'
@@ -388,7 +409,8 @@ function Get-HerdrManifestRecord {
     Assert-HerdrJsonProperties -Object $source -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256', 'volume_serial_number', 'file_index', 'number_of_links', 'file_identity') -Description 'Source record'
     Assert-HerdrJsonProperties -Object $stage -Allowed @('path', 'file_name', 'extension', 'captured_utc', 'size_bytes', 'last_write_time_utc', 'sha256', 'volume_serial_number', 'file_index', 'number_of_links', 'file_identity') -Description 'Bridge-stage record'
     $sourcePath = Get-HerdrCanonicalPath -Path (Get-HerdrRequiredJsonString -Object $source -Name 'path' -Description 'Source record')
-    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourcePath -RootPath $inboxCanonical -Description 'Staging source boundary' | Out-Null
+    Assert-HerdrPhysicalPathUnderRoot -CandidatePath $sourcePath -RootPath $inboxCanonical `
+        -Description 'Staging source boundary' -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
     if ($sourcePath.Equals($inboxCanonical, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Staging manifest source is outside the configured OneDrive Inbox.'
     }
@@ -839,6 +861,12 @@ function Invoke-HerdrExcelJob {
     }
     if ([string]::IsNullOrWhiteSpace($OneDriveOutboxRoot)) { $OneDriveOutboxRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Outbox }
     if ([string]::IsNullOrWhiteSpace($OneDriveArchiveRoot)) { $OneDriveArchiveRoot = Get-HerdrDefaultOneDriveSiblingRoot -InboxRoot $OneDriveInboxRoot -Name Archive }
+    $oneDriveExchangeCanonical = if ($null -ne $runtimeConfiguration) {
+        Get-HerdrCanonicalPath -Path $runtimeConfiguration.OneDriveExchangeRoot
+    }
+    else {
+        Get-HerdrCanonicalPath -Path (Split-Path -Parent (Get-HerdrCanonicalPath -Path $OneDriveInboxRoot))
+    }
     if ($null -ne $runtimeConfiguration) {
         Assert-HerdrOneDriveReady -OneDriveExchangeRoot $runtimeConfiguration.OneDriveExchangeRoot `
             -OneDriveAccount $runtimeConfiguration.OneDriveAccount -IdentityConfiguration $identityConfiguration `
@@ -855,21 +883,25 @@ function Invoke-HerdrExcelJob {
     Assert-HerdrExistingPathIsNotReparsePoint -Path $reviewCanonical | Out-Null
     Assert-HerdrExistingPathIsNotReparsePoint -Path $toolsCanonical | Out-Null
     Assert-HerdrExistingPathIsNotReparsePoint -Path $outboxCanonical -AllowMissing | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveOutboxCanonical | Out-Null
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveArchiveCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveOutboxCanonical `
+        -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveArchiveCanonical `
+        -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
     $exchangeInputCanonical = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeCanonical 'in') `
         -TrustedRoot $exchangeCanonical -Description 'Exchange input root'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $reviewCanonical -Description 'exchange and review-job'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $toolsCanonical -Description 'exchange and tools'
     Assert-HerdrPathDoesNotOverlap -Left $reviewCanonical -Right $toolsCanonical -Description 'review-job and tools'
     $oneDriveInboxCanonical = Assert-HerdrConfiguredLocalPath -Path $OneDriveInboxRoot
-    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveInboxCanonical | Out-Null
+    Assert-HerdrExistingPathIsNotReparsePoint -Path $oneDriveInboxCanonical `
+        -AllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveInboxCanonical -Description 'exchange and OneDrive'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveOutboxCanonical -Description 'exchange and OneDrive Outbox'
     Assert-HerdrPathDoesNotOverlap -Left $exchangeCanonical -Right $oneDriveArchiveCanonical -Description 'exchange and OneDrive Archive'
     $job = Read-HerdrExcelJob -JobPath $JobPath -ExchangeRoot $exchangeCanonical
     $manifest = Get-HerdrManifestRecord -ManifestPath $job.ManifestPath -JobId $job.JobId `
-        -ExchangeRoot $exchangeCanonical -OneDriveInboxRoot $OneDriveInboxRoot `
+        -ExchangeRoot $exchangeCanonical -OneDriveExchangeRoot $oneDriveExchangeCanonical `
+        -OneDriveInboxRoot $OneDriveInboxRoot `
         -OneDriveOutboxRoot $oneDriveOutboxCanonical -OneDriveArchiveRoot $oneDriveArchiveCanonical
     if ($job.SourceRepository -ne 'NOT-PROVIDED' -and $job.SourceRepository -cne $manifest.Provenance.repository) { throw 'Excel job repository provenance does not match the staging manifest.' }
     if ($job.SourceBranch -ne 'NOT-PROVIDED' -and $job.SourceBranch -cne $manifest.Provenance.branch) { throw 'Excel job branch provenance does not match the staging manifest.' }
@@ -891,7 +923,8 @@ function Invoke-HerdrExcelJob {
         Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical) `
             -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode | Out-Null
     }
-    $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical -ExpectedIdentity $manifest.SourceIdentity
+    $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical `
+        -ExpectedIdentity $manifest.SourceIdentity -AllowedCloudFilesRoot $oneDriveExchangeCanonical
     if ($sourceBefore.Sha256 -cne $manifest.SourceHash -or $sourceBefore.SizeBytes -ne $manifest.SourceSizeBytes) { throw 'Canonical source workbook hash changed before execution.' }
     $stageBefore = Get-HerdrFileSnapshot -Path $manifest.StagedPath `
         -TrustedRoot (Join-Path (Join-Path $exchangeCanonical 'in') $job.JobId) -ExpectedIdentity $manifest.StagedIdentity
@@ -925,7 +958,8 @@ function Invoke-HerdrExcelJob {
         if ($null -ne $AfterExcelHook) { & $AfterExcelHook }
         $lastMileAfter = Get-HerdrFileSnapshot -Path $lastMilePath -TrustedRoot $reviewJobPath -ExpectedIdentity $lastMileBefore
         Assert-HerdrSnapshotsEqual -Expected $lastMileBefore -Actual $lastMileAfter -Description 'Protected last-mile workbook'
-        $sourceAfter = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical -ExpectedIdentity $sourceBefore
+        $sourceAfter = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical `
+        -ExpectedIdentity $sourceBefore -AllowedCloudFilesRoot $oneDriveExchangeCanonical
         if ($sourceAfter.Sha256 -cne $sourceBefore.Sha256 -or $sourceAfter.SizeBytes -ne $sourceBefore.SizeBytes) { throw 'Canonical source workbook changed during execution.' }
         $resultWorking = Get-HerdrFileSnapshot -Path $resultWorkingPath -TrustedRoot $reviewJobPath
         $outboxJobPath = Ensure-HerdrManagedDirectory -Path $outboxJobPath `
@@ -936,11 +970,14 @@ function Invoke-HerdrExcelJob {
         $result = Get-HerdrFileSnapshot -Path $resultPath -TrustedRoot $outboxJobPath
         Assert-HerdrSnapshotContentEqual -Expected $resultWorking -Actual $result -Description 'Outbox result copy'
         $oneDriveOutboxJobPath = Ensure-HerdrManagedDirectory -Path $oneDriveOutboxJobPath `
-            -TrustedRoot $oneDriveOutboxCanonical -Description 'OneDrive output job directory'
+            -TrustedRoot $oneDriveOutboxCanonical -Description 'OneDrive output job directory' `
+            -AllowedCloudFilesRoot $oneDriveExchangeCanonical
         $oneDriveResultPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath ('result' + $extension))
         & $copyHerdrFileExclusive -SourcePath $resultPath -DestinationPath $oneDriveResultPath `
-            -TrustedRoot $outboxJobPath -ExpectedSourceIdentity $result -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
-        $oneDriveResult = Get-HerdrFileSnapshot -Path $oneDriveResultPath -TrustedRoot $oneDriveOutboxJobPath
+            -TrustedRoot $outboxJobPath -ExpectedSourceIdentity $result -TrustedDestinationRoot $oneDriveOutboxJobPath `
+            -DestinationAllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
+        $oneDriveResult = Get-HerdrFileSnapshot -Path $oneDriveResultPath -TrustedRoot $oneDriveOutboxJobPath `
+            -AllowedCloudFilesRoot $oneDriveExchangeCanonical
         Assert-HerdrSnapshotContentEqual -Expected $result -Actual $oneDriveResult -Description 'OneDrive Outbox result copy'
         $completedUtc = [DateTime]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         $provenance = [ordered]@{
@@ -1001,7 +1038,8 @@ function Invoke-HerdrExcelJob {
         Write-HerdrAtomicText -Path $manifestOutputPath -Content $json -TrustedRoot $outboxJobPath | Out-Null
         $oneDriveManifestPath = Get-HerdrCanonicalPath -Path (Join-Path $oneDriveOutboxJobPath 'provenance.json')
         & $copyHerdrFileExclusive -SourcePath $manifestOutputPath -DestinationPath $oneDriveManifestPath `
-            -TrustedRoot $outboxJobPath -TrustedDestinationRoot $oneDriveOutboxJobPath | Out-Null
+            -TrustedRoot $outboxJobPath -TrustedDestinationRoot $oneDriveOutboxJobPath `
+            -DestinationAllowedCloudFilesRoot $oneDriveExchangeCanonical | Out-Null
         $logRecord = [ordered]@{
             schema = 'herdr-excel-job-log-v1'
             job_id = $job.JobId
@@ -1031,12 +1069,13 @@ function Invoke-HerdrExcelJob {
     finally {
         if (-not $completed) {
             foreach ($cleanup in @(
-                [pscustomobject]@{ Path = $outboxJobPath; Root = $outboxCanonical; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
-                [pscustomobject]@{ Path = $oneDriveOutboxJobPath; Root = $oneDriveOutboxCanonical; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
-                [pscustomobject]@{ Path = $reviewJobPath; Root = $reviewCanonical; Files = @('input.xlsx', 'input.xlsm', 'input.xlsb', 'result.xlsx', 'result.xlsm', 'result.xlsb') }
+                [pscustomobject]@{ Path = $outboxJobPath; Root = $outboxCanonical; AllowedCloudFilesRoot = $null; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
+                [pscustomobject]@{ Path = $oneDriveOutboxJobPath; Root = $oneDriveOutboxCanonical; AllowedCloudFilesRoot = $oneDriveExchangeCanonical; Files = @('result.xlsx', 'result.xlsm', 'result.xlsb', 'provenance.json') },
+                [pscustomobject]@{ Path = $reviewJobPath; Root = $reviewCanonical; AllowedCloudFilesRoot = $null; Files = @('input.xlsx', 'input.xlsm', 'input.xlsb', 'result.xlsx', 'result.xlsm', 'result.xlsb') }
             )) {
                 try {
-                    Remove-HerdrManagedTree -Path $cleanup.Path -TrustedRoot $cleanup.Root -KnownFileNames $cleanup.Files
+                    Remove-HerdrManagedTree -Path $cleanup.Path -TrustedRoot $cleanup.Root `
+                        -KnownFileNames $cleanup.Files -AllowedCloudFilesRoot $cleanup.AllowedCloudFilesRoot
                 }
                 catch {
                     Write-Verbose "Safe runner cleanup did not remove '$($cleanup.Path)': $($_.Exception.Message)"

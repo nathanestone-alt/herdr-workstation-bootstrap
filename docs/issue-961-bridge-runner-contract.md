@@ -49,16 +49,24 @@ roots, the locked workbook allowlist, repository/branch/commit provenance, and
 
 The exact workbook allowlist is `.xlsx`, `.xlsm`, and `.xlsb`. The helper rejects
 all other extensions, device/UNC paths, traversal outside the configured Inbox,
-reparse points (including every ancestor), Offline/Recall attributes,
-hard-linked sources, unstable exclusive reads, collisions, and source/stage
-size, hash, or physical file-identity mismatches. Windows production paths are
-proven through no-follow handles, final-handle paths, volume/file identities,
-and revalidation before and after read/copy/hash transitions. Managed-directory
-creation, temp file creation, atomic text output, atomic commit/rename, and
-failure cleanup are handle-relative to pinned no-follow directory handles;
-path checks are test-only seams on non-Windows hosts. Destination parents are
-likewise tied to their trusted job root before commit and the committed leaf is
-re-proven afterward. It never deletes or moves the Inbox original.
+symlinks, junctions, mount points, and unrecognized reparse tags. The only
+accepted reparse case is a native Cloud Files directory tag on the path to a
+configured OneDrive exchange root or one of its Inbox/Outbox/Archive children;
+workbook files themselves must remain non-reparse and fully hydrated. The
+configured exchange root used for Cloud Files tag admission is not a general
+containment root for every physical proof; lexical and final-handle containment
+continues to be enforced by the dedicated trusted-root and exchange-boundary
+checks. Offline/
+Recall attributes, hard-linked sources, unstable exclusive reads, collisions,
+and source/stage size, hash, or physical file-identity mismatches are also
+rejected. Windows production paths are proven through no-follow handles,
+final-handle paths, volume/file identities, and revalidation before and after
+read/copy/hash transitions. Managed-directory creation, temp file creation,
+atomic text output, atomic commit/rename, and failure cleanup are
+handle-relative to pinned no-follow directory handles; path checks are
+test-only seams on non-Windows hosts. Destination parents are likewise tied to
+their trusted job root before commit and the committed leaf is re-proven
+afterward. It never deletes or moves the Inbox original.
 
 ## Job schema and Excel boundary
 
@@ -77,10 +85,11 @@ stage, reads JSON through a supported `FileStream`-backed UTF-8 reader over the
 validated native handle, copies the accepted stage into the configured
 host-owned local review-job workspace, and opens only that last-mile copy. The
 source and last-mile hashes are checked again after Excel. Results and compact
-provenance/log records are copied to the configured local output and OneDrive
-Outbox locations; the configured OneDrive Archive is validated as a distinct,
-non-reparse root. The runner never opens an exchange/OneDrive copy directly,
-and never moves or deletes the Inbox original.
+provenance/log records are copied to the configured local output and the
+OneDrive Outbox; the configured OneDrive Archive is validated as a distinct
+Cloud Files directory under the configured exchange boundary. The runner
+never opens an exchange/OneDrive copy directly, and never moves or deletes the
+Inbox original.
 
 Excel automation is default-deny: `AutomationSecurity=ForceDisable`, links are
 not updated, data connections cannot refresh, events are disabled, and no

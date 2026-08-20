@@ -55,10 +55,15 @@ try {
     $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
     Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
+    } 'Cloud Files reparse point on a non-directory' 'Cloud Files file reparse description'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
 
     $result = Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' `
-        -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -Repository 'STModel-Private' `
+        -OneDriveExchangeRoot $oneDriveExchange -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -Repository 'STModel-Private' `
         -Branch 'codex/issue-961-bootstrap-reconcile' -Commit 'aa1f42580e4a3d98df8756f73d727d901cad90ea' `
         -StabilityIntervalMilliseconds 0
     Assert-True ($result.SourcePreserved) 'The Inbox source was not reported as preserved.'
@@ -71,26 +76,31 @@ try {
     Assert-True ((@(Get-HerdrWorkbookExtensionAllowlist) -join ',') -ceq '.xlsx,.xlsm,.xlsb') 'The workbook extension allowlist changed.'
 
     Assert-Throws {
-        Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
+        Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
     } 'collision' 'job collision'
     Assert-Throws {
-        Invoke-HerdrReviewStaging -SourcePath $source -JobId '../escape' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
+        Invoke-HerdrReviewStaging -SourcePath $source -JobId '../escape' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
     } 'job ID is invalid' 'job ID traversal'
     $outside = Join-Path $root 'outside.xlsx'
     [IO.File]::WriteAllBytes($outside, $sourceBytes)
     Assert-Throws {
-        Invoke-HerdrReviewStaging -SourcePath $outside -JobId 'job-outside' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
+        Invoke-HerdrReviewStaging -SourcePath $outside -JobId 'job-outside' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
     } 'outside the configured OneDrive Inbox' 'source root escape'
     $unsupported = Join-Path $inbox 'unsupported.txt'
     [IO.File]::WriteAllText($unsupported, 'not a workbook')
     Assert-Throws {
-        Invoke-HerdrReviewStaging -SourcePath $unsupported -JobId 'job-extension' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
+        Invoke-HerdrReviewStaging -SourcePath $unsupported -JobId 'job-extension' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
     } 'not allowed' 'extension deny'
 
     $unstableSource = Join-Path $inbox 'unstable.xlsx'
     [IO.File]::WriteAllBytes($unstableSource, [Text.Encoding]::UTF8.GetBytes('stable-before'))
     Assert-Throws {
-        Invoke-HerdrReviewStaging -SourcePath $unstableSource -JobId 'job-unstable' -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0 `
+        Invoke-HerdrReviewStaging -SourcePath $unstableSource -JobId 'job-unstable' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0 `
             -BetweenSourceReads { param([string]$Path) [IO.File]::WriteAllBytes($Path, [Text.Encoding]::UTF8.GetBytes('changed-after')) }
     } 'unstable' 'stability gate'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-unstable'))) 'Unstable staging left a partial job directory.'

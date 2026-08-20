@@ -53,7 +53,8 @@ function New-TestJob {
     $jobId = 'job-{0:d3}' -f $script:counter
     $source = Join-Path $inbox ("workbook-{0}.xlsx" -f $script:counter)
     [IO.File]::WriteAllBytes($source, [Text.Encoding]::UTF8.GetBytes("fixture $secret $jobId`n"))
-    $staged = Invoke-HerdrReviewStaging -SourcePath $source -JobId $jobId -OneDriveInboxRoot $inbox `
+    $staged = Invoke-HerdrReviewStaging -SourcePath $source -JobId $jobId -OneDriveExchangeRoot $oneDriveExchange `
+        -OneDriveInboxRoot $inbox `
         -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
         -ExchangeRoot $exchange -Repository 'STModel-Private' -Branch 'main' -Commit 'abc123' -StabilityIntervalMilliseconds 0
     $jobPath = Join-Path (Split-Path -Parent $staged.ManifestPath) 'job.json'
@@ -71,6 +72,21 @@ function New-TestJob {
 
 try {
     New-Item -ItemType Directory -Path $inbox, $oneDriveOutbox, $oneDriveArchive, $exchange, $reviewJobs, $tools -Force | Out-Null
+    $platformRoot = [IO.Path]::GetPathRoot($root)
+    $platformRootProof = Get-HerdrPhysicalPathProof -Path $platformRoot -AllowedCloudFilesRoot $oneDriveExchange
+    Assert-True ($platformRootProof.Exists -and $platformRootProof.Leaf.IsDirectory) `
+        "A configured Cloud Files boundary incorrectly rejected the platform root '$platformRoot'."
+    if ($IsWindows) {
+        # DestinationAllowedCloudFilesRoot is independent of TrustedDestinationRoot.
+        # This exercises Copy-HerdrFileExclusive's C:\ operation root on Windows.
+        $independentCopySource = Join-Path $exchange 'independent-boundary-source.xlsx'
+        $independentCopyDestination = Join-Path $oneDriveOutbox 'independent-boundary-destination.xlsx'
+        [IO.File]::WriteAllBytes($independentCopySource, [Text.Encoding]::UTF8.GetBytes('independent boundary fixture'))
+        Copy-HerdrFileExclusive -SourcePath $independentCopySource -DestinationPath $independentCopyDestination `
+            -DestinationAllowedCloudFilesRoot $oneDriveExchange | Out-Null
+        Assert-True (Test-Path -LiteralPath $independentCopyDestination -PathType Leaf) `
+            'A destination Cloud Files boundary was incorrectly coupled to TrustedDestinationRoot.'
+    }
     Write-TestJson -Path $runtimeConfig -Value ([ordered]@{
         schema = 'herdr-windows-review-runtime-v1'
         approved = $true
