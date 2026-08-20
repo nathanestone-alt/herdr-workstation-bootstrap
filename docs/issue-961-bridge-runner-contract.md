@@ -101,5 +101,9 @@ SID, interactive session ID, and fixed non-admin bridge-account SID. The runner
 proves the current process, Explorer, OneDrive process, and signed-in OneDrive
 account before work, then Windows Authz evaluates effective bridge access to
 every host-owned tools or review-job root; any effective write grant is denied.
+Effective-access evaluation does not generate Authz audits or require
+`SeAuditPrivilege`: the bridge initializes its Authz resource manager with
+`AUTHZ_RM_FLAG_NO_AUDIT` for an access decision only. Central-access-policy
+behavior remains unchanged.
 Test probes are available only behind the explicit hermetic `-TestMode` seam;
 the production wrappers expose no bridge-account or path override.

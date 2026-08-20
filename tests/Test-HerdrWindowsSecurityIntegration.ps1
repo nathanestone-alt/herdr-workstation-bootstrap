@@ -5,6 +5,12 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $fixtureText = [IO.File]::ReadAllText($PSCommandPath)
+$bridgeSourcePath = Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1'
+$bridgeSource = [IO.File]::ReadAllText($bridgeSourcePath)
+if (-not $bridgeSource.Contains('AUTHZ_RM_FLAG_NO_AUDIT = 0x1;', [StringComparison]::Ordinal) -or
+    -not $bridgeSource.Contains('AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT,', [StringComparison]::Ordinal)) {
+    throw 'Mechanical Authz regression: effective-access resource-manager initialization must use AUTHZ_RM_FLAG_NO_AUDIT.'
+}
 $rawThreadPattern = '[Threading.' + 'ThreadStart]'
 if ($fixtureText.Contains($rawThreadPattern, [StringComparison]::Ordinal)) {
     throw 'Mechanical race-fixture regression: raw ThreadStart execution is forbidden.'
@@ -364,8 +370,8 @@ try {
 
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $currentGroups = @([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value })
-    $effectiveWriteSddl = "D:P(A;;0x120116;;;$currentSid)"
-    $effectiveReadSddl = "D:P(A;;0x120089;;;$currentSid)"
+    $effectiveWriteSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x1F0156;;;${currentSid})"
+    $effectiveReadSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x120089;;;${currentSid})"
     $effectiveWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveWriteSddl)
     $effectiveReadDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveReadSddl)
     $effectiveWriteBytes = [byte[]]::new($effectiveWriteDescriptor.BinaryLength)
@@ -377,7 +383,7 @@ try {
     Assert-True (-not [Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveReadBytes)) `
         'Authz effective-access regression treated read access as write access.'
     if ($currentGroups.Count -gt 0) {
-        $groupSddl = "D:P(A;;0x120116;;;$($currentGroups[0]))"
+        $groupSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x1F0156;;;$($currentGroups[0]))"
         $groupDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($groupSddl)
         $groupBytes = [byte[]]::new($groupDescriptor.BinaryLength)
         $groupDescriptor.GetBinaryForm($groupBytes, 0)

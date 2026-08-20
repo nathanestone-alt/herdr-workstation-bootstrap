@@ -54,6 +54,7 @@ namespace Herdr.Security {
         private const int NativeFileRenameInformation = 10;
         private const int FileDispositionInformation = 4;
         private const uint FileGenericWrite = 0x00120116;
+        private const uint AUTHZ_RM_FLAG_NO_AUDIT = 0x1;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct ByHandleFileInformation {
@@ -427,7 +428,7 @@ namespace Herdr.Security {
             IntPtr saclResults = IntPtr.Zero;
             IntPtr errors = IntPtr.Zero;
             try {
-                if (!AuthzInitializeResourceManager(0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                if (!AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
                     "HerdrBridge effective access", out resourceManager)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Authz resource manager initialization failed");
                 }
