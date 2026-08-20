@@ -1,0 +1,12 @@
+{
+  "schema": "herdr-windows-review-runtime-v1",
+  "approved": true,
+  "one_drive_exchange_root": "<host-owned Windows OneDrive>\\Herdr Review Exchange",
+  "one_drive_account": "<designated OneDrive account>",
+  "exchange_root": "<host-owned local bridge staging root>",
+  "review_jobs_root": "<host-owned local Excel review-job root>",
+  "tools_root": "<host-owned local reviewed-tools root>",
+  "designated_interactive_user_sid": "<Windows SID>",
+  "designated_interactive_session_id": "<interactive session number>",
+  "bridge_account_sid": "<HerdrBridge SID>"
+}

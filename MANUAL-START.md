@@ -44,10 +44,11 @@ On the current Surface:
 6. Install and activate 64-bit Microsoft 365 desktop Excel.
 7. Create, save, reopen and close a disposable workbook in `%USERPROFILE%\Documents`.
 8. Resolve Excel Trust Center, add-in, activation and Protected View prompts.
-9. Sign in to the native Windows OneDrive client, create `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the full tree Always keep on this device.
-10. Do not make OneDrive, `C:\HerdrExchange`, `C:\HerdrReviewJobs`, or any child an Excel Trusted Location; trust macros, links and data connections only for a specifically verified workbook.
+9. Sign in to the native Windows OneDrive client under the designated interactive user, create the configured `Herdr Review Exchange\Inbox`, `Outbox`, and `Archive`, and mark the full tree Always keep on this device.
+10. Create the host-owned runtime configuration from `config/windows-review-runtime.example.json` outside Git, set `HERDR_WINDOWS_REVIEW_CONFIG`, and approve it only after validating its roots and OneDrive account.
+11. Do not make the configured OneDrive exchange, local staging root, local review-job root, or any child an Excel Trusted Location; trust macros, links and data connections only for a specifically verified workbook.
 
-`New-HerdrExchangeShare.ps1` establishes direct membership of `HerdrBridge` in the built-in Users group and rejects membership in any other local group; do not add it to groups manually.
+The #961 workbook lane uses SSH to herdr-win and does not install OneDrive or rclone in Ubuntu. Any separately commissioned SMB bootstrap utility remains outside this route; do not use it as the issue #961 exchange path.
 
 Excel COM still requires the designated Windows user to be interactively signed in. The Ubuntu VM can start and accept SSH before that login occurs.
 

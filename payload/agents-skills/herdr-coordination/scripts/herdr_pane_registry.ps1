@@ -3,7 +3,7 @@ param(
     [ValidateSet("status", "authority-acquire", "authority-renew", "challenge", "claim", "assign", "ack-assignment", "activate", "resolve", "resolve-pane", "revalidate")]
     [string]$Action = "status",
 
-    [string]$RegistryPath = "C:\tmp\herdr-pane-registry.jsonl",
+    [string]$RegistryPath = $(Join-Path ([IO.Path]::GetTempPath()) "herdr-pane-registry.jsonl"),
     [string]$ReceiptPath,
     [string]$PaneId,
     [string]$Name,

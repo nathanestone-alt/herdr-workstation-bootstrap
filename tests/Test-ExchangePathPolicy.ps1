@@ -1,6 +1,11 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\scripts\windows\HerdrExchangePathPolicy.ps1')
 
+if (-not $IsWindows) {
+    Write-Host 'SKIP: Windows path-policy checks require Windows path semantics.'
+    exit 0
+}
+
 function Assert-Rejected([string]$Path, [string]$Expected, [switch]$AllowExisting) {
     try {
         Resolve-HerdrExchangePath -Path $Path -AllowExistingUnmanagedPath:$AllowExisting | Out-Null
@@ -31,8 +36,19 @@ $expectedWindowsBaseDirectoryLoop = "foreach (`$directory in @('C:\dev', 'C:\Her
 if (-not $windowsBaseBody.Contains($expectedWindowsBaseDirectoryLoop, [StringComparison]::Ordinal)) {
     throw 'WindowsBase directory allowlist changed; review it before allowing any additional host path.'
 }
-if ($windowsBaseBody -match '[''"]C:\\HerdrExchange(?:\\|[''"])') {
-    throw 'WindowsBase must not pre-create C:\HerdrExchange; the share script owns its creation and marker.'
+if ($windowsBaseBody.Contains(('C:\Herdr' + 'Exchange'), [StringComparison]::Ordinal)) {
+    throw 'WindowsBase must not pre-create a legacy fixed exchange root; runtime configuration owns the review route.'
+}
+$stageText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\Stage-HerdrReviewWorkbook.ps1')
+$invokeText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\Invoke-HerdrExcelJob.ps1')
+foreach ($entryPointText in @($stageText, $invokeText)) {
+    if ($entryPointText.Contains(('C:\Herdr' + 'Exchange'), [StringComparison]::Ordinal) -or
+        $entryPointText.Contains(('C:\HerdrReview' + 'Jobs'), [StringComparison]::Ordinal)) {
+        throw 'Issue 961 entry points must not contain legacy fixed Windows roots.'
+    }
+    if (-not $entryPointText.Contains('RuntimeConfigurationPath', [StringComparison]::Ordinal)) {
+        throw 'Issue 961 entry points must require host-owned runtime configuration.'
+    }
 }
 
 $nonFixedPath = 'Z:\HerdrExchange'

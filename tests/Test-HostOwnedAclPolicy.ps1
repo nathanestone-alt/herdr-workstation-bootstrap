@@ -1,6 +1,11 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\scripts\windows\HerdrHostOwnedAclPolicy.ps1')
 
+if (-not $IsWindows) {
+    Write-Host 'SKIP: Windows ACL policy checks require Windows security principals.'
+    exit 0
+}
+
 $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-acl-policy-$([Guid]::NewGuid().ToString('N'))"
 $child = Join-Path $root 'pre-existing-child'

@@ -10,7 +10,8 @@ $ledgerPath = Join-Path $tempRoot "ledger.jsonl"
 $watchLogPath = Join-Path $tempRoot "watch.md"
 $coordLogPath = Join-Path $tempRoot "coordination.md"
 $fakeCoordPath = Join-Path $tempRoot "coord.ps1"
-$fakeRtkPath = Join-Path $tempRoot "rtk.cmd"
+$isWindowsPlatform = [IO.Path]::DirectorySeparatorChar -eq [char]92
+$fakeRtkPath = Join-Path $tempRoot $(if ($isWindowsPlatform) { "rtk.cmd" } else { "rtk" })
 
 function Assert-Equal {
     param(
@@ -40,7 +41,6 @@ function Start-RequestProcess {
         -ArgumentList @("-NoProfile", "-EncodedCommand", $encoded) `
         -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath `
-        -WindowStyle Hidden `
         -PassThru
     return [pscustomobject]@{
         Process = $process
@@ -69,6 +69,7 @@ function Wait-RequestBatch {
 
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 try {
+    if ($isWindowsPlatform) {
     @'
 @echo off
 setlocal EnableDelayedExpansion
@@ -78,7 +79,7 @@ shift
 if /I "%~1"=="agent" if /I "%~2"=="get" (
   set "testSession=session-stress"
   if /I "%~3"=="w2:p1" set "testSession=session-source"
-  echo {"id":"stress:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"stress-terminal","revision":1,"state_change_seq":1,"agent":"codex","agent_status":"idle","agent_session":{"agent":"codex","value":"!testSession!"}}}}
+  echo {"id":"stress:agent:get","result":{"type":"agent_info","agent":{"pane_id":"%~3","workspace_id":"w1","tab_id":"w1:t2","terminal_id":"stress-terminal","revision":1,"state_change_seq":1,"agent":"codex","agent_status":"idle","provider":"openai","model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"priority","agent_session":{"agent":"codex","value":"!testSession!"}}}}
   exit /b 0
 )
 if /I "%~1"=="agent" if /I "%~2"=="read" (
@@ -92,6 +93,41 @@ if /I "%~1"=="tab" if /I "%~2"=="get" (
 echo unexpected fake rtk invocation: %* 1>&2
 exit /b 2
 '@ | Set-Content -LiteralPath $fakeRtkPath -Encoding ascii
+    }
+    else {
+        @'
+#!/usr/bin/env pwsh
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$arguments = @($args)
+if ($arguments.Count -gt 0 -and $arguments[0] -ieq "proxy") { $arguments = @($arguments[1..($arguments.Count - 1)]) }
+if ($arguments.Count -lt 1 -or $arguments[0] -ine "herdr") { exit 2 }
+$arguments = @($arguments[1..($arguments.Count - 1)])
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "get") {
+    $paneId = [string]$arguments[2]
+    $session = if ($paneId -ieq "w2:p1") { "session-source" } else { "session-stress" }
+    [ordered]@{ id = "stress:agent:get"; result = [ordered]@{ type = "agent_info"; agent = [ordered]@{
+        pane_id = $paneId; workspace_id = "w1"; tab_id = "w1:t2"; terminal_id = "stress-terminal"
+        revision = 1; state_change_seq = 1; agent = "codex"; agent_status = "idle"
+        provider = "openai"; model = "gpt-5.6-luna"; reasoning_effort = "max"; service_tier = "priority"
+        agent_session = [ordered]@{ agent = "codex"; value = $session }
+    } } } | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "agent" -and $arguments[1] -ieq "read") {
+    Write-Output "ready prompt"
+    exit 0
+}
+if ($arguments.Count -ge 3 -and $arguments[0] -ieq "tab" -and $arguments[1] -ieq "get") {
+    [ordered]@{ id = "stress:tab:get"; result = [ordered]@{ type = "tab_info"; tab = [ordered]@{ tab_id = "w1:t2"; workspace_id = "w1"; label = "Stress Reviewer"; pane_count = 1 } } } | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
+Write-Error "unexpected fake rtk invocation: $($arguments -join ' ')"
+exit 2
+'@ | Set-Content -LiteralPath $fakeRtkPath -Encoding utf8
+        & chmod +x $fakeRtkPath
+        if ($LASTEXITCODE -ne 0) { throw "Unable to mark the fake RTK shim executable." }
+    }
 
     @'
 [CmdletBinding()]
@@ -105,7 +141,8 @@ param(
     [string]$ExpectedSession,
     [string]$ExpectedTabLabel,
     [string]$ExpectedTabId,
-    [string]$LogPath
+    [string]$LogPath,
+    [string]$WatchLogPath
 )
 if ($Action -eq "deliver") {
     [pscustomobject]@{
@@ -144,7 +181,8 @@ if ($Action -eq "prove-caller") {
     $originalHerdrEnv = $env:HERDR_ENV
     $originalPaneId = $env:HERDR_PANE_ID
     try {
-        $env:PATH = "$tempRoot;$originalPath"
+        $pwshDirectory = Split-Path -Parent (Get-Command pwsh -ErrorAction Stop).Source
+        $env:PATH = [string]::Join([IO.Path]::PathSeparator, @($tempRoot, $pwshDirectory))
         $env:HERDR_ENV = "1"
         $env:HERDR_PANE_ID = "w2:p1"
 

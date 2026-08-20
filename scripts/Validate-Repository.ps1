@@ -1,6 +1,8 @@
 #Requires -Version 7.0
 [CmdletBinding()]
-param()
+param(
+    [switch]$RunPayloadRegression
+)
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -47,7 +49,9 @@ if ($bashCandidates) {
         'tests\test-configure-excel-share-inputs.sh',
         'tests\test-configure-vps-client.sh',
         'tests\test-verify-vps-access.sh',
-        'tests\test-verify-path.sh'
+        'tests\test-verify-path.sh',
+        'tests\test-python-toolchain.sh',
+        'tests\test-install-payload.sh'
     )) {
         $testPath = Join-Path $RepoRoot $relativeTest
         & $bash (Convert-ToBashPath -Path $testPath)
@@ -75,16 +79,71 @@ catch {
     $failures.Add("Behavioral regression test failed: tests\Test-ExchangePathPolicy.ps1 ($($_.Exception.Message))")
 }
 try {
+    & (Join-Path $RepoRoot 'tests\Test-HerdrReviewStaging.ps1')
+}
+catch {
+    $failures.Add("Behavioral regression test failed: tests\Test-HerdrReviewStaging.ps1 ($($_.Exception.Message))")
+}
+try {
+    & (Join-Path $RepoRoot 'tests\Test-HerdrExcelJobRunner.ps1')
+}
+catch {
+    $failures.Add("Behavioral regression test failed: tests\Test-HerdrExcelJobRunner.ps1 ($($_.Exception.Message))")
+}
+try {
+    & (Join-Path $RepoRoot 'tests\Test-HerdrWindowsSecurityIntegration.ps1')
+}
+catch {
+    $failures.Add("Behavioral regression test failed: tests\Test-HerdrWindowsSecurityIntegration.ps1 ($($_.Exception.Message))")
+}
+try {
     & (Join-Path $RepoRoot 'tests\Test-BootstrapVmDispatcher.ps1')
 }
 catch {
     $failures.Add("Behavioral regression test failed: tests\Test-BootstrapVmDispatcher.ps1 ($($_.Exception.Message))")
 }
 
+$payloadRegressionTests = @(
+    'payload\agents-skills\herdr-coordination\scripts\test_claude_session_refresh.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_codex_session_refresh.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_coordination.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_naming_lifecycle.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_pane_registry.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_pane_registry_cli.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_skill_compatibility.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_workflow.ps1',
+    'payload\agents-skills\herdr-coordination\scripts\test_herdr_workflow_stress.ps1',
+    'payload\agents-skills\st-herdr-dispatch\scripts\test_st_herdr_dispatch.ps1'
+)
+foreach ($relativeTest in $payloadRegressionTests) {
+    if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $relativeTest))) {
+        $failures.Add("Reconciled payload regression test missing: $relativeTest")
+    }
+}
+if ($RunPayloadRegression) {
+    if (-not $IsWindows) {
+        $failures.Add('Payload behavioral regression suites require their Windows-only fixture runtime; use the static validator on Ubuntu and run -RunPayloadRegression on Windows.')
+    }
+    else {
+        foreach ($relativeTest in $payloadRegressionTests) {
+            try {
+                & (Join-Path $RepoRoot $relativeTest)
+            }
+            catch {
+                $failures.Add("Payload behavioral regression test failed: $relativeTest ($($_.Exception.Message))")
+            }
+        }
+    }
+}
+
 $requiredFiles = @(
     'scripts\windows\HerdrFirewallPolicy.ps1',
     'scripts\windows\HerdrHostOwnedAclPolicy.ps1',
     'scripts\windows\HerdrExchangePathPolicy.ps1',
+    'scripts\windows\HerdrReviewStaging.ps1',
+    'scripts\windows\Stage-HerdrReviewWorkbook.ps1',
+    'scripts\windows\HerdrExcelJobRunner.ps1',
+    'scripts\windows\Invoke-HerdrExcelJob.ps1',
     'scripts\windows\New-HerdrUbuntuVM.ps1',
     'scripts\windows\New-HerdrExchangeShare.ps1',
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
@@ -96,14 +155,80 @@ $requiredFiles = @(
     'tests\test-verify-path.sh',
     'tests\Test-FirewallPolicy.ps1',
     'tests\Test-ExchangePathPolicy.ps1',
+    'tests\Test-HerdrReviewStaging.ps1',
+    'tests\Test-HerdrExcelJobRunner.ps1',
+    'tests\Test-HerdrWindowsSecurityIntegration.ps1',
     'tests\Test-BootstrapVmDispatcher.ps1',
     'tests\Test-HostOwnedAclPolicy.ps1',
     'config\ubuntu-toolchain.lock',
+    'config\payload-manifest.sha256',
+    'tests\test-python-toolchain.sh',
+    'tests\test-install-payload.sh',
     'legacy\WSL2-FALLBACK.md'
 )
 foreach ($relativePath in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $relativePath))) {
         $failures.Add("Required Hyper-V architecture file missing: $relativePath")
+    }
+}
+
+$payloadManifestPath = Join-Path $RepoRoot 'config\payload-manifest.sha256'
+$payloadRoot = Join-Path $RepoRoot 'payload'
+$manifestEntries = [Collections.Generic.List[object]]::new()
+if (Test-Path -LiteralPath $payloadManifestPath) {
+    $manifestLineNumber = 0
+    foreach ($line in Get-Content -LiteralPath $payloadManifestPath) {
+        $manifestLineNumber++
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#', [StringComparison]::Ordinal)) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})  ([A-Za-z0-9._/-]+)$') {
+            $failures.Add("Payload manifest syntax: line $manifestLineNumber")
+            continue
+        }
+        $relativePayloadHash = $matches[1]
+        $relativePayloadPath = $matches[2]
+        if ($relativePayloadPath -notmatch '^(agents-skills|claude-skills)/' -or $relativePayloadPath.Contains('..')) {
+            $failures.Add("Payload manifest path is outside the installable roots: $relativePayloadPath")
+            continue
+        }
+        if ($manifestEntries.Path -contains $relativePayloadPath) {
+            $failures.Add("Duplicate payload manifest path: $relativePayloadPath")
+            continue
+        }
+        $manifestEntries.Add([pscustomobject]@{ Hash = $relativePayloadHash; Path = $relativePayloadPath })
+    }
+    $manifestPaths = @($manifestEntries | ForEach-Object Path)
+    for ($index = 1; $index -lt $manifestPaths.Count; $index++) {
+        if ([string]::CompareOrdinal($manifestPaths[$index - 1], $manifestPaths[$index]) -ge 0) {
+            $failures.Add('Payload manifest paths are not strictly sorted.')
+            break
+        }
+    }
+    $filesystemPaths = @(
+        foreach ($payloadSubtree in @('agents-skills', 'claude-skills')) {
+            $payloadSubtreePath = Join-Path $payloadRoot $payloadSubtree
+            if (-not (Test-Path -LiteralPath $payloadSubtreePath -PathType Container)) {
+                $failures.Add("Installable payload root missing: $payloadSubtree")
+                continue
+            }
+            Get-ChildItem -LiteralPath $payloadSubtreePath -File -Recurse | ForEach-Object {
+                $_.FullName.Substring($payloadRoot.Length + 1).Replace('\', '/')
+            }
+        }
+    ) | Sort-Object
+    $manifestComparison = Compare-Object -ReferenceObject $manifestPaths -DifferenceObject $filesystemPaths
+    if ($manifestComparison) {
+        $failures.Add('Payload manifest paths do not exactly match the installable payload filesystem.')
+    }
+    foreach ($manifestEntry in $manifestEntries) {
+        $manifestFilePath = Join-Path $payloadRoot ($manifestEntry.Path.Replace('/', [IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $manifestFilePath -PathType Leaf)) {
+            $failures.Add("Payload manifest file missing: $($manifestEntry.Path)")
+            continue
+        }
+        $actualPayloadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestFilePath).Hash.ToLowerInvariant()
+        if ($actualPayloadHash -cne $manifestEntry.Hash) {
+            $failures.Add("Payload manifest hash mismatch: $($manifestEntry.Path)")
+        }
     }
 }
 
@@ -143,17 +268,23 @@ $contentAssertions = @(
     @{ Path = 'scripts\windows\HerdrHostOwnedAclPolicy.ps1'; Required = @('Snapshot descendants before protecting the root', "'/inheritance:r'", "'/grant:r'", "'/remove'", 'S-1-5-18', 'S-1-5-32-544', '$OperatorSid.Value', 'Unexpected ACL entry'); Forbidden = @('AccessControlType]::Deny', 'S-1-5-11', "'/T'", "'/C'") },
     @{ Path = 'scripts\windows\New-HerdrExchangeShare.ps1'; Required = @('C:\HerdrTools', 'C:\HerdrReviewJobs', 'Resolve-HerdrExchangePath', '$AllowExistingSharePath', '.herdr-exchange-root', 'Protect-HostOwnedTree -TargetPath $toolsPathResolved', 'S-1-5-32-545', 'Add-LocalGroupMember', 'Get-NetConnectionProfile', 'Preflight found', 'AcceptedFirewallRule', 'LocalAddress', 'SetAccessRuleProtection($true, $false)', 'Get-NetFirewallPortFilter', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'may belong only to the built-in Users group', 'Revoke-SmbShareAccess', 'Remove-NetFirewallRule', '-EncryptData $true', '-RotatePassword'); Forbidden = @('$Path\scripts', '-PasswordNeverExpires:$false', '$toolsPathResolved /remove:g', '$toolsPathResolved /inheritance:r') },
     @{ Path = 'scripts\windows\HerdrExchangePathPolicy.ps1'; Required = @('device namespace', 'local fixed drive', 'DriveType', 'protected system path', 'reparse point', 'ExistingManagedShare', 'AllowExistingUnmanagedPath'); Forbidden = @() },
+    @{ Path = 'scripts\windows\HerdrReviewStaging.ps1'; Required = @('Offline', 'RecallOnOpen', 'RecallOnDataAccess', 'FileShare]::None', 'SHA256', 'herdr-review-staging-v1', 'stability_interval_milliseconds', 'source_preserved', 'FileFlagOpenReparsePoint', 'GetFinalPathNameByHandleW', 'NumberOfLinks', 'TrustedDestinationRoot', 'ExpectedRoot', 'herdr-windows-review-runtime-v1', 'HERDR_WINDOWS_REVIEW_CONFIG', 'one_drive_exchange_root', 'review_jobs_root'); Forbidden = @('Invoke-Expression', 'Start-Process', 'USERPROFILE') },
+    @{ Path = 'scripts\windows\Stage-HerdrReviewWorkbook.ps1'; Required = @('RuntimeConfigurationPath', 'StabilityIntervalMilliseconds', 'Invoke-HerdrReviewStaging', 'HERDR_STAGING_FAILED'); Forbidden = @('Invoke-Expression', 'Start-Process', 'C:\HerdrExchange', 'C:\HerdrReviewJobs') },
+    @{ Path = 'scripts\windows\HerdrExcelJobRunner.ps1'; Required = @('herdr-excel-job-v1', "-cne 'recalculate'", 'AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'SaveCopyAs', 'HerdrBridge', 'Assert-HerdrBridgeCannotWrite', 'OneDriveOutboxRoot', 'OneDriveArchiveRoot', 'HERDR_DESIGNATED_INTERACTIVE_USER_SID', 'HERDR_BRIDGE_ACCOUNT_SID', 'HERDR_WINDOWS_REVIEW_CONFIG', 'Get-HerdrRuntimeConfiguration', 'Assert-HerdrOneDriveReady', 'Get-HerdrProcessIdentityProof', 'Assert-HerdrExcelProcessIdentity', 'TrustedDestinationRoot', 'canonical_workbook_mutated', 'trusted_locations'); Forbidden = @('Invoke-Expression', 'Start-Process', 'RefreshAll', 'RunAutoMacros', 'TrustedLocation', 'C:\HerdrExchange', 'C:\HerdrReviewJobs', 'USERPROFILE') },
+    @{ Path = 'scripts\windows\Invoke-HerdrExcelJob.ps1'; Required = @('RuntimeConfigurationPath', 'Invoke-HerdrExcelJob', 'HERDR_EXCEL_JOB_FAILED'); Forbidden = @('Invoke-Expression', 'Start-Process', 'BridgeAccount', 'C:\HerdrExchange', 'C:\HerdrReviewJobs') },
+    @{ Path = 'tests\Test-HerdrWindowsSecurityIntegration.ps1'; Required = @('SKIP:', 'RunspaceFactory', 'PowerShell]::Create()', 'control-after-race', 'HardLink', 'Junction', 'HERDR_RUN_EXCEL_CANARY', 'Auto_Open', 'RefreshOnFileOpen', 'identity substitution', 'last-mile tamper', 'nested-group write grant', 'directory identity swap', 'destination directory boundary', 'atomic output boundary'); Forbidden = @('C:\HerdrExchange\scripts', 'Invoke-Expression', 'Start-Process') },
     @{ Path = 'scripts\windows\Test-HerdrExchangeBoundary.ps1'; Required = @('-Credential $credential', '-WorkingDirectory "$env:SystemRoot\Temp"', 'C:\HerdrReviewJobs', 'AcceptedFirewallRule', 'LocalAddress', 'exit 41', 'exit 43', 'exit 44', 'exit 45', 'exit 46', 'Get-NetFirewallApplicationFilter', 'Get-NetFirewallServiceFilter', 'UnauthorizedAccessException', 'Boundary test passed'); Forbidden = @() },
     @{ Path = 'scripts\windows\Install-ExcelAutomation.ps1'; Required = @('C:\HerdrTools\excel-automation'); Forbidden = @('C:\HerdrExchange') },
     @{ Path = 'scripts\windows\Test-ExcelCom.py'; Required = @('C:\HerdrTools\excel-automation\smoke'); Forbidden = @('C:\HerdrExchange') },
-    @{ Path = 'MANUAL-START.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`'); Forbidden = @('disposable workbook in `C:\HerdrExchange`') },
-    @{ Path = 'HERDR_WORKSTATION_DEPENDENCY_SETUP_PLAN.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'do not create `C:\HerdrExchange` before the guarded share step'); Forbidden = @() },
+    @{ Path = 'MANUAL-START.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'HERDR_WINDOWS_REVIEW_CONFIG'); Forbidden = @('disposable workbook in `C:\HerdrExchange`', 'C:\HerdrReviewJobs') },
+    @{ Path = 'HERDR_WORKSTATION_DEPENDENCY_SETUP_PLAN.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'HERDR_WINDOWS_REVIEW_CONFIG', 'SSH to `herdr-win`'); Forbidden = @('do not create `C:\HerdrExchange` before the guarded share step', 'C:\HerdrReviewJobs') },
     @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
-    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', 'command -v "$executable"', 'cargo_install_root', '--prefix "$node_dir"', '$node_dir/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
+    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'UV_VERSION', 'PYTHON_VERSION', 'validate_toolchain_lock', 'install_python_toolchain', 'write_py_compat', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', 'command -v "$executable"', 'cargo_install_root', '--prefix "$node_anchor"', '$node_anchor/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt', 'py_3.13_probe'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
     @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry', 'Mount point must be an absolute path', 'protected system path', 'direct /srv/herdr-* child', 'Refusing to change it', '$mount_point_exists', 'Windows host contains unsupported characters', 'SMB share name contains unsupported characters'); Forbidden = @() },
     @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'ForwardAgent no', 'ForwardX11 no', 'ForwardX11Trusted no', 'ControlMaster no', 'ControlPath none', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
     @{ Path = 'scripts\ubuntu\verify-vps-access.sh'; Required = @('OpenSSH could not resolve alias', 'VPS access was not attempted', '$1=""', 'effective IdentityFile'); Forbidden = @('ssh -G "$alias_name" 2>/dev/null') },
-    @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE') }
+    @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'validate_toolchain_lock', 'python3.13', 'py --list', 'toolchain-manifest.txt', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE') },
+    @{ Path = 'scripts\ubuntu\install-payload.sh'; Required = @('config/payload-manifest.sha256', 'ensure_source_clean', 'validate_payload_manifest', 'verify_installed_payload', 'payload-runtime-receipt.txt', 'previous destinations were restored', 'regression_test_count'); Forbidden = @('cp -a "$payload"') }
 )
 foreach ($assertion in $contentAssertions) {
     $assertionPath = Join-Path $RepoRoot $assertion.Path

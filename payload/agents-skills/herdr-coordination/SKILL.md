@@ -7,13 +7,13 @@ description: "Coordinate live Claude and Codex sessions through Herdr using stab
 
 ## Tracked source and installation
 
-Treat `C:\dev\Codex\Herder\herdr-coordination` as the editable source of
+Treat `the tracked coordination-skill repository checkout` as the editable source of
 truth. Do not make durable edits directly in the installed
-`%USERPROFILE%\.agents\skills\herdr-coordination` checkout. Commit and push
+`$HOME/.agents/skills/herdr-coordination` checkout. Commit and push
 source changes to its configured origin, then run:
 
 ```powershell
-rtk pwsh -NoProfile -File scripts\sync_installed_skill.ps1 -Action install
+rtk pwsh -NoProfile -File scripts/sync_installed_skill.ps1 -Action install
 ```
 
 Use `-Action check` to prove that the installed skill is clean and at the exact
@@ -26,6 +26,8 @@ Coordinate existing agents without hard-coding workspace, tab, pane, terminal, o
 ## Guardrails
 
 1. Verify `HERDR_ENV=1` before any Herdr control command using the agent's native host-shell tool. Never make this decision inside context-mode, an MCP server, a sandboxed executor, or a detached helper because those subprocesses may strip pane-scoped `HERDR_*` variables. If such a subprocess reports them missing, recheck directly; stop only when the direct host-shell check fails.
+
+   For registration and any pane/agent operation that requires live pane metadata, make an explicit host-access preflight by running `herdr pane get <live-pane-id>` from that native host shell; `HERDR_ENV=1` alone is not proof that pane access is available. If the preflight returns `PermissionDenied` or `Operation not permitted`, classify the attempt as `host_access_unavailable`, do not issue or retry registration from the same sandbox, and obtain host-level execution before retrying the preflight. Run the authorized initialization command only after the preflight succeeds. If a legacy attempt already failed before that preflight, allow at most one host-level retry, then stop and report that no session identity was returned.
 2. Run `herdr --help` and the relevant command group when command syntax has not been established in the current turn.
 3. Discover live IDs from Herdr JSON. Never persist or predict an ID. The reviewed 0.8.0 preview still lets `--current` fall back to UI focus when `HERDR_PANE_ID` is absent, so require the native workspace/tab/pane IDs and use the explicit pane ID; never use `--current` as identity recovery.
 4. Read a target pane before waiting for new output or recovering input.
@@ -41,12 +43,12 @@ Compatibility reviewed for Herdr `0.8.0-preview.2026-08-04-d78e3d3b5126` on 2026
 Treat every Herdr update as invalidating the previous skill-compatibility review. Before new cross-tab automation:
 
 1. Compare `herdr --version`, `herdr --skill`, `herdr --help`, `herdr agent`, and `herdr pane` with every command used by this skill and its scripts.
-2. Refresh both `.agents\skills\herdr\SKILL.md` and `.claude\skills\herdr\SKILL.md` from the bundled control-skill baseline while preserving this skill's tracked-relay overlay.
+2. Refresh both `.agents/skills/herdr/SKILL.md` and `.claude/skills/herdr/SKILL.md` from the bundled control-skill baseline while preserving this skill's tracked-relay overlay.
 3. Search live skills and scripts for removed command forms. Do not replace current `agent prompt --wait`, `agent wait`, or `pane wait-output` primitives with ad hoc status polling.
-4. Run `scripts\test_herdr_skill_compatibility.ps1`,
-   `scripts\test_herdr_coordination.ps1`,
-   `scripts\test_codex_session_refresh.ps1`,
-   `scripts\test_claude_session_refresh.ps1`, and skill frontmatter validation.
+4. Run `scripts/test_herdr_skill_compatibility.ps1`,
+   `scripts/test_herdr_coordination.ps1`,
+   `scripts/test_codex_session_refresh.ps1`,
+   `scripts/test_claude_session_refresh.ps1`, and skill frontmatter validation.
 5. Update the reviewed-version markers only after all checks pass, then notify existing sessions of exact migrations because their context may still contain stale syntax.
 
 This is a standing order for every Herdr update, including preview builds and patch releases.
@@ -56,7 +58,7 @@ The reviewed `0.8.0-preview.2026-08-04-d78e3d3b5126` binary makes `agent wait` a
 ## Shared state
 
 - Coordinator tab label: `Coordination`
-- Default log: `C:\tmp\herdr-coordination.md`
+- Default log: `/tmp/herdr-coordination.md`
 - Override the log with `HERDR_COORDINATION_LOG` when needed.
 - Treat the log as append-only. Never rewrite or delete another agent's entry.
 - Format entries as `FROM <pane-id|external> TO <pane-id|ALL>: <message>`; the helper adds the timestamp.
@@ -68,26 +70,26 @@ The log is durable coordination evidence, not an automatic message bus. Agents m
 Resolve the installed skill once per shell:
 
 ```powershell
-$coordSkill = Join-Path $env:USERPROFILE ".agents\skills\herdr-coordination"
+$coordSkill = Join-Path $HOME ".agents/skills/herdr-coordination"
 ```
 
 Discover the coordinator dynamically:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" -Action discover
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" -Action discover
 ```
 
 Append a normal handoff or status message:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action append -To ALL -Message "Validation passed; evidence is at audit/findings/example.md."
 ```
 
 Append and urgently deliver a message to the coordinator:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action send -To coordinator -Message "Blocked on workbook ownership; no files changed."
 ```
 
@@ -102,7 +104,7 @@ To append and deliver directly to a specific live pane, use that explicit pane
 ID as `-To`:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action send -To <discovered-pane-id> `
   -ExpectedTabLabel "<exact-live-stable-label>" `
   -ExpectedAgent <codex|claude> -ExpectedSession <native-session-id> `
@@ -129,7 +131,7 @@ and strand the message awaiting manual Enter.
 Inspect whether a relay body was actually acknowledged:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action relay-status -RelayRef "[HR:...]"
 ```
 
@@ -158,7 +160,7 @@ while making the relay readable from the sidebar.
 Deliver a verified message to a specific live pane without adding another log entry:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action deliver -PaneId <discovered-pane-id> `
   -ExpectedTabLabel "<exact-live-stable-label>" `
   -ExpectedAgent <codex|claude> -ExpectedSession <native-session-id> `
@@ -169,7 +171,7 @@ rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
 
 Before submitting to any agent, the helper starts a hidden proof-bound watcher whenever it can establish either the preferred native-session proof or the stable agent-process lease described below. This includes `idle` and `done` targets: Herdr can return a successful `agent_prompted` receipt while the exact text remains unsubmitted in the composer, so a successful receipt is not final proof and must retain watcher ownership. For an agent that is not already working, the helper also waits up to seven seconds for an observed lifecycle change. The preferred recovery proof is the unchanged explicit target identity plus the exact `[HC:...]` token as active input—not merely visible elsewhere in detection. A narrow exception handles an agent UI that suppresses or misclassifies its composer: after the explicit `agent prompt` call itself returns `agent_prompt_stalled`, the helper may send one receipt-bound `Enter` if the same pane, agent, native session or complete process lease remains proven and the agent is still `idle` or `done`. This applies when the fresh token is absent, or when it appears only in history while `state_change_seq` is unchanged and the current prompt is empty or an exact built-in Codex placeholder. If different user-authored text occupies the current prompt, lifecycle sequence changed, or the pre-send agent is blocked, recovery fails closed and sends no key. A recovery must then observe a matching lifecycle/sequence or queue-history proof. The helper never uses UI focus, reconstructs a caller/session, substitutes another pane, or sends more than one recovery key.
 
-For an already-working agent, the helper uses Herdr's queued-prompt path; the sender does not wait for the unrelated active turn. For an available agent, the same watcher closes the false-positive receipt gap. The helper reads Herdr through `rtk proxy`, requests `--format text`, and pins native-command output to UTF-8 so hidden processes receive the same Unicode prompt markers as visible shells. From launch, the watcher repeatedly verifies the same identity and classifies the tracked token using the last prompt-marker line. It polls every 250 ms for the first ten seconds and then every second through the remaining watcher lifetime. If the exact token is active, it sends `Enter` and requires the token to move from active input into history/the queued-message region or requires a matching lifecycle/sequence transition. If the token remains active after the first key, it may send one second bounded `Enter` only after an immediate identity/session/token re-read; idle/done must remain unchanged, or a working transition must retain the same `state_change_seq`. It records delivery without sending a key only when the exact token is already in transcript history and a post-availability lifecycle transition or sequence advance proves that the turn ran. Token history, token disappearance, elapsed time, a successful prompt receipt, and current `working` status alone are never success. If verified submission proof is still absent after 60 seconds, the watcher emits one local `Cross-talk delivery stalled` notification while continuing to seek proof; notification failure never changes the transport result. If identity changes or proof remains ambiguous, it fails without another key. Watchers time out after 15 minutes and append their result to `C:\tmp\herdr-coordination-watch.md`.
+For an already-working agent, the helper uses Herdr's queued-prompt path; the sender does not wait for the unrelated active turn. For an available agent, the same watcher closes the false-positive receipt gap. The helper reads Herdr through `rtk proxy`, requests `--format text`, and pins native-command output to UTF-8 so hidden processes receive the same Unicode prompt markers as visible shells. From launch, the watcher repeatedly verifies the same identity and classifies the tracked token using the last prompt-marker line. It polls every 250 ms for the first ten seconds and then every second through the remaining watcher lifetime. If the exact token is active, it sends `Enter` and requires the token to move from active input into history/the queued-message region or requires a matching lifecycle/sequence transition. If the token remains active after the first key, it may send one second bounded `Enter` only after an immediate identity/session/token re-read; idle/done must remain unchanged, or a working transition must retain the same `state_change_seq`. It records delivery without sending a key only when the exact token is already in transcript history and a post-availability lifecycle transition or sequence advance proves that the turn ran. Token history, token disappearance, elapsed time, a successful prompt receipt, and current `working` status alone are never success. If verified submission proof is still absent after 60 seconds, the watcher emits one local `Cross-talk delivery stalled` notification while continuing to seek proof; notification failure never changes the transport result. If identity changes or proof remains ambiguous, it fails without another key. Watchers time out after 15 minutes and append their result to `/tmp/herdr-coordination-watch.md`.
 
 An empty detection snapshot is a transient observation, not an error and not
 proof that the prompt was accepted. The watcher must keep polling the same
@@ -195,7 +197,7 @@ Use the workflow wrapper for reviews, merge gates, release gates, and other work
 Before dispatch, preflight the explicit target:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action preflight -PaneId <discovered-pane-id> `
   -ExpectedTabLabel "<exact-live-stable-reviewer-label>"
 ```
@@ -205,29 +207,29 @@ Preflight requires the same explicit pane, a detected agent, matching native-ses
 Create a tracked request with stable task, candidate, and review-type identifiers:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action request -TaskId "#567" -CandidateId "<commit-or-artifact-id>" `
   -ReviewType "independent-review" -PaneId <discovered-pane-id> `
   -ExpectedTabLabel "<exact-live-stable-reviewer-label>" `
   -Message "Review the exact candidate and return PASS or BLOCK." `
-  -ArtifactPath "C:\tmp\review-567.md"
+  -ArtifactPath "/tmp/review-567.md"
 ```
 
-The normalized task/candidate/type tuple is the idempotency key. Repeating the same request returns the existing `[WF:...]` workflow and does not redeliver it. `request` requires `-ExpectedTabLabel`; preflight compares it exactly with the target's live tab label before reserving or logging work, and the delivery helper revalidates the same label together with agent/session proof. The wrapper appends the full `[HR:...] [WF:...]` request to the coordination log, sends a compact prompt, and records the source and target pane, stable labels, agent kinds, native sessions, `[HC:...]` transport token, work-ACK deadline, and completion timeout in `C:\tmp\herdr-workflow-ledger.jsonl`.
+The normalized task/candidate/type tuple is the idempotency key. Repeating the same request returns the existing `[WF:...]` workflow and does not redeliver it. `request` requires `-ExpectedTabLabel`; preflight compares it exactly with the target's live tab label before reserving or logging work, and the delivery helper revalidates the same label together with agent/session proof. The wrapper appends the full `[HR:...] [WF:...]` request to the coordination log, sends a compact prompt, and records the source and target pane, stable labels, agent kinds, native sessions, `[HC:...]` transport token, work-ACK deadline, and completion timeout in `/tmp/herdr-workflow-ledger.jsonl`.
 
 The receiving agent must ACK immediately from the same pane and native session:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action ack -WorkflowRef "[WF:...]" -Message "Accepted; review started."
 ```
 
 On completion, the same proven session records the outcome and durable artifact:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action complete -WorkflowRef "[WF:...]" -Outcome PASS `
-  -ArtifactPath "C:\tmp\review-567.md" `
+  -ArtifactPath "/tmp/review-567.md" `
   -Message "Self-contained verdict summary and remaining limitations."
 ```
 
@@ -246,7 +248,7 @@ After reading the exact durable completion relay, the originating requester
 must record consumption from the same pane and native session:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action ack-return -WorkflowRef "[WF:...]"
 ```
 
@@ -328,6 +330,24 @@ the same path changed. A crash that leaves only a current-format
 `request_reserved` event resumes the same workflow and relay identity rather
 than remaining permanently stranded.
 
+### Report the native execution profile
+
+Before a newly launched or restored worker accepts a tracked review, report its
+selected execution profile from the worker's native dispatch configuration:
+
+```powershell
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
+  -Action report-profile -Provider openai -Model gpt-5.6-luna `
+  -ReasoningEffort max -ServiceTier priority
+```
+
+Use the exact provider, model, reasoning effort, and service tier selected for
+that worker; the example reflects the default Luna Max/priority route. The
+action proves the caller's live pane and native session, stores a
+session-bound Herdr metadata report, and fails closed if Herdr cannot expose
+the exact values. Workflow preflight reads this native report (or equivalent
+native agent fields) and never infers execution profile from UI text.
+
 If a reviewer produced a durable verdict but `complete` was refused during a temporary native-session proof gap, never fabricate completion or close the ledger from pane identity alone. Prefer having the original target retry `complete` after its exact native session is restored. When that is impractical, only the dynamically discovered `Coordination` pane may run `-Action reconcile-completion`, and only while all of these proofs agree:
 
 - the request and work ACK name the same target pane, agent, and native session;
@@ -337,11 +357,11 @@ If a reviewer produced a durable verdict but `complete` was refused during a tem
 - no existing completion conflicts.
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_workflow.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_workflow.ps1" `
   -Action reconcile-completion -WorkflowRef "[WF:...]" `
   -PaneId <original-target-pane> -ExpectedTargetSession "<original-native-session>" `
   -CandidateId "<exact-candidate-tuple>" -Outcome PASS `
-  -ArtifactPath "C:\tmp\review-567.md" -ArtifactSha256 "<64-hex-sha256>" `
+  -ArtifactPath "/tmp/review-567.md" -ArtifactSha256 "<64-hex-sha256>" `
   -EvidenceRelayRef "[HR:...]"
 ```
 
@@ -473,6 +493,13 @@ A pane must send one tracked `PANE NAMING REQUEST` to Coordination:
 3. immediately when repository, lane, role, or slot changes;
 4. before retirement when its task is complete and the pane should close.
 
+Retirement is a terminal lifecycle, not an ordinary subtitle update. Use
+`-NamingLifecycle retirement`, keep the pane open after sending the request,
+and close it only after `naming-status` reports either `applied` or
+`retirement_target_gone` for that exact relay. A read-ACK is not completion.
+If Coordination is unavailable, keep the pane open or ask the user; never send
+the request and immediately exit.
+
 Ordinary progress, phase changes, PASS/BLOCK results, and status changes do not
 rename the pane. If only the ticket changes, keep the canonical name and update
 only the subtitle. Send the naming request before further cross-pane routing so
@@ -489,7 +516,7 @@ Use the dedicated helper so the request format is validated and the relay is
 created atomically:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action name-request -RepoCode AGT -LaneCode T -RoleCode R `
   -WorkKind issue -IssueNumber 828 `
   -WorkTitle "UserForm diagnostic coordinate mapping" `
@@ -505,13 +532,25 @@ not completion. Naming is asynchronous: while APPLIED is pending, the pane
 continues work and routes only by the stable explicit pane ID (never by the
 stale human label). A delayed rename must never block useful work.
 
+For retirement, make the lifecycle explicit and retain the previous identity:
+
+```powershell
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
+  -Action name-request -NamingLifecycle retirement `
+  -RepoCode AGT -LaneCode T -RoleCode R -WorkKind issue -IssueNumber 828 `
+  -WorkTitle "retired" -PreviousName AGT-T-R1 -PreviousWork "#828 · completed"
+```
+
+New requests carry the requester's exact pane, tab, agent, and native session.
+Coordination refuses to mutate a live pane when that tuple no longer matches.
+
 ### How Coordination completes a naming request
 
 Reading a naming request is not completing it. Coordination must consume every
 accepted `PANE NAMING REQUEST` relay and leave proof on the log:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action consume-name-requests
 ```
 
@@ -528,8 +567,12 @@ same `[HN:...]` `APPLIED` proof is appended. Use it to complete one specific
 request; use `consume-name-requests` to drain the backlog.
 
 Consumption is idempotent. A request that already carries a valid `APPLIED`
-proof is never re-applied, never mutates the pane again, and never gains a
-second proof, so re-running either action is always safe.
+proof is never re-applied. An explicit retirement request whose target is
+confirmed absent twice receives a coordinator-authored
+`retirement_target_gone` disposition rather than a false `APPLIED` proof.
+Both terminal results are skipped on later sweeps. An unfinished
+`APPLY-STARTED` intent reports `uncertain_apply` and fails closed for
+reconciliation.
 
 Naming is coordinator-owned and fails closed. A caller that is not the
 discovered Coordination pane, a request routed to a different Coordination pane,
@@ -543,12 +586,13 @@ A naming request that was read-ACKed but never applied used to fail silently.
 Check for that directly:
 
 ```powershell
-rtk pwsh -NoProfile -File "$coordSkill\scripts\herdr_coordination.ps1" `
+rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action naming-status -NamingDeadlineSeconds 300
 ```
 
 `naming-status` is a read-only bounded watchdog. It reports each request as
-`awaiting_read_ack`, `read_acked_unapplied`, `overdue_unapplied`, or `applied`,
+`awaiting_read_ack`, `read_acked_unapplied`, `overdue_unapplied`, `applied`,
+`retirement_target_gone`, `uncertain_apply`, or `reconciliation_required`,
 and raises `overdue` when a read-ACKed request has no matching `APPLIED` proof
 past the deadline. It never contacts Herdr and never mutates anything, so any
 pane may run it and a stalled coordinator cannot suppress its own alarm. Scope
@@ -572,5 +616,6 @@ At every handoff and end-of-turn check:
 1. verify the canonical name still matches repository, lane, role, and slot;
 2. verify the subtitle still matches the active issue, PR, or feature;
 3. request a naming update if either changed;
-4. close completed panes after the retirement handoff unless the user explicitly
-   keeps the pane for another assignment.
+4. close completed panes only after the exact retirement naming request reaches
+   `applied` or `retirement_target_gone`, unless the user explicitly keeps
+   the pane for another assignment.

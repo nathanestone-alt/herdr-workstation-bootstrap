@@ -19,9 +19,9 @@ Once an agent is running in this repository, give it this exact instruction:
 
 - `bootstrap.ps1` — Windows status, base packages, Hyper-V enablement, VM creation, and Excel environment.
 - `scripts/windows/New-HerdrUbuntuVM.ps1` — convergent Generation 2 VM provisioning with invariant checks, partial-create cleanup, bounded resources, and host-level autostart.
-- `scripts/windows/New-HerdrExchangeShare.ps1` — convergent Windows SMB exchange with a fixed non-admin identity, fail-closed share-path adoption, allowlisted writable directories, encrypted SMB, and a Tailscale-only firewall rule.
+- `scripts/windows/New-HerdrExchangeShare.ps1` — legacy, separately commissioned Windows SMB exchange with a fixed non-admin identity, fail-closed share-path adoption, allowlisted writable directories, encrypted SMB, and a Tailscale-only firewall rule; it is outside the issue #961 SSH-to-OneDrive route.
 - `scripts/ubuntu/bootstrap.sh` — Ubuntu packages plus the checksum-verified, version-locked toolchain in `config/ubuntu-toolchain.lock`.
-- `scripts/ubuntu/configure-excel-share.sh` — credential-protected SMB mount at `/srv/herdr-exchange`.
+- `scripts/ubuntu/configure-excel-share.sh` — legacy credential-protected SMB mount at `/srv/herdr-exchange`; issue #961 does not install or run it.
 - `scripts/ubuntu/verify.sh` — non-destructive Ubuntu verification.
 - `scripts/windows/Test-ExcelCom.py` — disposable native Excel COM smoke test.
 - `scripts/windows/Test-HerdrExchangeBoundary.ps1` — live negative test proving the SMB bridge cannot modify the exchange root or host-owned automation code and that no competing firewall rule exposes SMB.
