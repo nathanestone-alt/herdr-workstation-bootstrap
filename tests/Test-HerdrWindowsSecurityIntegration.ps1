@@ -203,7 +203,8 @@ function New-IntegrationFixture {
     $source = Join-Path $Inbox "fixture-$Number.xlsx"
     [IO.File]::WriteAllBytes($source, [Text.Encoding]::UTF8.GetBytes("fixture-$Number"))
     $staged = Invoke-HerdrReviewStaging -SourcePath $source -JobId "windows-$Number" `
-        -OneDriveInboxRoot $Inbox -OneDriveOutboxRoot $OneDriveOutbox -OneDriveArchiveRoot $OneDriveArchive `
+        -OneDriveExchangeRoot (Split-Path -Parent $Inbox) -OneDriveInboxRoot $Inbox `
+        -OneDriveOutboxRoot $OneDriveOutbox -OneDriveArchiveRoot $OneDriveArchive `
         -ExchangeRoot $Exchange -Repository 'STModel-Private' -Branch 'security-test' -Commit 'fixture' `
         -StabilityIntervalMilliseconds 0
     $jobPath = Join-Path (Split-Path -Parent $staged.ManifestPath) 'job.json'
@@ -324,28 +325,28 @@ try {
     } 'outside the trusted physical root' 'atomic output boundary'
 
     $identityConfiguration = [pscustomobject]@{
-        InteractiveUserSid = 'S-1-5-21-961-user'
+        InteractiveUserSid = 'S-1-5-21-961-1001'
         InteractiveSessionId = 7
-        BridgeAccountSid = 'S-1-5-21-961-bridge'
+        BridgeAccountSid = 'S-1-5-21-961-1002'
     }
     Assert-Throws {
         Assert-HerdrInteractiveIdentity -Configuration $identityConfiguration -TestMode -IdentityProbe {
-            [pscustomobject]@{ CurrentUserSid = 'S-1-5-21-961-user'; CurrentSessionId = 8; ExplorerUserSid = 'S-1-5-21-961-user'; ExplorerSessionId = 8 }
+            [pscustomobject]@{ CurrentUserSid = 'S-1-5-21-961-1001'; CurrentSessionId = 8; ExplorerUserSid = 'S-1-5-21-961-1001'; ExplorerSessionId = 8 }
         }
     } 'session proof mismatch' 'wrong interactive session'
 
     $aclRoot = Join-Path $root 'acl'
     New-Item -ItemType Directory -Path $aclRoot -Force | Out-Null
     $nestedWrite = [pscustomobject]@{
-        IdentityReference = 'S-1-5-21-961-nested-group'
+        IdentityReference = 'S-1-5-21-961-1003'
         AccessControlType = [Security.AccessControl.AccessControlType]::Allow
         FileSystemRights = [Security.AccessControl.FileSystemRights]::Modify
     }
     $acl = [pscustomobject]@{ AreAccessRulesProtected = $true; Access = @($nestedWrite) }
     $aclReader = { param([string]$Path) $acl }.GetNewClosure()
-    $nestedGroupReader = { param([string]$Account) @('S-1-5-21-961-nested-group') }
-    $identityGroupReader = { param([string]$Account) @('S-1-5-21-961-bridge') }
-    $substituteIdentityProbe = { 'S-1-5-21-961-substitute' }
+    $nestedGroupReader = { param([string]$Account) @('S-1-5-21-961-1003') }
+    $identityGroupReader = { param([string]$Account) @('S-1-5-21-961-1002') }
+    $substituteIdentityProbe = { 'S-1-5-21-961-1004' }
     Assert-Throws {
         Assert-HerdrBridgeCannotWrite -Paths @($aclRoot) -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid `
             -AclReader $aclReader `

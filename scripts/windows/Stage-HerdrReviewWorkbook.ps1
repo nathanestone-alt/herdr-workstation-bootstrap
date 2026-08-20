@@ -25,7 +25,8 @@ try {
     Assert-HerdrOneDriveReady -OneDriveExchangeRoot $runtimeConfiguration.OneDriveExchangeRoot `
         -OneDriveAccount $runtimeConfiguration.OneDriveAccount -IdentityConfiguration $identityConfiguration | Out-Null
     $result = Invoke-HerdrReviewStaging -SourcePath $SourcePath -JobId $JobId `
-        -OneDriveInboxRoot $runtimeConfiguration.OneDriveInboxRoot -OneDriveOutboxRoot $runtimeConfiguration.OneDriveOutboxRoot `
+        -OneDriveExchangeRoot $runtimeConfiguration.OneDriveExchangeRoot -OneDriveInboxRoot $runtimeConfiguration.OneDriveInboxRoot `
+        -OneDriveOutboxRoot $runtimeConfiguration.OneDriveOutboxRoot `
         -OneDriveArchiveRoot $runtimeConfiguration.OneDriveArchiveRoot -ExchangeRoot $runtimeConfiguration.ExchangeRoot `
         -Repository $Repository -Branch $Branch -Commit $Commit `
         -StabilityIntervalMilliseconds $StabilityIntervalMilliseconds

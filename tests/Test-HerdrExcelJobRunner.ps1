@@ -53,7 +53,8 @@ function New-TestJob {
     $jobId = 'job-{0:d3}' -f $script:counter
     $source = Join-Path $inbox ("workbook-{0}.xlsx" -f $script:counter)
     [IO.File]::WriteAllBytes($source, [Text.Encoding]::UTF8.GetBytes("fixture $secret $jobId`n"))
-    $staged = Invoke-HerdrReviewStaging -SourcePath $source -JobId $jobId -OneDriveInboxRoot $inbox `
+    $staged = Invoke-HerdrReviewStaging -SourcePath $source -JobId $jobId -OneDriveExchangeRoot $oneDriveExchange `
+        -OneDriveInboxRoot $inbox `
         -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
         -ExchangeRoot $exchange -Repository 'STModel-Private' -Branch 'main' -Commit 'abc123' -StabilityIntervalMilliseconds 0
     $jobPath = Join-Path (Split-Path -Parent $staged.ManifestPath) 'job.json'
