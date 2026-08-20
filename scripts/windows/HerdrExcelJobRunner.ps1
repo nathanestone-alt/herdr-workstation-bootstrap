@@ -757,7 +757,6 @@ function Invoke-HerdrExcelRecalculate {
             -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
         $workbook = $excel.Workbooks.Open($InputPath, 0, $false)
         Disable-HerdrExcelConnections -Workbook $workbook
-        $workbook.UpdateLinks = 0
         $workbook.Calculate()
         Assert-HerdrExcelProcessIdentity -Excel $excel -Configuration $IdentityConfiguration `
             -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
