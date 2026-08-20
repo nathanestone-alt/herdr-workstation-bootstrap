@@ -56,16 +56,22 @@ Assert-True (Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseT
         -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') -AllowedCloudFilesRoot $syntheticBoundary) `
     'Cloud Files file acceptance beneath its configured boundary failed.'
 foreach ($tagCase in @(
-    [pscustomobject]@{ Name = 'symbolic link'; Tag = ConvertTo-TestReparseTag 'A000000C' },
-    [pscustomobject]@{ Name = 'junction'; Tag = ConvertTo-TestReparseTag 'A0000003' },
-    [pscustomobject]@{ Name = 'mount point'; Tag = ConvertTo-TestReparseTag 'A0000003' },
-    [pscustomobject]@{ Name = 'unrecognized reparse tag'; Tag = ConvertTo-TestReparseTag '9000001B' }
+    [pscustomobject]@{ Name = 'symbolic link'; Tag = ConvertTo-TestReparseTag 'A000000C'; DirectoryExpected = 'Refusing symbolic-link reparse point with tag'; FileExpected = 'Refusing symbolic-link reparse point on a non-directory' },
+    [pscustomobject]@{ Name = 'junction'; Tag = ConvertTo-TestReparseTag 'A0000003'; DirectoryExpected = 'Refusing junction or mount-point reparse point with tag'; FileExpected = 'Refusing junction or mount-point reparse point on a non-directory' },
+    [pscustomobject]@{ Name = 'mount point'; Tag = ConvertTo-TestReparseTag 'A0000003'; DirectoryExpected = 'Refusing junction or mount-point reparse point with tag'; FileExpected = 'Refusing junction or mount-point reparse point on a non-directory' },
+    [pscustomobject]@{ Name = 'unrecognized reparse tag'; Tag = ConvertTo-TestReparseTag '9000001B'; DirectoryExpected = 'Refusing unrecognized reparse point with tag'; FileExpected = 'Refusing unrecognized reparse point on a non-directory' }
 )) {
     Assert-Throws {
         Assert-HerdrAllowedReparsePoint -ReparseTag $tagCase.Tag -IsDirectory:$true `
             -ComponentPath $syntheticComponent -CandidatePath $syntheticCandidate `
             -AllowedCloudFilesRoot $syntheticBoundary | Out-Null
-    } 'Refusing' "$($tagCase.Name) rejection"
+    } $tagCase.DirectoryExpected "$($tagCase.Name) rejection"
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag $tagCase.Tag -IsDirectory:$false `
+            -ComponentPath (Join-Path $syntheticCandidate 'workbook.xlsx') `
+            -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') `
+            -AllowedCloudFilesRoot $syntheticBoundary | Out-Null
+    } $tagCase.FileExpected "$($tagCase.Name) file rejection"
 }
 Assert-Throws {
     Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$false `
