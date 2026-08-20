@@ -37,9 +37,28 @@ $runtimeConfig = Join-Path $root 'runtime-config.json'
 $secret = 'TEST-SECRET-MUST-NOT-LEAK'
 $counter = 0
 $accessCalls = [Collections.Generic.List[string]]::new()
+$protectedReviewJobPaths = [Collections.Generic.List[string]]::new()
+$expectedReviewJobPath = [IO.Path]::GetFullPath((Join-Path $reviewJobs 'job-001'))
 $accessProbe = {
     param([object[]]$Paths)
     foreach ($path in $Paths) { [void]$accessCalls.Add([string]$path) }
+}.GetNewClosure()
+$protectionProbe = {
+    param([string]$Path, [string]$OperatorSid)
+    [void]$protectedReviewJobPaths.Add([IO.Path]::GetFullPath($Path))
+}.GetNewClosure()
+$successAccessProbe = {
+    param([object[]]$Paths)
+    foreach ($path in $Paths) {
+        $canonicalPath = [IO.Path]::GetFullPath([string]$path)
+        $hasProtection = @($protectedReviewJobPaths | Where-Object {
+            $_.Equals($expectedReviewJobPath, [StringComparison]::OrdinalIgnoreCase)
+        }).Count -gt 0
+        if ($canonicalPath.Equals($expectedReviewJobPath, [StringComparison]::OrdinalIgnoreCase) -and -not $hasProtection) {
+            throw 'Review-job bridge ACL assertion ran before host-owned protection.'
+        }
+        [void]$accessCalls.Add([string]$path)
+    }
 }.GetNewClosure()
 $interactiveProbe = { $true }
 $copyHerdrFileExclusive = Get-Command Copy-HerdrFileExclusive -CommandType Function -ErrorAction Stop
@@ -145,7 +164,7 @@ try {
     $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -RuntimeConfigurationPath $runtimeConfig `
         -TestMode `
         -InteractiveSessionProbe $interactiveProbe `
-        -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe
+        -HostOwnedAccessProbe $successAccessProbe -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
     Assert-True ($successResult.Status -ceq 'succeeded') 'The hermetic runner did not succeed.'
     Assert-True (Test-Path -LiteralPath $successResult.ResultPath -PathType Leaf) 'The runner result is missing.'
     Assert-True (Test-Path -LiteralPath $successResult.ManifestPath -PathType Leaf) 'The runner provenance manifest is missing.'
@@ -161,6 +180,9 @@ try {
     Assert-True (-not $jobLog.Contains($secret, [StringComparison]::Ordinal)) 'Job log leaked workbook content.'
     Assert-True ($oneDriveManifest -ceq $resultManifest) 'The OneDrive Outbox manifest differs from the bridge manifest.'
     Assert-True ((Get-HerdrFileSnapshot -Path $success.Source).Sha256 -ceq $successResult.ResultSha256) 'The canonical source was not preserved.'
+    Assert-True (@($protectedReviewJobPaths | Where-Object {
+        $_.Equals($expectedReviewJobPath, [StringComparison]::OrdinalIgnoreCase)
+    }).Count -eq 1) 'Review-job host-owned protection was not invoked.'
     Assert-True ($accessCalls.Count -ge 2) 'Host-owned ACL policy was not checked before execution.'
     $cliOutput = $successResult | ConvertTo-Json -Compress
     Assert-True (-not $cliOutput.Contains($secret, [StringComparison]::Ordinal)) 'Runner output leaked workbook content.'
@@ -236,12 +258,26 @@ try {
     $runnerText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1')
     Assert-True ($runnerText.Contains('FileStream]::new($opened.SafeHandle', [StringComparison]::Ordinal)) 'The production JSON reader is not handle-backed through FileStream.'
     Assert-True (-not $runnerText.Contains('StreamReader]::new($opened.SafeHandle', [StringComparison]::Ordinal)) 'The production JSON reader uses the unsupported SafeFileHandle StreamReader overload.'
-    foreach ($required in @('AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'SaveCopyAs', 'canonical_workbook_mutated')) {
+    foreach ($required in @('AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'Workbooks.Open($InputPath, 0, $false)', 'SaveCopyAs', 'canonical_workbook_mutated')) {
         Assert-True ($runnerText.Contains($required, [StringComparison]::Ordinal)) "Excel canary marker is missing: $required"
     }
-    foreach ($forbidden in @('RefreshAll', 'Invoke-Expression', 'Start-Process', 'TrustedLocation', 'RunAutoMacros')) {
+    Assert-True (-not $runnerText.Contains('$workbook.Calculate()', [StringComparison]::Ordinal)) `
+        'Workbook-level Calculate is invalid and must not return.'
+    $connectionIndex = $runnerText.IndexOf('Disable-HerdrExcelConnections -Workbook $workbook', [StringComparison]::Ordinal)
+    $calculateIndex = $runnerText.IndexOf('$excel.Calculate()', [StringComparison]::Ordinal)
+    $postCalculateIdentityIndex = if ($calculateIndex -ge 0) {
+        $runnerText.IndexOf('Assert-HerdrExcelProcessIdentity -Excel $excel', $calculateIndex, [StringComparison]::Ordinal)
+    }
+    else { -1 }
+    $saveCopyIndex = $runnerText.IndexOf('$workbook.SaveCopyAs($ResultPath)', [StringComparison]::Ordinal)
+    Assert-True ($connectionIndex -ge 0 -and $calculateIndex -gt $connectionIndex -and
+        $postCalculateIdentityIndex -gt $calculateIndex -and $saveCopyIndex -gt $postCalculateIdentityIndex) `
+        'Application-level Excel calculation call or ordering is missing.'
+    foreach ($forbidden in @('RefreshAll', 'Invoke-Expression', 'Start-Process', 'TrustedLocation', 'RunAutoMacros', '$workbook.UpdateLinks = 0')) {
         Assert-True (-not $runnerText.Contains($forbidden, [StringComparison]::Ordinal)) "Excel canary regression marker is present: $forbidden"
     }
+    Assert-True ($runnerText.Contains('HostOwnedTreeProtector', [StringComparison]::Ordinal)) 'The runner lacks the focused host-owned protection test seam.'
+    Assert-True ($runnerText.Contains('Protect-HostOwnedTree -TargetPath $reviewJobPath', [StringComparison]::Ordinal)) 'The runner does not apply the host-owned ACL policy to new review-job directories.'
     $outputTexts = @(Get-ChildItem -LiteralPath $exchange -File -Recurse -Filter '*.json' | ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
     foreach ($text in $outputTexts) {
         Assert-True (-not $text.Contains($secret, [StringComparison]::Ordinal)) 'Runner output or log leaked workbook content.'

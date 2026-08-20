@@ -55,11 +55,24 @@ try {
     $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
     Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
+    Assert-True (Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange) `
+        'Cloud Files file acceptance beneath the configured exchange boundary failed.'
     Assert-Throws {
         Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
-            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') | Out-Null
+    } 'configured OneDrive exchange boundary' 'Cloud Files file no-boundary rejection'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $root 'outside.xlsx') -CandidatePath (Join-Path $root 'outside.xlsx') `
             -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
-    } 'Cloud Files reparse point on a non-directory' 'Cloud Files file reparse description'
+    } 'outside the configured OneDrive exchange boundary' 'Cloud Files file boundary rejection'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000001B', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'unknown.xlsx') -CandidatePath (Join-Path $inbox 'unknown.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
+    } 'Refusing unrecognized reparse point on a non-directory' 'unrecognized file reparse rejection'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
 
     $result = Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' `
@@ -105,6 +118,40 @@ try {
     } 'unstable' 'stability gate'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-unstable'))) 'Unstable staging left a partial job directory.'
 
+    $fullyHydratedCloudFilesAttributes = [int64]0x420 # Archive | ReparsePoint
+    $fullyHydratedCloudFilesTag = [uint32]([Convert]::ToUInt32('9000E01A', 16))
+    $fullyHydratedCloudFilesBlocked = @(Get-HerdrBlockedAttributeNames -Attributes $fullyHydratedCloudFilesAttributes `
+        -ReparseTag $fullyHydratedCloudFilesTag -ComponentPath $source -CandidatePath $source `
+        -AllowedCloudFilesRoot $oneDriveExchange)
+    Assert-True (-not ($fullyHydratedCloudFilesBlocked -contains 'ReparsePoint')) `
+        'Fully hydrated Cloud Files attributes must not block ReparsePoint.'
+    $cloudFilesNoBoundaryBlocked = @(Get-HerdrBlockedAttributeNames -Attributes $fullyHydratedCloudFilesAttributes `
+        -ReparseTag $fullyHydratedCloudFilesTag -ComponentPath $source -CandidatePath $source)
+    Assert-True ($cloudFilesNoBoundaryBlocked -contains 'ReparsePoint') `
+        'Cloud Files ReparsePoint must remain blocked without an allowed boundary.'
+    $cloudFilesOutsideBoundaryBlocked = @(Get-HerdrBlockedAttributeNames -Attributes $fullyHydratedCloudFilesAttributes `
+        -ReparseTag $fullyHydratedCloudFilesTag -ComponentPath $source -CandidatePath $source `
+        -AllowedCloudFilesRoot (Join-Path $root 'other-boundary'))
+    Assert-True ($cloudFilesOutsideBoundaryBlocked -contains 'ReparsePoint') `
+        'Cloud Files ReparsePoint must remain blocked outside the allowed boundary.'
+    $unrecognizedCloudFilesBlocked = @(Get-HerdrBlockedAttributeNames -Attributes $fullyHydratedCloudFilesAttributes `
+        -ReparseTag ([uint32]([Convert]::ToUInt32('9000001B', 16))) -ComponentPath $source -CandidatePath $source `
+        -AllowedCloudFilesRoot $oneDriveExchange)
+    Assert-True ($unrecognizedCloudFilesBlocked -contains 'ReparsePoint') `
+        'Unrecognized reparse tags must remain blocked by the hydration filter.'
+    foreach ($hydrationCase in @(
+        [pscustomobject]@{ Name = 'Offline'; Bits = [int64]0x1000 },
+        [pscustomobject]@{ Name = 'RecallOnOpen'; Bits = [int64]0x40000 },
+        [pscustomobject]@{ Name = 'RecallOnDataAccess'; Bits = [int64]0x400000 }
+    )) {
+        $hydrationBlocked = @(Get-HerdrBlockedAttributeNames -Attributes ($fullyHydratedCloudFilesAttributes -bor $hydrationCase.Bits) `
+            -ReparseTag $fullyHydratedCloudFilesTag -ComponentPath $source -CandidatePath $source `
+            -AllowedCloudFilesRoot $oneDriveExchange)
+        Assert-True ($hydrationBlocked -contains $hydrationCase.Name) `
+            "$($hydrationCase.Name) must remain blocked for a Cloud Files leaf."
+        Assert-True (-not ($hydrationBlocked -contains 'ReparsePoint')) `
+            "$($hydrationCase.Name) must not restore the generic ReparsePoint hydration denial."
+    }
     $offlineBits = [int64]0x1000
     Assert-True ((Get-HerdrBlockedAttributeNames -Attributes $offlineBits) -contains 'Offline') 'Offline hydration flag is not blocked.'
     $recallBits = [int64]0x400000
@@ -112,6 +159,16 @@ try {
 
     $stagePath = Join-Path $PSScriptRoot '..\scripts\windows\Stage-HerdrReviewWorkbook.ps1'
     $stageText = [IO.File]::ReadAllText($stagePath)
+    $stagingSourceText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1'))
+    $runnerSourceText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1'))
+    Assert-True ($stagingSourceText.Contains('Get-HerdrPhysicalPathProof -Path $trustedRootCanonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
+        'Managed-directory trusted-root proof does not propagate the Cloud Files boundary.'
+    Assert-True ($stagingSourceText.Contains('Open-HerdrNativeReadFile -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
+        'Snapshot native reads do not propagate the Cloud Files boundary.'
+    Assert-True ($stagingSourceText.Contains('Open-HerdrNativeReadFile -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
+        'Copy native reads do not propagate the source Cloud Files boundary.'
+    Assert-True ($runnerSourceText.Contains('Open-HerdrNativeReadFile -Path $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
+        'Runner JSON native reads do not preserve explicit Cloud Files boundary plumbing.'
     Assert-True (-not $stageText.Contains('TestMode', [StringComparison]::Ordinal)) 'Production staging wrapper exposes a test-mode seam.'
     $identityIndex = $stageText.IndexOf('Assert-HerdrInteractiveIdentity', [StringComparison]::Ordinal)
     $bridgeIndex = $stageText.IndexOf('Assert-HerdrBridgeCannotWrite', [StringComparison]::Ordinal)

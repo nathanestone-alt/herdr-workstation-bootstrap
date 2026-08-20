@@ -2,6 +2,8 @@ Set-StrictMode -Version Latest
 
 $script:HerdrReviewStagingScriptPath = Join-Path $PSScriptRoot 'HerdrReviewStaging.ps1'
 . $script:HerdrReviewStagingScriptPath
+$script:HerdrHostOwnedAclPolicyScriptPath = Join-Path $PSScriptRoot 'HerdrHostOwnedAclPolicy.ps1'
+. $script:HerdrHostOwnedAclPolicyScriptPath
 
 function Assert-HerdrJsonProperties {
     [CmdletBinding()]
@@ -51,7 +53,8 @@ function Read-HerdrJsonFile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string]$TrustedRoot
+        [string]$TrustedRoot,
+        [string]$AllowedCloudFilesRoot
     )
 
     $opened = $null
@@ -60,17 +63,18 @@ function Read-HerdrJsonFile {
     $boundaryBefore = $null
     try {
         if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
-            $proof = Get-HerdrPhysicalPathProof -Path $Path
+            $proof = Get-HerdrPhysicalPathProof -Path $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         }
         else {
-            $boundaryBefore = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot -Description 'JSON input boundary'
+            $boundaryBefore = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot `
+                -Description 'JSON input boundary' -AllowedCloudFilesRoot $AllowedCloudFilesRoot
             $proof = $boundaryBefore.Candidate
         }
         if (-not $proof.Exists -or $proof.Leaf.IsDirectory) { throw 'not a regular file' }
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
         if ($IsWindows) {
-            $opened = Open-HerdrNativeReadFile -Path $Path
+            $opened = Open-HerdrNativeReadFile -Path $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot
             Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $opened.Identity -Description 'JSON input before read' -IncludeLinkCount | Out-Null
             $fileStream = [IO.FileStream]::new($opened.SafeHandle, [IO.FileAccess]::Read, 4096, $false)
             $reader = [IO.StreamReader]::new($fileStream, [Text.UTF8Encoding]::new($false, $true), $true, 4096, $true)
@@ -81,16 +85,16 @@ function Read-HerdrJsonFile {
         }
         $value = $raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop
         $afterProof = if ($IsWindows) {
-            Get-HerdrPhysicalPathProof -Path $Path -ExistingLeafHandle $opened
+            Get-HerdrPhysicalPathProof -Path $Path -ExistingLeafHandle $opened -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         }
         else {
-            Get-HerdrPhysicalPathProof -Path $Path
+            Get-HerdrPhysicalPathProof -Path $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot
         }
         Compare-HerdrPhysicalIdentity -Expected $proof.Leaf -Actual $afterProof.Leaf -Description 'JSON input after read' -IncludeLinkCount | Out-Null
         if ($null -ne $boundaryBefore) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $Path -RootPath $TrustedRoot `
                 -ExpectedCandidate $proof -ExpectedRoot $boundaryBefore.Root -Description 'JSON input boundary after read' `
-                -ExistingCandidateHandle $opened | Out-Null
+                -ExistingCandidateHandle $opened -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
         }
     }
     catch {
@@ -757,8 +761,7 @@ function Invoke-HerdrExcelRecalculate {
             -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
         $workbook = $excel.Workbooks.Open($InputPath, 0, $false)
         Disable-HerdrExcelConnections -Workbook $workbook
-        $workbook.UpdateLinks = 0
-        $workbook.Calculate()
+        $excel.Calculate()
         Assert-HerdrExcelProcessIdentity -Excel $excel -Configuration $IdentityConfiguration `
             -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe | Out-Null
         $workbook.SaveCopyAs($ResultPath)
@@ -795,6 +798,7 @@ function Invoke-HerdrExcelJob {
         [scriptblock]$InteractiveSessionProbe,
         [scriptblock]$IdentityProbe,
         [scriptblock]$HostOwnedAccessProbe,
+        [scriptblock]$HostOwnedTreeProtector,
         [scriptblock]$ExcelInvoker,
         [scriptblock]$ExcelProcessProbe,
         [scriptblock]$AfterExcelHook,
@@ -809,7 +813,8 @@ function Invoke-HerdrExcelJob {
     $copyHerdrFileExclusive = Get-Command Copy-HerdrFileExclusive -CommandType Function -ErrorAction Stop
 
     if (-not $TestMode -and ($null -ne $InteractiveSessionProbe -or $null -ne $IdentityProbe -or
-        $null -ne $HostOwnedAccessProbe -or $null -ne $ExcelInvoker -or $null -ne $ExcelProcessProbe -or
+        $null -ne $HostOwnedAccessProbe -or $null -ne $HostOwnedTreeProtector -or
+        $null -ne $ExcelInvoker -or $null -ne $ExcelProcessProbe -or
         $null -ne $AfterExcelHook -or $null -ne $OneDriveReadyProbe)) {
         throw 'Test probes are permitted only in explicit test mode.'
     }
@@ -931,6 +936,13 @@ function Invoke-HerdrExcelJob {
     if ($stageBefore.Sha256 -cne $manifest.StagedHash -or $stageBefore.SizeBytes -ne $manifest.StagedSizeBytes) { throw 'Bridge-stage workbook hash changed before execution.' }
     $reviewJobPath = Ensure-HerdrManagedDirectory -Path $reviewJobPath `
         -TrustedRoot $reviewCanonical -Description 'Excel review-job directory'
+    if ($null -ne $HostOwnedTreeProtector) {
+        & $HostOwnedTreeProtector $reviewJobPath $identityConfiguration.InteractiveUserSid
+    }
+    elseif (-not $TestMode) {
+        Protect-HostOwnedTree -TargetPath $reviewJobPath `
+            -OperatorSid ([Security.Principal.SecurityIdentifier]::new($identityConfiguration.InteractiveUserSid))
+    }
     if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical, $reviewJobPath)
     }

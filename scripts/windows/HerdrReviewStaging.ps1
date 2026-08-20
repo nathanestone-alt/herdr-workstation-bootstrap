@@ -687,12 +687,15 @@ function Assert-HerdrAllowedReparsePoint {
     else {
         'unrecognized'
     }
-    if (-not $IsDirectory) {
-        throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
-    }
     if (-not $isCloudFilesTag) {
+        if (-not $IsDirectory) {
+            throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
+        }
         throw "Refusing $tagDescription reparse point with tag 0x{0:x8}: '$ComponentPath'." -f $ReparseTag
     }
+    # A recognized Cloud Files file leaf is permitted only inside the explicit
+    # boundary below; symbolic links, junctions, mount points, and unknown
+    # reparse tags remain denied by the branch above.
     if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
         throw "Refusing Cloud Files reparse point outside a configured OneDrive exchange boundary: '$ComponentPath'."
     }
@@ -978,7 +981,9 @@ function Ensure-HerdrManagedDirectory {
             $chain.SafeHandle.Dispose()
         }
     }
-    $trustedRootProof = if ($null -eq $trustedRootCanonical) { $null } else { Get-HerdrPhysicalPathProof -Path $trustedRootCanonical }
+    $trustedRootProof = if ($null -eq $trustedRootCanonical) { $null } else {
+        Get-HerdrPhysicalPathProof -Path $trustedRootCanonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot
+    }
     foreach ($component in @(Get-HerdrPathComponents -Path $canonical)) {
         $componentPath = [string]$component
         $componentExists = [IO.Directory]::Exists($componentPath) -or [IO.File]::Exists($componentPath)
@@ -1249,7 +1254,13 @@ function Get-HerdrDefaultOneDriveSiblingRoot {
 
 function Get-HerdrBlockedAttributeNames {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$Attributes)
+    param(
+        [Parameter(Mandatory)][object]$Attributes,
+        [uint32]$ReparseTag = 0,
+        [string]$ComponentPath,
+        [string]$CandidatePath,
+        [string]$AllowedCloudFilesRoot
+    )
 
     $blockedAttributes = [ordered]@{
         Offline = [int64]0x1000
@@ -1257,9 +1268,28 @@ function Get-HerdrBlockedAttributeNames {
         RecallOnOpen = [int64]0x40000
         RecallOnDataAccess = [int64]0x400000
     }
+    $allowCloudFilesReparsePoint = $false
+    if (([int64]$Attributes -band [int64][IO.FileAttributes]::ReparsePoint) -ne 0 -and
+        (Test-HerdrCloudFilesReparseTag -ReparseTag $ReparseTag) -and
+        -not [string]::IsNullOrWhiteSpace($ComponentPath) -and
+        -not [string]::IsNullOrWhiteSpace($CandidatePath) -and
+        -not [string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
+        try {
+            Assert-HerdrAllowedReparsePoint -ReparseTag $ReparseTag -IsDirectory:$false `
+                -ComponentPath $ComponentPath -CandidatePath $CandidatePath `
+                -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
+            $allowCloudFilesReparsePoint = $true
+        }
+        catch {
+            $allowCloudFilesReparsePoint = $false
+        }
+    }
     return @(
         foreach ($entry in $blockedAttributes.GetEnumerator()) {
-            if (([int64]$Attributes -band $entry.Value) -ne 0) { $entry.Key }
+            if (([int64]$Attributes -band $entry.Value) -ne 0 -and
+                ($entry.Key -ne 'ReparsePoint' -or -not $allowCloudFilesReparsePoint)) {
+                $entry.Key
+            }
         }
     )
 }
@@ -1281,7 +1311,9 @@ function Assert-HerdrWorkbookFile {
         if ($extension -notin (Get-HerdrWorkbookExtensionAllowlist)) {
             throw "Workbook extension '$extension' is not allowed."
         }
-        $blocked = @(Get-HerdrBlockedAttributeNames -Attributes $item.Attributes)
+        $blocked = @(Get-HerdrBlockedAttributeNames -Attributes $item.Attributes `
+            -ReparseTag ([uint32]$proof.Leaf.ReparseTag) -ComponentPath ([string]$proof.Leaf.LexicalPath) `
+            -CandidatePath $Path -AllowedCloudFilesRoot $AllowedCloudFilesRoot)
         if ($blocked.Count -gt 0) {
             throw "Workbook is not fully hydrated; blocked attributes: $($blocked -join ', ')."
         }
@@ -1292,7 +1324,10 @@ function Assert-HerdrWorkbookFile {
 
 function Open-HerdrNativeReadFile {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$AllowedCloudFilesRoot
+    )
 
     if (-not $IsWindows) { throw 'Native file handles are available only on Windows.' }
     $canonical = Get-HerdrCanonicalPath -Path $Path
@@ -1302,7 +1337,9 @@ function Open-HerdrNativeReadFile {
         $safeHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($rawHandle, $true)
         $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity($rawHandle)
         if (($identity.Attributes -band [Herdr.Security.NativeMethods]::FileAttributeReparsePoint) -ne 0) {
-            throw "Workbook source is a reparse point: '$canonical'."
+            Assert-HerdrAllowedReparsePoint -ReparseTag ([uint32]$identity.ReparseTag) -IsDirectory:$false `
+                -ComponentPath $canonical -CandidatePath $canonical `
+                -AllowedCloudFilesRoot $AllowedCloudFilesRoot | Out-Null
         }
         if ([int64]$identity.NumberOfLinks -gt 1) {
             throw "Workbook source has multiple hard links: '$canonical'."
@@ -1559,7 +1596,7 @@ function Get-HerdrFileSnapshot {
     try {
         try {
             if ($IsWindows) {
-                $opened = Open-HerdrNativeReadFile -Path $canonicalPath
+                $opened = Open-HerdrNativeReadFile -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot
                 $openedIdentity = $opened.Identity
                 if ($null -ne $ExpectedIdentity) {
                     Compare-HerdrPhysicalIdentity -Expected $ExpectedIdentity -Actual $openedIdentity -Description 'Workbook source' -IncludeLinkCount | Out-Null
@@ -1683,7 +1720,7 @@ function Copy-HerdrNativeFileExclusive {
     $failure = $null
     $sourceIdentity = $null
     try {
-        $opened = Open-HerdrNativeReadFile -Path $source
+        $opened = Open-HerdrNativeReadFile -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
         $sourceIdentity = $opened.Identity
         if ($null -ne $ExpectedSourceIdentity) {
             Compare-HerdrPhysicalIdentity -Expected $ExpectedSourceIdentity -Actual $sourceIdentity `
@@ -1790,7 +1827,7 @@ function Copy-HerdrFileExclusive {
                 -Description 'Copy source boundary' -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
         }
         if ($IsWindows) {
-            $opened = Open-HerdrNativeReadFile -Path $source
+            $opened = Open-HerdrNativeReadFile -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
             $sourceIdentity = $opened.Identity
             if ($null -ne $ExpectedSourceIdentity) {
                 Compare-HerdrPhysicalIdentity -Expected $ExpectedSourceIdentity -Actual $sourceIdentity -Description 'Copy source' -IncludeLinkCount | Out-Null
