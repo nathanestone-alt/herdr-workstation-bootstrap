@@ -981,7 +981,9 @@ function Ensure-HerdrManagedDirectory {
             $chain.SafeHandle.Dispose()
         }
     }
-    $trustedRootProof = if ($null -eq $trustedRootCanonical) { $null } else { Get-HerdrPhysicalPathProof -Path $trustedRootCanonical }
+    $trustedRootProof = if ($null -eq $trustedRootCanonical) { $null } else {
+        Get-HerdrPhysicalPathProof -Path $trustedRootCanonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot
+    }
     foreach ($component in @(Get-HerdrPathComponents -Path $canonical)) {
         $componentPath = [string]$component
         $componentExists = [IO.Directory]::Exists($componentPath) -or [IO.File]::Exists($componentPath)

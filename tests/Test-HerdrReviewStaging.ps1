@@ -161,6 +161,8 @@ try {
     $stageText = [IO.File]::ReadAllText($stagePath)
     $stagingSourceText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1'))
     $runnerSourceText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\windows\HerdrExcelJobRunner.ps1'))
+    Assert-True ($stagingSourceText.Contains('Get-HerdrPhysicalPathProof -Path $trustedRootCanonical -AllowedCloudFilesRoot $AllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
+        'Managed-directory trusted-root proof does not propagate the Cloud Files boundary.'
     Assert-True ($stagingSourceText.Contains('Open-HerdrNativeReadFile -Path $canonicalPath -AllowedCloudFilesRoot $AllowedCloudFilesRoot', [StringComparison]::Ordinal)) `
         'Snapshot native reads do not propagate the Cloud Files boundary.'
     Assert-True ($stagingSourceText.Contains('Open-HerdrNativeReadFile -Path $source -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot', [StringComparison]::Ordinal)) `

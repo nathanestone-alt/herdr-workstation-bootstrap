@@ -122,6 +122,10 @@ if (-not [string]::IsNullOrWhiteSpace($CloudFilesExchangeRoot)) {
             -AllowEqual:($directory.Equals($exchangeRoot, [StringComparison]::OrdinalIgnoreCase)) `
             -AllowedCloudFilesRoot $exchangeRoot -Description "Cloud Files containment '$directory'" | Out-Null
     }
+    $managedOutbox = Ensure-HerdrManagedDirectory -Path (Join-Path $exchangeRoot 'Outbox') `
+        -TrustedRoot $exchangeRoot -Description 'Cloud Files Outbox' -AllowedCloudFilesRoot $exchangeRoot
+    Assert-True ($managedOutbox -ceq (Join-Path $exchangeRoot 'Outbox')) `
+        'Ensure-HerdrManagedDirectory Cloud Files fixture failed.'
 }
 
 Write-Host 'Herdr Windows path-policy correction regression test passed.'
