@@ -53,7 +53,8 @@ namespace Herdr.Security {
         public const int TokenUser = 1;
         private const int NativeFileRenameInformation = 10;
         private const int FileDispositionInformation = 4;
-        private const uint FileGenericWrite = 0x00120116;
+        private const uint MAXIMUM_ALLOWED = 0x02000000;
+        private const uint EffectiveWriteMask = 0x000D0156;
         private const uint AUTHZ_RM_FLAG_NO_AUDIT = 0x1;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -436,9 +437,8 @@ namespace Herdr.Security {
                     IntPtr.Zero, new Luid(), IntPtr.Zero, out clientContext)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Authz bridge context initialization failed");
                 }
-                uint writeMask = FileGenericWrite | DeleteAccess | WriteDac | WriteOwner | FileDeleteChild;
                 var request = new AuthzAccessRequest {
-                    DesiredAccess = writeMask,
+                    DesiredAccess = MAXIMUM_ALLOWED,
                     PrincipalSelfSid = IntPtr.Zero,
                     ObjectTypeList = IntPtr.Zero,
                     ObjectTypeListLength = 0,
@@ -464,7 +464,7 @@ namespace Herdr.Security {
                     throw new Win32Exception(apiError, "Authz effective access evaluation failed");
                 }
                 uint grantedMask = unchecked((uint)Marshal.ReadInt32(granted));
-                return (grantedMask & writeMask) != 0;
+                return (grantedMask & EffectiveWriteMask) != 0;
             }
             finally {
                 if (errors != IntPtr.Zero) Marshal.FreeHGlobal(errors);

@@ -370,20 +370,26 @@ try {
 
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $currentGroups = @([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value })
-    $effectiveWriteSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x1F0156;;;${currentSid})"
-    $effectiveReadSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x120089;;;${currentSid})"
+    $effectiveWriteSddl = "O:SYG:SYD:P(A;;0x000D0156;;;${currentSid})"
+    $effectivePartialWriteSddl = "O:SYG:SYD:P(A;;0x120116;;;${currentSid})"
+    $effectiveReadSddl = "O:SYG:SYD:P(A;;0x120089;;;${currentSid})"
     $effectiveWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveWriteSddl)
+    $effectivePartialWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectivePartialWriteSddl)
     $effectiveReadDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveReadSddl)
     $effectiveWriteBytes = [byte[]]::new($effectiveWriteDescriptor.BinaryLength)
+    $effectivePartialWriteBytes = [byte[]]::new($effectivePartialWriteDescriptor.BinaryLength)
     $effectiveReadBytes = [byte[]]::new($effectiveReadDescriptor.BinaryLength)
     $effectiveWriteDescriptor.GetBinaryForm($effectiveWriteBytes, 0)
+    $effectivePartialWriteDescriptor.GetBinaryForm($effectivePartialWriteBytes, 0)
     $effectiveReadDescriptor.GetBinaryForm($effectiveReadBytes, 0)
     Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveWriteBytes)) `
-        'Authz effective-access regression did not detect direct token write access.'
+        'Authz effective-access regression did not detect the full dangerous-write grant.'
+    Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectivePartialWriteBytes)) `
+        'Authz effective-access regression did not detect a partial FILE_GENERIC_WRITE grant.'
     Assert-True (-not [Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveReadBytes)) `
         'Authz effective-access regression treated read access as write access.'
     if ($currentGroups.Count -gt 0) {
-        $groupSddl = "O:${currentSid}G:${currentSid}D:P(A;;0x1F0156;;;$($currentGroups[0]))"
+        $groupSddl = "O:SYG:SYD:P(A;;0x120116;;;$($currentGroups[0]))"
         $groupDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($groupSddl)
         $groupBytes = [byte[]]::new($groupDescriptor.BinaryLength)
         $groupDescriptor.GetBinaryForm($groupBytes, 0)

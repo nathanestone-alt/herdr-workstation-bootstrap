@@ -100,7 +100,11 @@ Production execution requires the runtime configuration's designated user
 SID, interactive session ID, and fixed non-admin bridge-account SID. The runner
 proves the current process, Explorer, OneDrive process, and signed-in OneDrive
 account before work, then Windows Authz evaluates effective bridge access to
-every host-owned tools or review-job root; any effective write grant is denied.
+every host-owned tools or review-job root; any effective grant containing one or
+more of `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_EA`,
+`FILE_WRITE_ATTRIBUTES`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, or
+`WRITE_OWNER` is denied. `READ_CONTROL` or `SYNCHRONIZE` alone is not a write
+grant.
 Effective-access evaluation does not generate Authz audits or require
 `SeAuditPrivilege`: the bridge initializes its Authz resource manager with
 `AUTHZ_RM_FLAG_NO_AUDIT` for an access decision only. Central-access-policy
