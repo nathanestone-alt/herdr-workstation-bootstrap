@@ -55,6 +55,11 @@ try {
     $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
     Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
+    } 'Cloud Files reparse point on a non-directory' 'Cloud Files file reparse description'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
 
     $result = Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' `

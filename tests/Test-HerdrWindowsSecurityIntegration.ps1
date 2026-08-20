@@ -324,6 +324,9 @@ try {
         Write-HerdrAtomicText -Path (Join-Path $outside 'unsafe-output.json') -Content '{}' -TrustedRoot $safeDestinationRoot
     } 'outside the trusted physical root' 'atomic output boundary'
 
+    # These numeric fixture RIDs match the staging fixtures and keep the
+    # interactive user, bridge account, nested group, and substitute identity
+    # distinct while avoiding ambiguous non-SID fixture names in Authz probes.
     $identityConfiguration = [pscustomobject]@{
         InteractiveUserSid = 'S-1-5-21-961-1001'
         InteractiveSessionId = 7

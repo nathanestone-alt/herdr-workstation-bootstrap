@@ -52,7 +52,11 @@ all other extensions, device/UNC paths, traversal outside the configured Inbox,
 symlinks, junctions, mount points, and unrecognized reparse tags. The only
 accepted reparse case is a native Cloud Files directory tag on the path to a
 configured OneDrive exchange root or one of its Inbox/Outbox/Archive children;
-workbook files themselves must remain non-reparse and fully hydrated. Offline/
+workbook files themselves must remain non-reparse and fully hydrated. The
+configured exchange root used for Cloud Files tag admission is not a general
+containment root for every physical proof; lexical and final-handle containment
+continues to be enforced by the dedicated trusted-root and exchange-boundary
+checks. Offline/
 Recall attributes, hard-linked sources, unstable exclusive reads, collisions,
 and source/stage size, hash, or physical file-identity mismatches are also
 rejected. Windows production paths are proven through no-follow handles,

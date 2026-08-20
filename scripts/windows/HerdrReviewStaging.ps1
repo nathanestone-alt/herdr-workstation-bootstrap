@@ -673,7 +673,11 @@ function Assert-HerdrAllowedReparsePoint {
         [string]$AllowedCloudFilesRoot
     )
 
-    $tagDescription = if ($ReparseTag -eq [Convert]::ToUInt32('A000000C', 16)) {
+    $isCloudFilesTag = Test-HerdrCloudFilesReparseTag -ReparseTag $ReparseTag
+    $tagDescription = if ($isCloudFilesTag) {
+        'Cloud Files'
+    }
+    elseif ($ReparseTag -eq [Convert]::ToUInt32('A000000C', 16)) {
         'symbolic-link'
     }
     elseif ($ReparseTag -eq [Convert]::ToUInt32('A0000003', 16)) {
@@ -685,7 +689,7 @@ function Assert-HerdrAllowedReparsePoint {
     if (-not $IsDirectory) {
         throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
     }
-    if (-not (Test-HerdrCloudFilesReparseTag -ReparseTag $ReparseTag)) {
+    if (-not $isCloudFilesTag) {
         throw "Refusing $tagDescription reparse point with tag 0x{0:x8}: '$ComponentPath'." -f $ReparseTag
     }
     if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
@@ -714,15 +718,14 @@ function Get-HerdrPhysicalPathProof {
     )
 
     $canonical = Get-HerdrCanonicalPath -Path $Path
+    # This optional root scopes Cloud Files reparse-tag admission below. It is
+    # not a lexical or physical containment root; those checks belong to the
+    # dedicated trusted-root and exchange-boundary callers.
     $allowedCloudFilesRootCanonical = if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
         $null
     }
     else {
         Get-HerdrCanonicalPath -Path $AllowedCloudFilesRoot
-    }
-    if ($null -ne $allowedCloudFilesRootCanonical -and
-        -not (Test-HerdrPathSameOrDescendant -Candidate $canonical -Ancestor $allowedCloudFilesRootCanonical)) {
-        throw "Path is outside the configured OneDrive exchange boundary: '$canonical'."
     }
     if ($null -ne $ExistingLeafHandle) {
         if (-not $IsWindows) { throw 'An existing native leaf handle is available only on Windows.' }

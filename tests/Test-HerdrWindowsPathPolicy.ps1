@@ -67,7 +67,7 @@ Assert-Throws {
     Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$false `
         -ComponentPath (Join-Path $syntheticCandidate 'workbook.xlsx') -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') `
         -AllowedCloudFilesRoot $syntheticBoundary | Out-Null
-} 'non-directory' 'Cloud Files file rejection'
+} 'Cloud Files reparse point on a non-directory' 'Cloud Files file rejection'
 Assert-Throws {
     Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$true `
         -ComponentPath $syntheticComponent -CandidatePath 'C:\Users\natha\OneDrive\Other' `
