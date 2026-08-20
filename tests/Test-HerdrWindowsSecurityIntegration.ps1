@@ -5,6 +5,12 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $fixtureText = [IO.File]::ReadAllText($PSCommandPath)
+$bridgeSourcePath = Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1'
+$bridgeSource = [IO.File]::ReadAllText($bridgeSourcePath)
+if (-not $bridgeSource.Contains('AUTHZ_RM_FLAG_NO_AUDIT = 0x1;', [StringComparison]::Ordinal) -or
+    -not $bridgeSource.Contains('AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT,', [StringComparison]::Ordinal)) {
+    throw 'Mechanical Authz regression: effective-access resource-manager initialization must use AUTHZ_RM_FLAG_NO_AUDIT.'
+}
 $rawThreadPattern = '[Threading.' + 'ThreadStart]'
 if ($fixtureText.Contains($rawThreadPattern, [StringComparison]::Ordinal)) {
     throw 'Mechanical race-fixture regression: raw ThreadStart execution is forbidden.'
@@ -88,6 +94,33 @@ function Assert-Throws([scriptblock]$Action, [string]$Expected, [string]$Name) {
     if (-not $thrown) { throw "$Name was accepted unexpectedly." }
 }
 
+function Test-HerdrExpectedRaceContention {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        $nativeErrorCode = $null
+        if ($null -ne $current.PSObject.Properties['NativeErrorCode']) {
+            try { $nativeErrorCode = [int]$current.NativeErrorCode } catch { $nativeErrorCode = $null }
+        }
+        # 32/33 are sharing/lock violations from the no-delete-share handle;
+        # 80/183 are the bounded file/directory collision when the production
+        # operation recreates the disposable race parent between worker steps.
+        if ($nativeErrorCode -in @(32, 33, 80, 183)) {
+            return $true
+        }
+        $hResult = [int64]$current.HResult
+        if (($hResult -band [uint32]0xffff) -in @(32, 33, 80, 183)) {
+            return $true
+        }
+        if ([string]$current.Message -match '(?i)(sharing violation|used by another process|cannot access.*because.*another process)') {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
 function Write-TestJson([string]$Path, [object]$Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
 }
@@ -107,15 +140,65 @@ function Start-HerdrRaceMutator {
     $script = @'
 param($raceParent, $raceMoved, $raceOutside, $raceEvidence, $raceStop, $raceErrors, $raceReady, $raceRelease)
 [void]$raceEvidence.TryAdd('race-runspace-started', $true)
+
+function Test-RaceContention {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        $nativeErrorCode = $null
+        if ($null -ne $current.PSObject.Properties['NativeErrorCode']) {
+            try { $nativeErrorCode = [int]$current.NativeErrorCode } catch { $nativeErrorCode = $null }
+        }
+        if ($nativeErrorCode -in @(32, 33, 80, 183)) {
+            return $true
+        }
+        $hResult = [int64]$current.HResult
+        if (($hResult -band [uint32]0xffff) -in @(32, 33, 80, 183)) {
+            return $true
+        }
+        if ([string]$current.Message -match '(?i)(sharing violation|used by another process|cannot access.*because.*another process)') {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Invoke-RaceStep {
+    param(
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+
+    try {
+        & $Action | Out-Null
+        return $true
+    }
+    catch {
+        if (Test-RaceContention -Exception $_.Exception) {
+            [void]$raceErrors.Enqueue("expected contention [$Phase]: $($_.Exception.Message)")
+            return $false
+        }
+        [void]$raceErrors.Enqueue("unexpected worker error [$Phase]: $($_.Exception.ToString())")
+        [void]$raceEvidence.TryAdd('race-mutator-error', $true)
+        throw
+    }
+}
+
 for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++) {
     [void]$raceEvidence.TryAdd('race-cycle', $true)
-    try {
-        if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
+    if ([IO.Directory]::Exists($raceParent) -and -not [IO.Directory]::Exists($raceMoved)) {
+        if (Invoke-RaceStep -Phase 'move-parent' -Action {
             [IO.Directory]::Move($raceParent, $raceMoved)
+        }) {
             [void]$raceEvidence.TryAdd('parent-moved', $true)
         }
-        if (-not [IO.Directory]::Exists($raceParent)) {
-            New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force | Out-Null
+    }
+    if (-not [IO.Directory]::Exists($raceParent)) {
+        if (Invoke-RaceStep -Phase 'create-junction' -Action {
+            New-Item -ItemType Junction -Path $raceParent -Target $raceOutside -Force -ErrorAction Stop | Out-Null
+        }) {
             [void]$raceEvidence.TryAdd('junction-created', $true)
             if ($null -ne $raceReady) {
                 [void]$raceEvidence.TryAdd('race-junction-ready', $true)
@@ -126,19 +209,22 @@ for ($raceCycle = 0; $raceCycle -lt 256 -and -not $raceStop.IsSet; $raceCycle++)
             }
         }
         Start-Sleep -Milliseconds 1
-        if ([IO.Directory]::Exists($raceParent) -and
-            (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-            Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 1
+    if ([IO.Directory]::Exists($raceParent) -and
+        (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        if (Invoke-RaceStep -Phase 'remove-junction' -Action {
+            Remove-Item -LiteralPath $raceParent -Force -ErrorAction Stop
+        }) {
             [void]$raceEvidence.TryAdd('junction-removed', $true)
         }
-        if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+    }
+    if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
+        if (Invoke-RaceStep -Phase 'restore-parent' -Action {
             [IO.Directory]::Move($raceMoved, $raceParent)
+        }) {
             [void]$raceEvidence.TryAdd('parent-restored', $true)
         }
-    }
-    catch {
-        [void]$raceErrors.Enqueue($_.Exception.ToString())
-        [void]$raceEvidence.TryAdd('race-mutator-error', $true)
     }
 }
 '@
@@ -187,6 +273,74 @@ function Stop-HerdrRaceMutator {
         $Worker.PowerShell.Dispose()
         $Worker.Runspace.Dispose()
     }
+}
+
+function Restore-HerdrRaceParent {
+    param(
+        [Parameter(Mandatory)][string]$RaceParent,
+        [Parameter(Mandatory)][string]$RaceMoved,
+        [Parameter(Mandatory)][object]$RaceEvidence,
+        [Parameter(Mandatory)][object]$RaceErrors,
+        [string]$Description = 'Race parent restoration'
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $attempt = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $attempt++
+        try {
+            if ([IO.Directory]::Exists($RaceParent) -and
+                (([IO.File]::GetAttributes($RaceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                try {
+                    Remove-Item -LiteralPath $RaceParent -Force -ErrorAction Stop
+                    [void]$RaceEvidence.TryAdd('junction-removed', $true)
+                }
+                catch {
+                    if (-not (Test-HerdrExpectedRaceContention -Exception $_.Exception)) { throw }
+                    [void]$RaceErrors.Enqueue("expected contention [$Description remove-junction]: $($_.Exception.Message)")
+                }
+            }
+            if ([IO.Directory]::Exists($RaceParent) -and [IO.Directory]::Exists($RaceMoved) -and
+                (([IO.File]::GetAttributes($RaceParent) -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+                # A production operation can recreate this disposable parent while the
+                # original remains at parent-moved. Remove only that shadow fixture
+                # directory before restoring the original directory identity.
+                try {
+                    Remove-Item -LiteralPath $RaceParent -Recurse -Force -ErrorAction Stop
+                    [void]$RaceEvidence.TryAdd('race-shadow-parent-removed', $true)
+                }
+                catch {
+                    if (-not (Test-HerdrExpectedRaceContention -Exception $_.Exception)) { throw }
+                    [void]$RaceErrors.Enqueue("expected contention [$Description remove-shadow-parent]: $($_.Exception.Message)")
+                }
+            }
+            if ([IO.Directory]::Exists($RaceMoved) -and -not [IO.Directory]::Exists($RaceParent)) {
+                try {
+                    [IO.Directory]::Move($RaceMoved, $RaceParent)
+                    [void]$RaceEvidence.TryAdd('parent-restored', $true)
+                }
+                catch {
+                    if (-not (Test-HerdrExpectedRaceContention -Exception $_.Exception)) { throw }
+                    [void]$RaceErrors.Enqueue("expected contention [$Description restore-parent]: $($_.Exception.Message)")
+                }
+            }
+            $parentExists = [IO.Directory]::Exists($RaceParent)
+            $movedExists = [IO.Directory]::Exists($RaceMoved)
+            if ($parentExists -and -not $movedExists -and
+                (([IO.File]::GetAttributes($RaceParent) -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+                return
+            }
+        }
+        catch {
+            [void]$RaceErrors.Enqueue("unexpected [$Description attempt $attempt]: $($_.Exception.ToString())")
+            throw
+        }
+        Start-Sleep -Milliseconds 10
+    }
+
+    $evidence = @($RaceEvidence.Keys | Sort-Object) -join ', '
+    $contention = @($RaceErrors.ToArray()) -join ' | '
+    throw "$Description timed out after $attempt attempts; parent='$RaceParent'; moved='$RaceMoved'; evidence=$evidence; contention=$contention."
 }
 
 function New-IntegrationFixture {
@@ -364,20 +518,26 @@ try {
 
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $currentGroups = @([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value })
-    $effectiveWriteSddl = "D:P(A;;0x120116;;;$currentSid)"
-    $effectiveReadSddl = "D:P(A;;0x120089;;;$currentSid)"
+    $effectiveWriteSddl = "O:SYG:SYD:P(A;;0x000D0156;;;${currentSid})"
+    $effectivePartialWriteSddl = "O:SYG:SYD:P(A;;0x120116;;;${currentSid})"
+    $effectiveReadSddl = "O:SYG:SYD:P(A;;0x120089;;;${currentSid})"
     $effectiveWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveWriteSddl)
+    $effectivePartialWriteDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectivePartialWriteSddl)
     $effectiveReadDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($effectiveReadSddl)
     $effectiveWriteBytes = [byte[]]::new($effectiveWriteDescriptor.BinaryLength)
+    $effectivePartialWriteBytes = [byte[]]::new($effectivePartialWriteDescriptor.BinaryLength)
     $effectiveReadBytes = [byte[]]::new($effectiveReadDescriptor.BinaryLength)
     $effectiveWriteDescriptor.GetBinaryForm($effectiveWriteBytes, 0)
+    $effectivePartialWriteDescriptor.GetBinaryForm($effectivePartialWriteBytes, 0)
     $effectiveReadDescriptor.GetBinaryForm($effectiveReadBytes, 0)
     Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveWriteBytes)) `
-        'Authz effective-access regression did not detect direct token write access.'
+        'Authz effective-access regression did not detect the full dangerous-write grant.'
+    Assert-True ([Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectivePartialWriteBytes)) `
+        'Authz effective-access regression did not detect a partial FILE_GENERIC_WRITE grant.'
     Assert-True (-not [Herdr.Security.NativeMethods]::HasEffectiveWriteAccess($currentSid, $effectiveReadBytes)) `
         'Authz effective-access regression treated read access as write access.'
     if ($currentGroups.Count -gt 0) {
-        $groupSddl = "D:P(A;;0x120116;;;$($currentGroups[0]))"
+        $groupSddl = "O:SYG:SYD:P(A;;0x120116;;;$($currentGroups[0]))"
         $groupDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($groupSddl)
         $groupBytes = [byte[]]::new($groupDescriptor.BinaryLength)
         $groupDescriptor.GetBinaryForm($groupBytes, 0)
@@ -395,18 +555,23 @@ try {
     $raceEvidence = [Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
     $raceErrors = [Collections.Concurrent.ConcurrentQueue[string]]::new()
     $raceStop = [Threading.ManualResetEventSlim]::new($false)
+    $raceReady = [Threading.ManualResetEventSlim]::new($false)
     $raceWorker = Start-HerdrRaceMutator -RaceParent $raceParent -RaceMoved $raceMoved -RaceOutside $raceOutside `
-        -RaceEvidence $raceEvidence -RaceStop $raceStop -RaceErrors $raceErrors
-    $raceStartDeadline = [DateTime]::UtcNow.AddSeconds(5)
-    while (-not $raceEvidence.ContainsKey('race-runspace-started') -and [DateTime]::UtcNow -lt $raceStartDeadline) {
-        Start-Sleep -Milliseconds 10
-    }
-    Assert-True ($raceEvidence.ContainsKey('race-runspace-started')) 'The runspace-backed race mutator did not start.'
+        -RaceEvidence $raceEvidence -RaceStop $raceStop -RaceErrors $raceErrors -RaceReady $raceReady
     $raceOperationAttempts = 0
     $raceOperationSuccesses = 0
     $raceOperationFailures = [Collections.Generic.List[string]]::new()
     $raceWorkerFailure = $null
+    $raceRestoreFailure = $null
     try {
+        $raceStartDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $raceEvidence.ContainsKey('race-junction-ready') -and [DateTime]::UtcNow -lt $raceStartDeadline) {
+            Start-Sleep -Milliseconds 10
+        }
+        Assert-True ($raceEvidence.ContainsKey('race-runspace-started')) 'The runspace-backed race mutator did not start.'
+        Assert-True ($raceEvidence.ContainsKey('race-junction-ready')) `
+            ("The ancestor/junction race did not establish its bounded start barrier; evidence={0}; contention={1}." -f
+                (($raceEvidence.Keys | Sort-Object) -join ', '), ($raceErrors.ToArray() -join ' | '))
         for ($attempt = 0; $attempt -lt 40; $attempt++) {
             $raceOperationAttempts++
             try {
@@ -436,16 +601,18 @@ try {
     finally {
         try { Stop-HerdrRaceMutator -Worker $raceWorker }
         catch { $raceWorkerFailure = $_.Exception }
-    }
-    if ([IO.Directory]::Exists($raceParent) -and
-        (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-        Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
-    }
-    if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
-        [IO.Directory]::Move($raceMoved, $raceParent)
+        try {
+            Restore-HerdrRaceParent -RaceParent $raceParent -RaceMoved $raceMoved `
+                -RaceEvidence $raceEvidence -RaceErrors $raceErrors -Description 'Ancestor/junction race restoration'
+        }
+        catch { $raceRestoreFailure = $_.Exception }
+        $raceReady.Dispose()
     }
     if ($null -ne $raceWorkerFailure) {
         throw "The ancestor/junction race worker failed: $($raceWorkerFailure.Message)"
+    }
+    if ($null -ne $raceRestoreFailure) {
+        throw "The ancestor/junction race restoration failed: $($raceRestoreFailure.Message)"
     }
     $raceContentionDiagnostics = @($raceErrors.ToArray())
     $raceEvidenceKeys = @($raceEvidence.Keys)
@@ -486,6 +653,7 @@ try {
         -RaceReady $cleanupReady -RaceRelease $cleanupRelease
     $cleanupError = $null
     $cleanupWorkerFailure = $null
+    $cleanupRestoreFailure = $null
     try {
         if (-not $cleanupReady.Wait(5000)) {
             throw ("The cleanup collision race did not establish its bounded start barrier; evidence={0}; contention={1}." -f
@@ -509,18 +677,19 @@ try {
         [void]$cleanupRelease.Set()
         try { Stop-HerdrRaceMutator -Worker $cleanupRaceWorker }
         catch { $cleanupWorkerFailure = $_.Exception }
-    }
-    if ([IO.Directory]::Exists($raceParent) -and
-        (([IO.File]::GetAttributes($raceParent) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-        Remove-Item -LiteralPath $raceParent -Force -ErrorAction SilentlyContinue
-    }
-    if ([IO.Directory]::Exists($raceMoved) -and -not [IO.Directory]::Exists($raceParent)) {
-        [IO.Directory]::Move($raceMoved, $raceParent)
+        try {
+            Restore-HerdrRaceParent -RaceParent $raceParent -RaceMoved $raceMoved `
+                -RaceEvidence $cleanupEvidence -RaceErrors $cleanupErrors -Description 'Cleanup collision race restoration'
+        }
+        catch { $cleanupRestoreFailure = $_.Exception }
     }
     $cleanupReady.Dispose()
     $cleanupRelease.Dispose()
     if ($null -ne $cleanupWorkerFailure) {
         throw "The cleanup collision race worker failed: $($cleanupWorkerFailure.Message)"
+    }
+    if ($null -ne $cleanupRestoreFailure) {
+        throw "The cleanup collision race restoration failed: $($cleanupRestoreFailure.Message)"
     }
     $cleanupContentionDiagnostics = @($cleanupErrors.ToArray())
     $cleanupEvidenceKeys = @($cleanupEvidence.Keys)
@@ -552,6 +721,7 @@ try {
         'Handle-relative cleanup race wrote outside the trusted root.'
     Assert-True (@(Get-ChildItem -LiteralPath $raceTrusted -Recurse -Force -File -Filter '.herdr-text-*.tmp' -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative atomic-text cleanup left a temporary file.'
+    $raceStop.Dispose()
 
     $fixture = New-IntegrationFixture -Inbox $inbox -OneDriveOutbox $oneDriveOutbox -OneDriveArchive $oneDriveArchive `
         -Exchange $exchange -ReviewJobs $reviewJobs -Tools $tools -Number 1
