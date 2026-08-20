@@ -55,11 +55,24 @@ try {
     $runtime = Get-HerdrRuntimeConfiguration -Path $runtimeConfig
     Assert-True ($runtime.ExchangeRoot -ceq $exchange) 'Runtime configuration did not resolve the local exchange root.'
     Assert-True ($runtime.OneDriveInboxRoot -ceq $inbox) 'Runtime configuration did not derive the OneDrive Inbox root.'
+    Assert-True (Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange) `
+        'Cloud Files file acceptance beneath the configured exchange boundary failed.'
     Assert-Throws {
         Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
-            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') `
+            -ComponentPath (Join-Path $inbox 'review.xlsx') -CandidatePath (Join-Path $inbox 'review.xlsx') | Out-Null
+    } 'configured OneDrive exchange boundary' 'Cloud Files file no-boundary rejection'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000E01A', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $root 'outside.xlsx') -CandidatePath (Join-Path $root 'outside.xlsx') `
             -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
-    } 'Cloud Files reparse point on a non-directory' 'Cloud Files file reparse description'
+    } 'outside the configured OneDrive exchange boundary' 'Cloud Files file boundary rejection'
+    Assert-Throws {
+        Assert-HerdrAllowedReparsePoint -ReparseTag ([Convert]::ToUInt32('9000001B', 16)) -IsDirectory:$false `
+            -ComponentPath (Join-Path $inbox 'unknown.xlsx') -CandidatePath (Join-Path $inbox 'unknown.xlsx') `
+            -AllowedCloudFilesRoot $oneDriveExchange | Out-Null
+    } 'Refusing' 'unrecognized file reparse rejection'
     [IO.File]::WriteAllBytes($source, $sourceBytes)
 
     $result = Invoke-HerdrReviewStaging -SourcePath $source -JobId 'job-001' `

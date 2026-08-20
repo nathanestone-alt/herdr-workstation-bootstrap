@@ -687,12 +687,15 @@ function Assert-HerdrAllowedReparsePoint {
     else {
         'unrecognized'
     }
-    if (-not $IsDirectory) {
-        throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
-    }
     if (-not $isCloudFilesTag) {
+        if (-not $IsDirectory) {
+            throw "Refusing $tagDescription reparse point on a non-directory path component: '$ComponentPath'."
+        }
         throw "Refusing $tagDescription reparse point with tag 0x{0:x8}: '$ComponentPath'." -f $ReparseTag
     }
+    # A recognized Cloud Files file leaf is permitted only inside the explicit
+    # boundary below; symbolic links, junctions, mount points, and unknown
+    # reparse tags remain denied by the branch above.
     if ([string]::IsNullOrWhiteSpace($AllowedCloudFilesRoot)) {
         throw "Refusing Cloud Files reparse point outside a configured OneDrive exchange boundary: '$ComponentPath'."
     }

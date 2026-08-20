@@ -51,6 +51,10 @@ Assert-True (Test-HerdrCloudFilesReparseTag -ReparseTag (ConvertTo-TestReparseTa
 Assert-True (Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$true `
         -ComponentPath $syntheticComponent -CandidatePath $syntheticCandidate -AllowedCloudFilesRoot $syntheticBoundary) `
     'The accepted Cloud Files directory case was not allowed beneath its configured boundary.'
+Assert-True (Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$false `
+        -ComponentPath (Join-Path $syntheticCandidate 'workbook.xlsx') `
+        -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') -AllowedCloudFilesRoot $syntheticBoundary) `
+    'Cloud Files file acceptance beneath its configured boundary failed.'
 foreach ($tagCase in @(
     [pscustomobject]@{ Name = 'symbolic link'; Tag = ConvertTo-TestReparseTag 'A000000C' },
     [pscustomobject]@{ Name = 'junction'; Tag = ConvertTo-TestReparseTag 'A0000003' },
@@ -65,14 +69,19 @@ foreach ($tagCase in @(
 }
 Assert-Throws {
     Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$false `
-        -ComponentPath (Join-Path $syntheticCandidate 'workbook.xlsx') -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') `
+        -ComponentPath 'C:\Users\natha\OneDrive\Other\workbook.xlsx' -CandidatePath 'C:\Users\natha\OneDrive\Other\workbook.xlsx' `
         -AllowedCloudFilesRoot $syntheticBoundary | Out-Null
-} 'Cloud Files reparse point on a non-directory' 'Cloud Files file rejection'
+} 'Cloud Files reparse point outside' 'Cloud Files file boundary rejection'
 Assert-Throws {
     Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$true `
         -ComponentPath $syntheticComponent -CandidatePath 'C:\Users\natha\OneDrive\Other' `
         -AllowedCloudFilesRoot $syntheticBoundary | Out-Null
 } 'outside the configured' 'Cloud Files boundary escape'
+Assert-Throws {
+    Assert-HerdrAllowedReparsePoint -ReparseTag (ConvertTo-TestReparseTag '9000E01A') -IsDirectory:$false `
+        -ComponentPath (Join-Path $syntheticCandidate 'workbook.xlsx') `
+        -CandidatePath (Join-Path $syntheticCandidate 'workbook.xlsx') | Out-Null
+} 'configured OneDrive exchange boundary' 'Cloud Files file no-boundary rejection'
 
 $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-path-policy-$([Guid]::NewGuid().ToString('N'))"
 $junctionTarget = Join-Path $fixtureRoot 'target'
