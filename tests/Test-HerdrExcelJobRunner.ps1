@@ -261,6 +261,18 @@ try {
     foreach ($required in @('AutomationSecurity = 3', 'AskToUpdateLinks = $false', 'EnableRefresh = $false', 'RefreshOnFileOpen = $false', 'Workbooks.Open($InputPath, 0, $false)', 'SaveCopyAs', 'canonical_workbook_mutated')) {
         Assert-True ($runnerText.Contains($required, [StringComparison]::Ordinal)) "Excel canary marker is missing: $required"
     }
+    Assert-True (-not $runnerText.Contains('$workbook.Calculate()', [StringComparison]::Ordinal)) `
+        'Workbook-level Calculate is invalid and must not return.'
+    $connectionIndex = $runnerText.IndexOf('Disable-HerdrExcelConnections -Workbook $workbook', [StringComparison]::Ordinal)
+    $calculateIndex = $runnerText.IndexOf('$excel.Calculate()', [StringComparison]::Ordinal)
+    $postCalculateIdentityIndex = if ($calculateIndex -ge 0) {
+        $runnerText.IndexOf('Assert-HerdrExcelProcessIdentity -Excel $excel', $calculateIndex, [StringComparison]::Ordinal)
+    }
+    else { -1 }
+    $saveCopyIndex = $runnerText.IndexOf('$workbook.SaveCopyAs($ResultPath)', [StringComparison]::Ordinal)
+    Assert-True ($connectionIndex -ge 0 -and $calculateIndex -gt $connectionIndex -and
+        $postCalculateIdentityIndex -gt $calculateIndex -and $saveCopyIndex -gt $postCalculateIdentityIndex) `
+        'Application-level Excel calculation call or ordering is missing.'
     foreach ($forbidden in @('RefreshAll', 'Invoke-Expression', 'Start-Process', 'TrustedLocation', 'RunAutoMacros', '$workbook.UpdateLinks = 0')) {
         Assert-True (-not $runnerText.Contains($forbidden, [StringComparison]::Ordinal)) "Excel canary regression marker is present: $forbidden"
     }
