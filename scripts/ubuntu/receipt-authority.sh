@@ -202,7 +202,7 @@ probe_role_version() {
     pwsh) [[ "$first" == PowerShell\ * ]] || fail "unexpected PowerShell version output: $first" ;;
     rtk) [[ "$first" =~ ^rtk\ [0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "unexpected RTK version output: $first" ;;
   esac
-  printf '%s\t%s\t%s' "$first" "$(version_output_sha256 "$output")" "$output"
+  printf '%s\t%s\t%s\n' "$first" "$(version_output_sha256 "$output")" "$output"
 }
 
 declare -A role_version role_version_hash role_version_output
