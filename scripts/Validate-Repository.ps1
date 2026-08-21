@@ -51,6 +51,7 @@ if ($bashCandidates) {
         'tests\test-verify-vps-access.sh',
         'tests\test-verify-path.sh',
         'tests\test-python-toolchain.sh',
+        'tests\test-receipt-authority.sh',
         'tests\test-install-payload.sh'
     )) {
         $testPath = Join-Path $RepoRoot $relativeTest
@@ -148,6 +149,7 @@ $requiredFiles = @(
     'scripts\windows\New-HerdrExchangeShare.ps1',
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
     'scripts\ubuntu\configure-excel-share.sh',
+    'scripts\ubuntu\receipt-authority.sh',
     'tests\test-bootstrap-profile.sh',
     'tests\test-configure-excel-share-inputs.sh',
     'tests\test-configure-vps-client.sh',
@@ -161,8 +163,10 @@ $requiredFiles = @(
     'tests\Test-BootstrapVmDispatcher.ps1',
     'tests\Test-HostOwnedAclPolicy.ps1',
     'config\ubuntu-toolchain.lock',
+    'config\receipt-authority-role-allowlist.txt',
     'config\payload-manifest.sha256',
     'tests\test-python-toolchain.sh',
+    'tests\test-receipt-authority.sh',
     'tests\test-install-payload.sh',
     'legacy\WSL2-FALLBACK.md'
 )

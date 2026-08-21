@@ -313,6 +313,93 @@ fence_replace_file() {
   if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
 }
 
+fence_replace_python_launcher() {
+  local source="$1"
+  local target_path="$2"
+  local phase="$3"
+  local expected_fd="${4:-}"
+  local managed_root="$5"
+  local fd
+  local anchor
+  local parent
+  local existing_real
+  local owns_fd=0
+  if [[ -n "$expected_fd" ]]; then
+    fence_open_parent "$target_path" fd anchor parent "$expected_fd"
+  else
+    fence_open_parent "$target_path" fd anchor parent
+    owns_fd=1
+  fi
+  fence_require_parent "$parent" "$fd" "Python launcher parent for $target_path"
+  [[ -f "$source" && ! -L "$source" ]] || {
+    if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+    echo "Python launcher source is not a regular file: $source" >&2
+    exit 24
+  }
+  if [[ -L "$anchor" ]]; then
+    existing_real="$(realpath -e -- "$target_path" 2>/dev/null || true)"
+    [[ "$existing_real" == "$managed_root"/python/*/bin/python3.13 ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Refusing to replace an unmanaged Python launcher symlink: $target_path" >&2
+      exit 24
+    }
+  elif [[ -e "$anchor" && ! -f "$anchor" ]]; then
+    if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+    echo "Refusing to replace a non-file Python launcher: $target_path" >&2
+    exit 24
+  fi
+  chmod 0755 "$source"
+  bootstrap_test_pause "$phase"
+  fence_require_parent "$parent" "$fd" "Python launcher parent for $target_path"
+  mv -T -- "$source" "$anchor"
+  fence_require_parent "$parent" "$fd" "Python launcher parent for $target_path"
+  [[ -f "$anchor" && ! -L "$anchor" ]] || {
+    if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+    echo "Python launcher publication did not produce a regular file: $target_path" >&2
+    exit 24
+  }
+  if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+}
+
+fence_remove_managed_link() {
+  local source="$1"
+  local target_path="$2"
+  local phase="$3"
+  local expected_fd="${4:-}"
+  local fd
+  local anchor
+  local parent
+  local expected_real
+  local actual_real
+  local owns_fd=0
+  if [[ -n "$expected_fd" ]]; then
+    fence_open_parent "$target_path" fd anchor parent "$expected_fd"
+  else
+    fence_open_parent "$target_path" fd anchor parent
+    owns_fd=1
+  fi
+  fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
+  if [[ -e "$anchor" || -L "$anchor" ]]; then
+    [[ -L "$anchor" ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Refusing to replace a non-managed alias: $target_path" >&2
+      exit 24
+    }
+    expected_real="$(realpath -e -- "$source" 2>/dev/null || true)"
+    actual_real="$(realpath -e -- "$target_path" 2>/dev/null || true)"
+    [[ -n "$expected_real" && "$actual_real" == "$expected_real" ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Refusing to remove an unmanaged alias: $target_path" >&2
+      exit 24
+    }
+    bootstrap_test_pause "$phase"
+    fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
+    rm -f -- "$anchor"
+  fi
+  fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
+  if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+}
+
 validate_toolchain_lock() {
   for lock_hash_key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
     [[ "${!lock_hash_key:-}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -527,6 +614,7 @@ EOF
 install_python_toolchain() {
   local state_fd
   local bin_fd
+  local local_dir_fd
   local uv_parent_fd
   local uv_version_parent_fd
   local python_parent_fd
@@ -538,8 +626,12 @@ install_python_toolchain() {
   local python_dir_anchor
   local uv_dir_parent
   local python_dir_parent
+  local bin_dir_anchor
+  local local_dir_anchor
   local uv_runtime_real
   local python_runtime_real
+  local python_launcher_stage=''
+  local python_venv_stage=''
   validate_toolchain_lock || exit 22
   validate_platform || exit 20
 
@@ -550,14 +642,19 @@ install_python_toolchain() {
   python_dir="$python_parent/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
   validate_managed_paths \
     "$state_dir" "$bin_dir" "$managed_root" "$uv_parent" "$python_parent" \
-    "$uv_dir" "$uv_dir/uv" "$python_dir" "$python_dir/bin" "$python_dir/bin/python3.13" || {
+    "$uv_dir" "$uv_dir/uv" "$python_dir" "$python_dir/bin" "$python_dir/bin/python3.13" \
+    "$HOME/.local" "$HOME/.local/pyvenv.cfg" || {
       echo 'Managed Python toolchain paths are unsafe.' >&2
       exit 24
     }
   fence_open_directory "$state_dir" state_fd
   fence_open_directory "$bin_dir" bin_fd
+  fence_open_directory "$HOME/.local" local_dir_fd
   fence_require_directory "$state_dir" "$state_fd" 'toolchain state directory'
   fence_require_directory "$bin_dir" "$bin_fd" 'toolchain bin directory'
+  fence_require_directory "$HOME/.local" "$local_dir_fd" 'local directory'
+  bin_dir_anchor="/proc/self/fd/$bin_fd"
+  local_dir_anchor="/proc/self/fd/$local_dir_fd"
   bootstrap_test_pause before-toolchain-directory-mutations
   fence_open_directory "$uv_parent" uv_parent_fd
   uv_parent_anchor="/proc/self/fd/$uv_parent_fd"
@@ -632,8 +729,20 @@ install_python_toolchain() {
   python_runtime_real="$(realpath -e -- "$python_dir/bin/python3.13" 2>/dev/null || true)"
   path_is_under "$uv_runtime_real" "$home_real" || { echo 'uv runtime escaped the managed HOME.' >&2; exit 24; }
   path_is_under "$python_runtime_real" "$home_real" || { echo 'Python runtime escaped the managed HOME.' >&2; exit 24; }
+  [[ -f "$python_runtime_real" && ! -L "$python_runtime_real" ]] || { echo 'Managed Python runtime is not a regular file.' >&2; exit 24; }
   fence_replace_link "$uv_runtime_real" "$bin_dir/uv" before-uv-link-publish "$bin_fd"
-  fence_replace_link "$python_runtime_real" "$bin_dir/python3.13" before-python-link-publish "$bin_fd"
+  python_launcher_stage="$(mktemp "$bin_dir_anchor/.python3.13.XXXXXX")"
+  install -m 0755 -- "$python_runtime_real" "$python_launcher_stage"
+  fence_replace_python_launcher "$python_launcher_stage" "$bin_dir/python3.13" before-python-link-publish "$bin_fd" "$managed_root"
+  python_launcher_stage=''
+  python_venv_stage="$(mktemp "$local_dir_anchor/.pyvenv.cfg.XXXXXX")"
+  cat > "$python_venv_stage" <<EOF
+home = $python_dir
+include-system-site-packages = false
+version = $PYTHON_VERSION
+EOF
+  fence_replace_file "$python_venv_stage" "$HOME/.local/pyvenv.cfg" 0644 before-python-venv-config-publish "$local_dir_fd"
+  python_venv_stage=''
   write_py_compat "$bin_fd"
   check_uv_version "$bin_dir/uv" || { echo 'Managed uv failed its final version check.' >&2; exit 24; }
   check_python_version "$bin_dir/python3.13" && check_python_platform "$bin_dir/python3.13" || {
@@ -650,6 +759,7 @@ install_python_toolchain() {
   close_fence_fd "$uv_version_parent_fd"
   close_fence_fd "$uv_parent_fd"
   close_fence_fd "$python_parent_fd"
+  close_fence_fd "$local_dir_fd"
   close_fence_fd "$state_fd"
   close_fence_fd "$bin_fd"
 }
@@ -876,11 +986,15 @@ install_tools() {
   done
   cargo_home="${CARGO_HOME:-$HOME/.cargo}"
   cargo_install_root="${CARGO_INSTALL_ROOT:-$cargo_home}"
+  [[ "$cargo_install_root" == "$HOME/.cargo" ]] || {
+    echo "RTK must use the canonical cargo root '$HOME/.cargo', got '$cargo_install_root'." >&2
+    exit 24
+  }
   [[ -x "$cargo_install_root/bin/rtk" ]] || {
     echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
     exit 24
   }
-  fence_replace_link "$cargo_install_root/bin/rtk" "$bin_dir/rtk" before-rtk-link-publish "$bin_fd"
+  fence_remove_managed_link "$cargo_install_root/bin/rtk" "$bin_dir/rtk" before-rtk-alias-removal "$bin_fd"
 
   profile_script_tmp="$(mktemp)"
   {
@@ -946,6 +1060,9 @@ install_tools() {
   [[ "$(bun --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
   [[ "$(herdr --version | awk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
 
+  sudo -- "$repo_root/scripts/ubuntu/receipt-authority.sh" \
+    --install --source-root "$repo_root" --user-home "$HOME"
+
   manifest="$state_dir/toolchain-manifest.txt"
   manifest_tmp="$(mktemp "$state_anchor/.toolchain-manifest.XXXXXX")"
   {
@@ -955,6 +1072,9 @@ install_tools() {
     printf 'host_architecture=%s\n' "$(uname -m)"
     printf 'uv_path=%s\n' "$bin_dir/uv"
     printf 'python3.13_path=%s\n' "$bin_dir/python3.13"
+    printf 'python3.13_kind=%s\n' 'regular-file'
+    printf 'python3.13_sha256=%s\n' "$(sha256sum "$bin_dir/python3.13" | awk '{print $1}')"
+    printf 'python3.13_pyvenv_cfg=%s\n' "$HOME/.local/pyvenv.cfg"
     printf 'py_path=%s\n' "$bin_dir/py"
     printf 'uv_version=%s\n' "$("$bin_dir/uv" --version)"
     printf 'uv_url=%s\n' "$UV_URL"
@@ -979,6 +1099,8 @@ install_tools() {
     printf 'bun=%s\n' "$(bun --version)"
     printf 'herdr=%s\n' "$(herdr --version)"
     printf 'powershell=%s\n' "$(pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
+    printf 'receipt_authority_path=%s\n' '/etc/stmodel/issue-961/receipt-authority.json'
+    printf 'receipt_authority_sha256=%s\n' "$(sha256sum /etc/stmodel/issue-961/receipt-authority.json | awk '{print $1}')"
     dpkg-query -W -f='apt:${binary:Package}=${Version}\n' \
       cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
   } > "$manifest_tmp"

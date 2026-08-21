@@ -1,0 +1,7 @@
+# role|registry_id|names|version_argv|implementation
+bash|bash-host-tool-v1|bash,bash.exe|--version|Bash
+git|git-host-tool-v1|git,git.exe|--version|Git
+gh|github-cli-host-tool-v1|gh,gh.exe|--version|GitHub CLI
+node|node-host-tool-v1|node,node.exe|--version|Node.js
+pwsh|powershell-host-tool-v1|pwsh,pwsh.exe|--version|PowerShell
+rtk|rtk-host-tool-v1|rtk,rtk.exe|--version|RTK

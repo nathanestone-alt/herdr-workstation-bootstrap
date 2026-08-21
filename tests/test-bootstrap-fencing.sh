@@ -35,9 +35,10 @@ fence_replace_file "$generic_file_source" "$HOME/.local/bin/generic-file" 0644 b
   exit 1
 }
 
-# Exercise the managed toolchain's expected-fd link publication and exact
+# Exercise the managed toolchain's expected-fd Python migration and exact
 # python3.13/py compatibility seam without downloads or a real HOME.
-managed_python="$HOME/.local/lib/herdr-workstation/python3.13"
+managed_python="$HOME/.local/lib/herdr-workstation/python/test/bin/python3.13"
+mkdir -p "$(dirname "$managed_python")"
 cat > "$managed_python" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -49,13 +50,16 @@ printf '%s\n' "$@" > "$HOME/forwarded-args"
 exit "${PYTHON_STUB_EXIT:-0}"
 EOF
 chmod 0755 "$managed_python"
+ln -s "$managed_python" "$HOME/.local/bin/python3.13"
+python_launcher_stage="$(mktemp "$HOME/.local/bin/.python3.13.XXXXXX")"
+cp "$managed_python" "$python_launcher_stage"
 managed_bin_fd=''
 fence_open_directory "$HOME/.local/bin" managed_bin_fd
-fence_replace_link "$managed_python" "$HOME/.local/bin/python3.13" before-python-link-publish "$managed_bin_fd"
+fence_replace_python_launcher "$python_launcher_stage" "$HOME/.local/bin/python3.13" before-python-link-publish "$managed_bin_fd" "$HOME/.local/lib/herdr-workstation"
 fence_require_directory "$HOME/.local/bin" "$managed_bin_fd" 'test managed bin'
 close_fence_fd "$managed_bin_fd"
-[[ "$(readlink "$HOME/.local/bin/python3.13")" == "$managed_python" ]] || {
-  echo 'Managed python3.13 link target changed.' >&2
+[[ -f "$HOME/.local/bin/python3.13" && ! -L "$HOME/.local/bin/python3.13" ]] || {
+  echo 'Managed python3.13 launcher was not migrated to a regular file.' >&2
   exit 1
 }
 
