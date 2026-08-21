@@ -60,16 +60,17 @@ while IFS= read -r bootstrap_env_name; do
   esac
 done < <(compgen -e)
 
-bootstrap_reexec_committed_entrypoint() {
-  if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_BOOTSTRAP_TRUSTED_LAUNCHER:-}" != 1 ]]; then
-    echo 'bootstrap must be launched through the installed trusted launcher' >&2
-    exit 24
-  fi
-}
-bootstrap_reexec_committed_entrypoint "$@"
-if [[ "${HERDR_BOOTSTRAP_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
-  trap '/usr/bin/rm -rf -- "$HERDR_BOOTSTRAP_ENTRYPOINT_TEMP"' EXIT
-fi
+bootstrap_capability_entry_path="$($bootstrap_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+bootstrap_capability_entry_dir="${bootstrap_capability_entry_path%/*}"
+bootstrap_capability_repo_root="$($bootstrap_realpath_bin -e -- "$bootstrap_capability_entry_dir/../.." 2>/dev/null || true)"
+bootstrap_capability_helper="$bootstrap_capability_repo_root/scripts/ubuntu/launcher-capability.sh"
+[[ "$bootstrap_capability_entry_path" == "$bootstrap_capability_repo_root/scripts/ubuntu/bootstrap.sh" &&
+  -f "$bootstrap_capability_helper" && ! -L "$bootstrap_capability_helper" ]] ||
+  { echo 'bootstrap capability helper is not in the staged repository' >&2; exit 24; }
+# shellcheck disable=SC1090
+launcher_capability_entry_source="$bootstrap_capability_entry_path"
+source "$bootstrap_capability_helper" bootstrap
+launcher_capability_lifetime
 unset BASH_ENV ENV CDPATH GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG_PARAMETERS
 while IFS= read -r bootstrap_env_name; do
@@ -127,9 +128,6 @@ declare -a bootstrap_cleanup_paths=()
 bootstrap_register_cleanup() {
   [[ -n "${1:-}" ]] && bootstrap_cleanup_paths+=("$1")
 }
-if [[ "${HERDR_BOOTSTRAP_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
-  bootstrap_register_cleanup "$HERDR_BOOTSTRAP_ENTRYPOINT_TEMP"
-fi
 
 bootstrap_private_helper_dir=''
 bootstrap_cleanup() {
@@ -259,15 +257,9 @@ bootstrap_exec_cargo() {
   return "$bootstrap_cargo_status"
 }
 
-if [[ "${HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
-  bootstrap_repo_root="${HERDR_BOOTSTRAP_REPO_ROOT:-}"
-  bootstrap_script_path="$bootstrap_repo_root/scripts/ubuntu/bootstrap.sh"
-  bootstrap_script_dir="$bootstrap_repo_root/scripts/ubuntu"
-else
-  bootstrap_script_path="$($bootstrap_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-  bootstrap_script_dir="$($bootstrap_dirname_bin -- "$bootstrap_script_path")"
-  bootstrap_repo_root="$($bootstrap_realpath_bin -e -- "$bootstrap_script_dir/../.." 2>/dev/null || true)"
-fi
+bootstrap_repo_root="$launcher_capability_repo_root"
+bootstrap_script_path="$launcher_capability_entry_path"
+bootstrap_script_dir="$bootstrap_repo_root/scripts/ubuntu"
 [[ -n "$bootstrap_script_path" && "$bootstrap_script_path" == "$bootstrap_repo_root/scripts/ubuntu/bootstrap.sh" ]] || {
   bootstrap_trust_fail 'bootstrap entrypoint is not at the canonical repository path'
 }
@@ -359,8 +351,8 @@ done
 
 declare -a bootstrap_git_bound_paths=()
 declare -A bootstrap_git_bound_identities=()
-bootstrap_git_owner_uid="${HERDR_BOOTSTRAP_GIT_OWNER_UID:-$($bootstrap_id_bin -u)}"
-bootstrap_git_owner_gid="${HERDR_BOOTSTRAP_GIT_OWNER_GID:-$($bootstrap_id_bin -g)}"
+bootstrap_git_owner_uid="$launcher_capability_owner_uid"
+bootstrap_git_owner_gid="$launcher_capability_owner_gid"
 [[ "$bootstrap_git_owner_uid" =~ ^[0-9]+$ && "$bootstrap_git_owner_gid" =~ ^[0-9]+$ ]] || bootstrap_trust_fail 'bootstrap Git owner binding is not numeric'
 bootstrap_bind_git_path() {
   local path="$1" owner group mode identity
@@ -482,6 +474,7 @@ bootstrap_git_shallow="$(bootstrap_trust_git rev-parse --is-shallow-repository 2
 
 bootstrap_commit="$(bootstrap_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading HEAD'
 [[ "$bootstrap_commit" =~ ^[0-9a-f]{40}$ ]] || bootstrap_trust_fail 'bootstrap HEAD is not a full committed object'
+[[ "$bootstrap_commit" == "$launcher_capability_policy_commit" ]] || bootstrap_trust_fail 'bootstrap HEAD does not equal the approved policy commit'
 bootstrap_trust_git cat-file -e "$bootstrap_commit^{commit}" || bootstrap_trust_fail 'bootstrap HEAD object is unavailable'
 bootstrap_helper_tree="$(bootstrap_trust_git ls-tree "$bootstrap_commit" -- scripts/ubuntu/source-attestation.sh 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading the committed helper tree'
 [[ "$bootstrap_helper_tree" != *$'\n'* ]] || bootstrap_trust_fail 'bootstrap helper tree lookup was ambiguous'
@@ -513,6 +506,8 @@ bootstrap_private_helper_sha256="$($bootstrap_sha256_bin -- "$bootstrap_private_
 [[ "$bootstrap_private_helper_sha256" =~ ^[0-9a-f]{64}$ ]] || bootstrap_trust_fail 'materialized helper hash is invalid'
 
 # shellcheck disable=SC1090
+attestation_capability_owner_uid="$launcher_capability_owner_uid"
+attestation_capability_owner_gid="$launcher_capability_owner_gid"
 source "$bootstrap_private_helper"
 attestation_create_git_snapshot "$bootstrap_repo_root" '' '' || {
   echo 'Bootstrap source checkout failed exact committed-blob attestation.' >&2
@@ -775,11 +770,55 @@ install_receipt_from_snapshots() {
     expected_payload_sha="$1"
     expected_source_helper_sha="$2"
     managed_user_home="$3"
+    policy_path=/etc/herdr-workstation/bootstrap-policy.conf
+    [[ -f "$policy_path" && ! -L "$policy_path" &&
+      "$(/usr/bin/realpath -e -- "$policy_path" 2>/dev/null || true)" == "$policy_path" ]] || exit 24
+    for policy_component in /etc /etc/herdr-workstation; do
+      [[ ! -L "$policy_component" && -d "$policy_component" ]] || exit 24
+      [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_component")" == 0:0:755 ]] || exit 24
+    done
+    [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_path")" == 0:0:600 ]] || exit 24
+    exec 9<"$policy_path"
+    policy_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/9)"
+    [[ "$policy_identity" =~ ^[0-9]+:[0-9]+:0:0:600:regular[[:space:]]file$ ]] || exit 24
+    policy_header_count=0
+    policy_origin_count=0
+    policy_commit_count=0
+    policy_origin=''
+    policy_commit=''
+    while IFS= read -r policy_line; do
+      case "$policy_line" in
+        herdr-bootstrap-policy-v1) ((policy_header_count += 1)) ;;
+        origin=*)
+          ((policy_origin_count += 1))
+          [[ -z "$policy_origin" ]] || exit 24
+          policy_origin="${policy_line#origin=}"
+          ;;
+        commit=*)
+          ((policy_commit_count += 1))
+          [[ -z "$policy_commit" ]] || exit 24
+          policy_commit="${policy_line#commit=}"
+          ;;
+        *) exit 24 ;;
+      esac
+    done < /proc/$BASHPID/fd/9
+    [[ "$policy_header_count" == 1 && "$policy_origin_count" == 1 &&
+      "$policy_commit_count" == 1 && "$policy_commit" =~ ^[0-9a-f]{40}$ &&
+      "$policy_origin" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*\.git$ &&
+      "$policy_origin" != *..* && "$policy_origin" != *@* ]] || exit 24
     stage="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-payload.XXXXXX)"
     cleanup_root_payload() { /usr/bin/rm -rf -- "$stage"; }
     trap cleanup_root_payload EXIT
     /usr/bin/tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions
     /usr/bin/chown -R --no-dereference 0:0 -- "$stage"
+    exec 10<"$stage"
+    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/10)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
+    [[ -f /usr/local/libexec/herdr-workstation-bootstrap &&
+      ! -L /usr/local/libexec/herdr-workstation-bootstrap &&
+      "$(/usr/bin/realpath -e -- /usr/local/libexec/herdr-workstation-bootstrap 2>/dev/null || true)" == /usr/local/libexec/herdr-workstation-bootstrap &&
+      "$(/usr/bin/stat -c '%u:%g:%a' -- /usr/local/libexec/herdr-workstation-bootstrap)" == 0:0:755 ]] || exit 24
+    exec 11</usr/local/libexec/herdr-workstation-bootstrap
+    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/11)" =~ ^[0-9]+:[0-9]+:0:0:755:regular[[:space:]]file$ ]] || exit 24
     [[ -f "$stage/.payload-manifest" && ! -L "$stage/.payload-manifest" ]] || exit 24
     root_verify_payload() {
       local root="$1" manifest="$2" expected_hash="$3" expected_commit="$4"
@@ -837,7 +876,7 @@ install_receipt_from_snapshots() {
         [[ -f "$full" && ! -L "$full" ]] || return 1
       done
     }
-    root_verify_payload "$stage" "$stage/.payload-manifest" "$expected_payload_sha" "$4" || exit 24
+    root_verify_payload "$stage" "$stage/.payload-manifest" "$expected_payload_sha" "$policy_commit" || exit 24
     [[ "$(/usr/bin/sha256sum -- "$stage/source/scripts/ubuntu/source-attestation.sh" | /usr/bin/gawk "{print \$1}")" == "$expected_source_helper_sha" ]] || exit 24
     # The standalone root verifier binds the payload manifest and source
     # commit before the helper is sourced.  The helper then rechecks every
@@ -846,7 +885,6 @@ install_receipt_from_snapshots() {
     source "$stage/source/scripts/ubuntu/source-attestation.sh"
     attestation_reject_git_environment
     attestation_verify_payload_manifest "$stage" "$stage/.payload-manifest" "$expected_payload_sha"
-    export HERDR_RECEIPT_VERIFIED_PAYLOAD=1
     exec /usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
       --install \
       --source-root "$stage/source" \
@@ -856,9 +894,9 @@ install_receipt_from_snapshots() {
       --payload-root "$stage" \
       --payload-manifest "$stage/.payload-manifest" \
       --payload-manifest-sha256 "$expected_payload_sha" \
-      --source-commit "$bootstrap_commit" \
+      --source-commit "$policy_commit" \
       --user-home "$managed_user_home"
-  ' -- "$expected_payload_sha" "$expected_source_helper_sha" "$HOME" "$bootstrap_commit"
+  ' -- "$expected_payload_sha" "$expected_source_helper_sha" "$HOME"
   /usr/bin/rm -rf -- "$payload_root"
 }
 
@@ -1462,13 +1500,13 @@ install_locked_tailscale() (
   download_verified "$TAILSCALE_INSTALLER_URL" "$TAILSCALE_INSTALLER_SHA256" "$installer"
   root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-tailscale-root.XXXXXX)"
   if bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
-    "$installer" "$root_stage_dir" "$TAILSCALE_INSTALLER_SHA256" "$TAILSCALE_VERSION" "$real_apt_get" <<'HERDR_TAILSCALE_ROOT'
+    "$installer" "$root_stage_dir" "$TAILSCALE_INSTALLER_SHA256" "$TAILSCALE_VERSION" <<'HERDR_TAILSCALE_ROOT'
 set -euo pipefail
 installer_path="$1"
 stage_dir="$2"
 expected_sha="$3"
 locked_version="$4"
-real_apt_get="$5"
+apt_get_path=/usr/bin/apt-get
 expected_owner="$(/usr/bin/id -u)"
 expected_group="$(/usr/bin/id -g)"
 [[ -d "$stage_dir" && ! -L "$stage_dir" ]] || exit 24
@@ -1477,6 +1515,16 @@ expected_group="$(/usr/bin/id -g)"
   "$(/usr/bin/stat -c '%a' -- "$stage_dir")" =~ ^[0-7]+$ && \
   $((8#$(/usr/bin/stat -c '%a' -- "$stage_dir") & 022)) == 0 ]] || exit 24
 [[ -f "$installer_path" && ! -L "$installer_path" ]] || exit 24
+[[ -x "$apt_get_path" && ! -L "$apt_get_path" &&
+  "$(/usr/bin/realpath -e -- "$apt_get_path" 2>/dev/null || true)" == "$apt_get_path" &&
+  "$(/usr/bin/stat -c '%u:%g:%a' -- "$apt_get_path")" == 0:0:* ]] || exit 24
+[[ "$(/usr/bin/stat -c '%a' -- "$apt_get_path")" =~ ^[0-7]+$ &&
+  $((8#$(/usr/bin/stat -c '%a' -- "$apt_get_path") & 022)) == 0 ]] || exit 24
+exec 8<"$apt_get_path"
+apt_fd_path="/proc/$BASHPID/fd/8"
+apt_fd_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$apt_fd_path")"
+[[ "$(/usr/bin/realpath -e -- "$apt_fd_path" 2>/dev/null || true)" == "$apt_get_path" &&
+  "$apt_fd_identity" == "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$apt_get_path")" ]] || exit 24
 exec {installer_fd}<"$installer_path"
 installer_fd_path="/proc/$BASHPID/fd/$installer_fd"
 installer_id="$(/usr/bin/stat -Lc '%d:%i' -- "$installer_fd_path")"
@@ -1489,8 +1537,12 @@ trap '/usr/bin/rm -rf -- "$stage_dir"' EXIT
 cat >"$stage_dir/apt-get" <<'HERDR_TAILSCALE_SHIM'
 #!/usr/bin/bash
 set -euo pipefail
-real_apt_get="${HERDR_TAILSCALE_REAL_APT_GET:?}"
+apt_fd_path=/proc/self/fd/8
 locked_version="${TAILSCALE_VERSION:?}"
+[[ "$(/usr/bin/realpath -e -- "$apt_fd_path" 2>/dev/null || true)" == /usr/bin/apt-get &&
+  "$(/usr/bin/stat -c '%u:%g:%a' -- "$apt_fd_path")" == 0:0:* &&
+  "$(/usr/bin/stat -c '%a' -- "$apt_fd_path")" =~ ^[0-7]+$ &&
+  $((8#$(/usr/bin/stat -c '%a' -- "$apt_fd_path") & 022)) == 0 ]] || exit 24
 args=("$@")
 has_tailscale_package=0
 for arg in "${args[@]}"; do
@@ -1499,12 +1551,12 @@ done
 if (( has_tailscale_package == 1 )); then
   if [[ "${#args[@]}" -eq 4 && "${args[0]}" == install && "${args[1]}" == -y && \
         "${args[2]}" == "tailscale=$locked_version" && "${args[3]}" == tailscale-archive-keyring ]]; then
-    exec "$real_apt_get" install --allow-downgrades -y "${args[2]}" "${args[3]}"
+    exec "$apt_fd_path" install --allow-downgrades -y "${args[2]}" "${args[3]}"
   fi
   echo 'Unexpected or unlocked Tailscale apt-get invocation.' >&2
   exit 24
 fi
-exec "$real_apt_get" "${args[@]}"
+exec "$apt_fd_path" "${args[@]}"
 HERDR_TAILSCALE_SHIM
 /usr/bin/chmod 0755 -- "$stage_dir/apt-get"
 for object in "$stage_dir/install.sh" "$stage_dir/apt-get"; do
@@ -1515,7 +1567,7 @@ done
 [[ "$(/usr/bin/sha256sum -- "$stage_dir/install.sh" | /usr/bin/gawk '{print $1}')" == "$installer_hash" ]] || exit 24
 [[ "$(/usr/bin/stat -Lc '%d:%i' -- "$installer_path")" == "$installer_id" && \
   "$(/usr/bin/sha256sum -- "$installer_path" | /usr/bin/gawk '{print $1}')" == "$expected_sha" ]] || exit 24
-/usr/bin/env -i PATH="$stage_dir:/usr/sbin:/usr/bin:/sbin:/bin" HERDR_TAILSCALE_REAL_APT_GET="$real_apt_get" TAILSCALE_VERSION="$locked_version" \
+/usr/bin/env -i PATH="$stage_dir:/usr/sbin:/usr/bin:/sbin:/bin" TAILSCALE_VERSION="$locked_version" \
   /usr/bin/dash "$installer_fd_path"
 HERDR_TAILSCALE_ROOT
   then
@@ -1855,7 +1907,7 @@ install_base() {
   bootstrap_test_pause before-base-directory-mutations
   "$sudo_bin" "$apt_get_bin" update
   "$sudo_bin" DEBIAN_FRONTEND=noninteractive "$apt_get_bin" install -y \
-    apt-transport-https build-essential ca-certificates cifs-utils curl git git-lfs gh gnupg jq mosh \
+    apt-transport-https build-essential ca-certificates cifs-utils curl gawk git git-lfs gh gnupg jq mosh \
     openssh-client openssh-server pkg-config ripgrep rsync unzip zip
   PATH='/usr/sbin:/usr/bin:/sbin:/bin' /usr/bin/git lfs install
 
@@ -2118,7 +2170,7 @@ install_tools() {
     printf 'receipt_authority_path=%s\n' '/etc/stmodel/issue-961/receipt-authority.json'
     printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum /etc/stmodel/issue-961/receipt-authority.json | /usr/bin/gawk '{print $1}')"
     /usr/bin/dpkg-query -W -f='apt:${binary:Package}=${Version}\n' \
-      cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+      cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
   } > "$manifest_tmp"
   fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
   mv -T -- "$manifest_tmp" "$state_anchor/toolchain-manifest.txt"

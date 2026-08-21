@@ -9,11 +9,34 @@ readonly verify_find_bin='/usr/bin/find'
 readonly verify_env_bin='/usr/bin/env'
 readonly verify_git_bin='/usr/bin/git'
 export PATH="$verify_trusted_path"
-if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_VERIFY_TRUSTED_LAUNCHER:-}" != 1 && \
-  "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" != 1 ]]; then
-  echo 'verify.sh must be launched through the installed trusted launcher' >&2
-  exit 24
-fi
+verify_reject_dangerous_environment() {
+  local verify_env_name
+  while IFS= read -r verify_env_name; do
+    case "$verify_env_name" in
+      BASH_ENV|ENV|CDPATH)
+        [[ -z "${!verify_env_name:-}" ]] || {
+          echo "verify trust prelude: dangerous caller environment is not permitted: $verify_env_name" >&2
+          exit 24
+        }
+        ;;
+      GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_COMMON_DIR|GIT_CONFIG_*)
+        echo "verify trust prelude: caller Git environment override is not permitted: $verify_env_name" >&2
+        exit 24
+        ;;
+    esac
+  done < <(compgen -e)
+}
+verify_reject_dangerous_environment
+verify_script_path="$($verify_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+verify_script_dir="${verify_script_path%/*}"
+verify_repo_root="$($verify_realpath_bin -e -- "$verify_script_dir/../.." 2>/dev/null || true)"
+verify_capability_helper="$verify_repo_root/scripts/ubuntu/launcher-capability.sh"
+[[ "$verify_script_path" == "$verify_repo_root/scripts/ubuntu/verify.sh" &&
+  -f "$verify_capability_helper" && ! -L "$verify_capability_helper" ]] || exit 24
+# shellcheck disable=SC1090
+launcher_capability_entry_source="$verify_script_path"
+source "$verify_capability_helper" verify
+launcher_capability_lifetime
 if [[ -z "${HOME:-}" ]]; then
   verify_launch_home="$($verify_getent_bin passwd "$($verify_id_bin -u)" 2>/dev/null | /usr/bin/gawk -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
   [[ "$verify_launch_home" == /* && "$verify_launch_home" != '/' ]] || exit 24
@@ -27,19 +50,12 @@ while IFS= read -r verify_env_name; do
       ;;
   esac
 done < <(compgen -e)
-if [[ "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
-  repo_root="${HERDR_VERIFY_REPO_ROOT:-}"
-  verify_script_path="$repo_root/scripts/ubuntu/verify.sh"
-  trap '/usr/bin/rm -rf -- "$HERDR_VERIFY_ENTRYPOINT_TEMP"' EXIT
-else
-  verify_script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
-  repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_script_path")/../..")"
-fi
+repo_root="$launcher_capability_repo_root"
 
 declare -a verify_git_bound_paths=()
 declare -A verify_git_bound_identities=()
-verify_git_owner_uid="${HERDR_VERIFY_GIT_OWNER_UID:-$($verify_id_bin -u)}"
-verify_git_owner_gid="${HERDR_VERIFY_GIT_OWNER_GID:-$($verify_id_bin -g)}"
+verify_git_owner_uid="$launcher_capability_owner_uid"
+verify_git_owner_gid="$launcher_capability_owner_gid"
 [[ "$verify_git_owner_uid" =~ ^[0-9]+$ && "$verify_git_owner_gid" =~ ^[0-9]+$ ]] || exit 24
 verify_bind_git_path() {
   local path="$1" owner group mode identity
@@ -217,39 +233,22 @@ lock_file="$repo_root/config/ubuntu-toolchain.lock"
 # Bind the bootstrap library to the same committed source object before any
 # of its top-level code is sourced.  The live sibling is never executable in
 # this verification path.
-verify_bootstrap_temp="$(/usr/bin/mktemp -d /tmp/herdr-verify-bootstrap.XXXXXX)"
-trap '/usr/bin/rm -rf -- "$verify_bootstrap_temp"' EXIT
-verify_bootstrap_script="$verify_bootstrap_temp/bootstrap.sh"
+verify_bootstrap_script="$repo_root/scripts/ubuntu/bootstrap.sh"
 verify_bootstrap_commit="$(verify_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null)" || exit 24
+[[ "$verify_bootstrap_commit" == "$launcher_capability_policy_commit" ]] || exit 24
 verify_bootstrap_oid="$(verify_trust_git rev-parse --verify "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" 2>/dev/null)" || exit 24
 [[ "$verify_bootstrap_commit" =~ ^[0-9a-f]{40}$ && "$verify_bootstrap_oid" =~ ^[0-9a-f]{40}$ ]] || {
-  /usr/bin/rm -rf -- "$verify_bootstrap_temp"
   echo 'Committed bootstrap object is unavailable.' >&2
   exit 24
 }
-verify_trust_git show "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" > "$verify_bootstrap_script" || {
-    /usr/bin/rm -rf -- "$verify_bootstrap_temp"
-    echo 'Committed bootstrap bytes could not be materialized.' >&2
-    exit 24
-  }
 verify_bootstrap_materialized_oid="$(verify_trust_git hash-object --no-filters --stdin < "$verify_bootstrap_script")"
 [[ "$verify_bootstrap_materialized_oid" == "$verify_bootstrap_oid" ]] || {
-  /usr/bin/rm -rf -- "$verify_bootstrap_temp"
   echo 'Materialized bootstrap bytes differ from the committed object.' >&2
   exit 24
 }
-/usr/bin/chmod 0700 -- "$verify_bootstrap_temp"
 # shellcheck disable=SC1090
-HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 \
-HERDR_BOOTSTRAP_REPO_ROOT="$repo_root" \
-HERDR_BOOTSTRAP_GIT_OWNER_UID="${HERDR_VERIFY_GIT_OWNER_UID:-$(/usr/bin/id -u)}" \
-HERDR_BOOTSTRAP_GIT_OWNER_GID="${HERDR_VERIFY_GIT_OWNER_GID:-$(/usr/bin/id -g)}" \
-HERDR_BOOTSTRAP_ENTRYPOINT_TEMP="$verify_bootstrap_temp" \
 source "$verify_bootstrap_script"
-bootstrap_register_cleanup "$verify_bootstrap_temp"
-if [[ "${HERDR_VERIFY_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
-  bootstrap_register_cleanup "$HERDR_VERIFY_ENTRYPOINT_TEMP"
-fi
+launcher_capability_lifetime
 # Keep the process PATH system-only.  Managed user tools are resolved below
 # through explicitly validated absolute paths instead of a global user-writable
 # PATH prefix.
@@ -488,7 +487,7 @@ append_apt_receipt_expectations() {
  local apt_arch
   local dpkg_query_path
  local -a apt_packages=(
-   cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+   cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
  )
   dpkg_query_path="$(verify_resolve_command dpkg-query 2>/dev/null || true)"
   [[ -n "$dpkg_query_path" ]] || {

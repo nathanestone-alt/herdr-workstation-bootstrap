@@ -18,20 +18,27 @@ expect_failure() {
 }
 
 make_fixture() {
-  local name="$1" pause_kind="${2:-none}"
+  local name="$1" pause_kind="${2:-none}" runtime_uid_arg="${3:-}" runtime_gid_arg="${4:-}"
   fixture_root="$test_root/$name/fixture"
   source_root="$test_root/$name/source"
   fixture_home="$fixture_root/home"
   mkdir -p "$fixture_home" "$source_root/scripts/ubuntu"
   cp -- "$repo_root/scripts/ubuntu/trusted-launcher.sh" "$source_root/scripts/ubuntu/trusted-launcher.sh"
+  cp -- "$repo_root/scripts/ubuntu/launcher-capability.sh" "$source_root/scripts/ubuntu/launcher-capability.sh"
   cat > "$source_root/scripts/ubuntu/bootstrap.sh" <<'EOF'
 #!/usr/bin/bash
 set -euo pipefail
-[[ "${HERDR_BOOTSTRAP_TRUSTED_LAUNCHER:-}" == 1 ]]
-[[ "${HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT:-}" == 1 ]]
+entry_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
+repo_path="$(/usr/bin/realpath -e -- "${entry_path%/*}/../..")"
+source "$repo_path/scripts/ubuntu/launcher-capability.sh" bootstrap
+launcher_capability_lifetime
 : > "$HOME/clean-entrypoint-reached"
+printf '%s\n' "$(/usr/bin/id -u)" > "$HOME/runtime-uid"
+printf '%s\n' "$(/usr/bin/id -g)" > "$HOME/runtime-gid"
+/usr/bin/id -G > "$HOME/runtime-groups"
+/usr/bin/awk '/^NoNewPrivs:/ { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' /proc/self/status > "$HOME/runtime-no-new-privs"
 EOF
-  chmod 0755 "$source_root/scripts/ubuntu/trusted-launcher.sh" "$source_root/scripts/ubuntu/bootstrap.sh"
+  chmod 0755 "$source_root/scripts/ubuntu/"*.sh
   git -C "$source_root" init -q
   git -C "$source_root" config user.email fixture@example.invalid
   git -C "$source_root" config user.name fixture
@@ -43,7 +50,12 @@ EOF
   mkdir -p "$fixture_root"
   git clone -q --bare "$source_root" "$transport"
   chmod 0700 "$transport"
-  install_args=(--source-root "$source_root" --origin "$canonical_origin" --commit "$pinned_commit" --fixture-root "$fixture_root" --fixture-transport "$transport" --fixture-home "$fixture_home")
+  install_args=(--origin "$canonical_origin" --commit "$pinned_commit" --fixture-root "$fixture_root" --fixture-transport "$transport" --fixture-home "$fixture_home")
+  if [[ -n "$runtime_uid_arg" || -n "$runtime_gid_arg" ]]; then
+    [[ -n "$runtime_uid_arg" && -n "$runtime_gid_arg" ]] || fail_test 'root-drop fixture runtime identity is incomplete'
+    chown "$runtime_uid_arg:$runtime_gid_arg" "$fixture_home"
+    install_args+=(--fixture-runtime-uid "$runtime_uid_arg" --fixture-runtime-gid "$runtime_gid_arg")
+  fi
   if [[ "$pause_kind" == policy ]]; then
     policy_ready="$fixture_root/policy.ready"; policy_continue="$fixture_root/policy.continue"
     install_args+=(--fixture-policy-ready "$policy_ready" --fixture-policy-continue "$policy_continue")
@@ -67,7 +79,7 @@ run_launcher() {
 make_fixture clean
 [[ -f "$launcher" && ! -L "$launcher" && -x "$launcher" ]] || fail_test 'launcher was not published as an executable regular file'
 [[ "$(stat -c '%u:%g:%a' "$launcher")" == "$(id -u):$(id -g):755" ]] || fail_test 'fixture launcher owner/mode is wrong'
-[[ "$(stat -c '%u:%g:%a' "$policy")" == "$(id -u):$(id -g):644" ]] || fail_test 'fixture policy owner/mode is wrong'
+[[ "$(stat -c '%u:%g:%a' "$policy")" == "$(id -u):$(id -g):600" ]] || fail_test 'fixture policy owner/mode is wrong'
 [[ "$(stat -c '%u:%g:%a' "$stage_root")" == "$(id -u):$(id -g):755" ]] || fail_test 'fixture staging owner/mode is wrong'
 expect_failure 'second one-time provisioning' /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" "${install_args[@]}"
 
@@ -80,8 +92,15 @@ exit 99
 EOF
   chmod 0755 "$test_root/hostile-bin/$command_name"
 done
+set +e
 run_launcher "$test_root"
-[[ -f "$fixture_home/clean-entrypoint-reached" ]] || fail_test 'verified committed entrypoint did not execute'
+launcher_status=$?
+set -e
+(( launcher_status == 0 )) || fail_test "clean launcher failed with status $launcher_status"
+[[ -f "$fixture_home/clean-entrypoint-reached" ]] || {
+  ls -la "$fixture_home" >&2
+  fail_test 'verified committed entrypoint did not execute'
+}
 for command_name in env bash git realpath stat sha256sum gawk mktemp rm find sleep getent id chmod setpriv; do
   [[ ! -e "$test_root/hostile-$command_name-reached" ]] || fail_test "launcher resolved hostile PATH command: $command_name"
 done
@@ -103,12 +122,25 @@ run_launcher "$forged_root"
 [[ ! -e "$forged_marker" ]] || fail_test 'forged coherent repository entrypoint executed'
 
 dirty_root="$test_root/dirty"; dirty_marker="$test_root/dirty-entrypoint-reached"
-cp -a -- "$forged_root" "$dirty_root"
+cp -a -- "$source_root" "$dirty_root"
 cat >> "$dirty_root/scripts/ubuntu/bootstrap.sh" <<EOF
 : > '$dirty_marker'
 EOF
 run_launcher "$dirty_root"
 [[ ! -e "$dirty_marker" ]] || fail_test 'dirty repository code executed before trust'
+
+direct_attack="$test_root/direct-attack"
+mkdir -p "$direct_attack/scripts/ubuntu"
+{
+  printf '#!/usr/bin/bash\n: > %q\n' "$test_root/direct-before-guard-reached"
+  cat "$source_root/scripts/ubuntu/bootstrap.sh"
+} > "$direct_attack/scripts/ubuntu/bootstrap.sh"
+chmod 0755 "$direct_attack/scripts/ubuntu/bootstrap.sh"
+run_launcher "$direct_attack"
+[[ ! -e "$test_root/direct-before-guard-reached" ]] || fail_test 'attacker code before direct-entrypoint guard ran'
+expect_failure 'direct entrypoint with forged marker' env -i HOME="$fixture_home" PATH=/usr/bin:/bin \
+  HERDR_BOOTSTRAP_TRUSTED_LAUNCHER=1 HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 \
+  /usr/bin/bash "$source_root/scripts/ubuntu/bootstrap.sh"
 
 forged_commit="$(git -C "$forged_root" rev-parse --verify HEAD^{commit})"
 cp -- "$policy" "$test_root/policy.good"
@@ -121,7 +153,7 @@ printf 'herdr-bootstrap-policy-v1\nherdr-bootstrap-policy-v1\norigin=%s\ncommit=
 chmod 0644 "$policy"
 expect_failure 'duplicate policy header' run_launcher "$test_root"
 mv -T -- "$test_root/policy.good" "$policy"
-chmod 0666 "$policy"; expect_failure 'group-writable policy' run_launcher "$test_root"; chmod 0644 "$policy"
+chmod 0666 "$policy"; expect_failure 'group-writable policy' run_launcher "$test_root"; chmod 0600 "$policy"
 chmod 0644 "$launcher"; expect_failure 'non-executable launcher' run_launcher "$test_root"; chmod 0755 "$launcher"
 chmod 0775 "$policy_dir"; expect_failure 'unsafe policy parent mode' run_launcher "$test_root"; chmod 0755 "$policy_dir"
 chmod 0775 "$libexec_dir"; expect_failure 'unsafe launcher parent mode' run_launcher "$test_root"; chmod 0755 "$libexec_dir"
@@ -175,5 +207,33 @@ chmod 0755 "$replacement"; mv -T -- "$replacement" "$staged_entry"; : > "$entry_
 set +e; wait "$entry_race_pid"; entry_race_status=$?; set -e
 (( entry_race_status != 0 )) || fail_test 'entrypoint replacement race was accepted'
 [[ ! -e "$test_root/replacement-entrypoint-reached" ]] || fail_test 'replacement entrypoint executed'
+
+if [[ "$(id -u)" != 0 ]]; then
+  echo "SKIP: root-gated launcher privilege-drop tests (root unavailable; uid=$(id -u))."
+else
+  root_drop_uid="$(id -u nobody 2>/dev/null || true)"
+  root_drop_gid="$(id -g nobody 2>/dev/null || true)"
+  if [[ ! "$root_drop_uid" =~ ^[1-9][0-9]*$ || ! "$root_drop_gid" =~ ^[0-9]+$ ]]; then
+    echo 'SKIP: root-gated launcher privilege-drop tests (nobody account unavailable).'
+  else
+    make_fixture root-drop none "$root_drop_uid" "$root_drop_gid"
+    set +e
+    run_launcher "$test_root"
+    root_drop_status=$?
+    set -e
+    (( root_drop_status == 0 )) || fail_test "root-gated launcher fixture failed with status $root_drop_status"
+    [[ "$(< "$fixture_home/runtime-uid")" == "$root_drop_uid" ]] || fail_test 'launcher did not drop to the fixture uid'
+    [[ "$(< "$fixture_home/runtime-gid")" == "$root_drop_gid" ]] || fail_test 'launcher did not set the fixture gid'
+    [[ "$(tr -d '[:space:]' < "$fixture_home/runtime-groups")" == "$root_drop_gid" ]] || fail_test 'launcher did not clear supplementary groups'
+    [[ "$(< "$fixture_home/runtime-no-new-privs")" == 1 ]] || fail_test 'launcher did not set no_new_privs'
+    [[ "$(stat -c '%u:%g:%a' "$launcher")" == 0:0:755 ]] || fail_test 'root-gated launcher binary is not root-owned'
+    [[ "$(stat -c '%u:%g:%a' "$policy")" == 0:0:600 ]] || fail_test 'root-gated policy is not root-owned and private'
+    [[ "$(stat -c '%u:%g:%a' "$stage_root")" == 0:0:755 ]] || fail_test 'root-gated staging root is not root-owned'
+    chown "$root_drop_uid:$root_drop_gid" "$stage_root"
+    expect_failure 'user-owned staging root' run_launcher "$test_root"
+    chown 0:0 "$stage_root"
+    echo 'Root-gated launcher privilege-drop tests passed.'
+  fi
+fi
 
 echo 'trusted launcher policy, forged-repository, ownership/mode, and replacement tests passed.'

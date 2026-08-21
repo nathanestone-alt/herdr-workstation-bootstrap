@@ -22,8 +22,8 @@ readonly receipt_chown_bin='/usr/bin/chown'
 readonly receipt_setpriv_bin='/usr/bin/setpriv'
 readonly receipt_getent_bin='/usr/bin/getent'
 readonly receipt_id_bin='/usr/bin/id'
-receipt_git_owner_uid="${HERDR_RECEIPT_GIT_OWNER_UID:-$($receipt_id_bin -u)}"
-receipt_git_owner_gid="${HERDR_RECEIPT_GIT_OWNER_GID:-$($receipt_id_bin -g)}"
+receipt_git_owner_uid=''
+receipt_git_owner_gid=''
 declare -a receipt_bound_git_paths=()
 declare -A receipt_bound_git_identities=()
 
@@ -64,27 +64,31 @@ while IFS= read -r receipt_env_name; do
   esac
 done < <(compgen -e)
 
-receipt_reexec_committed_entrypoint() {
-  if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_RECEIPT_TRUSTED_LAUNCHER:-}" != 1 && \
-    "${HERDR_RECEIPT_VERIFIED_PAYLOAD:-}" != 1 ]]; then
-    echo 'receipt authority must be launched through the installed trusted launcher' >&2
-    exit 24
+receipt_capability_payload_mode=0
+receipt_capability_payload_root=''
+receipt_capability_args=("$@")
+for ((receipt_capability_arg_index=0; receipt_capability_arg_index < ${#receipt_capability_args[@]}; receipt_capability_arg_index++)); do
+  if [[ "${receipt_capability_args[$receipt_capability_arg_index]}" == --payload-root ]]; then
+    ((receipt_capability_arg_index + 1 < ${#receipt_capability_args[@]})) ||
+      { echo 'receipt capability: --payload-root requires a value' >&2; exit 24; }
+    receipt_capability_payload_mode=1
+    receipt_capability_payload_root="${receipt_capability_args[$((receipt_capability_arg_index + 1))]}"
+    break
   fi
-  local receipt_arg
-  for receipt_arg in "$@"; do
-    if [[ "$receipt_arg" == --payload-root ]]; then
-      [[ "${HERDR_RECEIPT_VERIFIED_PAYLOAD:-}" == 1 ]] || {
-        echo 'receipt authority trust boundary: payload entrypoint requires the verified root launcher' >&2
-        exit 24
-      }
-      return 0
-    fi
-  done
-}
-receipt_reexec_committed_entrypoint "$@"
-if [[ "${HERDR_RECEIPT_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
-  trap '/usr/bin/rm -rf -- "$HERDR_RECEIPT_ENTRYPOINT_TEMP"' EXIT
-fi
+done
+receipt_capability_entry_path="$($receipt_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+receipt_capability_entry_dir="${receipt_capability_entry_path%/*}"
+receipt_capability_repo_root="$($receipt_realpath_bin -e -- "$receipt_capability_entry_dir/../.." 2>/dev/null || true)"
+receipt_capability_helper="$receipt_capability_repo_root/scripts/ubuntu/launcher-capability.sh"
+[[ "$receipt_capability_entry_path" == "$receipt_capability_repo_root/scripts/ubuntu/receipt-authority.sh" &&
+  -f "$receipt_capability_helper" && ! -L "$receipt_capability_helper" ]] ||
+  { echo 'receipt capability helper is not in the staged repository' >&2; exit 24; }
+# shellcheck disable=SC1090
+launcher_capability_entry_source="$receipt_capability_entry_path"
+source "$receipt_capability_helper" receipt-authority "$receipt_capability_payload_mode" "$receipt_capability_payload_root"
+launcher_capability_lifetime
+receipt_git_owner_uid="$launcher_capability_owner_uid"
+receipt_git_owner_gid="$launcher_capability_owner_gid"
 unset BASH_ENV ENV CDPATH GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG_PARAMETERS
 while IFS= read -r receipt_env_name; do
@@ -518,9 +522,6 @@ declare -a receipt_cleanup_paths=()
 receipt_register_cleanup() {
   [[ -n "${1:-}" ]] && receipt_cleanup_paths+=("$1")
 }
-if [[ "${HERDR_RECEIPT_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
-  receipt_register_cleanup "$HERDR_RECEIPT_ENTRYPOINT_TEMP"
-fi
 
 receipt_private_helper_dir=''
 receipt_cleanup() {
@@ -537,15 +538,9 @@ receipt_cleanup() {
 }
 trap 'receipt_cleanup "$?"' EXIT
 
-if [[ "${HERDR_RECEIPT_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
-  receipt_repo_root="${HERDR_RECEIPT_REPO_ROOT:-}"
-  receipt_script_path="$receipt_repo_root/scripts/ubuntu/receipt-authority.sh"
-  receipt_script_dir="$receipt_repo_root/scripts/ubuntu"
-else
-  receipt_script_path="$($receipt_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-  receipt_script_dir="$($receipt_dirname_bin -- "$receipt_script_path")"
-  receipt_repo_root="$($receipt_realpath_bin -e -- "$receipt_script_dir/../.." 2>/dev/null || true)"
-fi
+receipt_repo_root="$launcher_capability_repo_root"
+receipt_script_path="$launcher_capability_entry_path"
+receipt_script_dir="$receipt_repo_root/scripts/ubuntu"
 [[ -n "$receipt_script_path" && "$receipt_script_path" == "$receipt_repo_root/scripts/ubuntu/receipt-authority.sh" ]] || {
   receipt_trust_fail 'receipt authority entrypoint is not at the canonical repository path'
 }
@@ -613,6 +608,8 @@ else
 fi
 
 # shellcheck disable=SC1090
+attestation_capability_owner_uid="$launcher_capability_owner_uid"
+attestation_capability_owner_gid="$launcher_capability_owner_gid"
 source "$receipt_private_helper"
 if (( receipt_repo_mode == 1 )); then
   attestation_create_git_snapshot "$receipt_repo_root" '' '' || receipt_trust_fail 'receipt entrypoint checkout failed exact committed-blob attestation'
@@ -743,6 +740,8 @@ else
 fi
 source_commit="$attestation_snapshot_commit"
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source snapshot commit is not a full commit'
+[[ "$source_commit" == "$launcher_capability_policy_commit" ]] ||
+  fail 'source snapshot commit does not equal the approved policy commit'
 source_script_path="$source_root/scripts/ubuntu/receipt-authority.sh"
 source_helper_path="$source_root/scripts/ubuntu/source-attestation.sh"
 [[ -f "$source_script_path" && ! -L "$source_script_path" ]] || fail 'source snapshot authority script is missing'
@@ -757,6 +756,7 @@ expected_helper_sha256="$(attestation_snapshot_file_digest "$source_manifest" sc
 if [[ -n "$payload_root" || -n "$payload_manifest_arg" ]]; then
   [[ -n "$payload_root" && -n "$payload_manifest_arg" ]] || fail 'payload root and manifest must be supplied together'
   [[ "$source_commit_binding" == "$receipt_prelude_source_commit" && "$source_commit_binding" =~ ^[0-9a-f]{40}$ ]] || fail 'payload source commit binding is missing or inconsistent'
+  [[ "$source_commit_binding" == "$launcher_capability_policy_commit" ]] || fail 'payload source commit does not equal the approved policy commit'
   payload_root="$(/usr/bin/realpath -e -- "$payload_root" 2>/dev/null || true)"
   payload_manifest_arg="$(/usr/bin/realpath -e -- "$payload_manifest_arg" 2>/dev/null || true)"
   [[ "$payload_manifest_arg" == "$payload_root/.payload-manifest" ]] || fail 'payload manifest is not bound to the payload root'

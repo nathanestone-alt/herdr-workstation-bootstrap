@@ -744,7 +744,7 @@ append_apt_receipt_expectations() {
   local apt_value
   local apt_arch
   local -a apt_packages=(
-    cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+    cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
   )
   for package in "${apt_packages[@]}"; do
     apt_line="$(dpkg-query -W -f='apt:${binary:Package}=${Version}\n' "$package" 2>/dev/null)" || fail_closed "unable to resolve locked APT receipt key: $package"

@@ -14,6 +14,9 @@ readonly launcher_policy_pause_ready='__HERDR_LAUNCHER_POLICY_PAUSE_READY__'
 readonly launcher_policy_pause_continue='__HERDR_LAUNCHER_POLICY_PAUSE_CONTINUE__'
 readonly launcher_entry_pause_ready='__HERDR_LAUNCHER_ENTRY_PAUSE_READY__'
 readonly launcher_entry_pause_continue='__HERDR_LAUNCHER_ENTRY_PAUSE_CONTINUE__'
+readonly launcher_fixture_receipt_pause_phase='__HERDR_LAUNCHER_RECEIPT_PAUSE_PHASE__'
+readonly launcher_fixture_receipt_pause_ready='__HERDR_LAUNCHER_RECEIPT_PAUSE_READY__'
+readonly launcher_fixture_receipt_pause_continue='__HERDR_LAUNCHER_RECEIPT_PAUSE_CONTINUE__'
 readonly launcher_env_bin=/usr/bin/env launcher_bash_bin=/usr/bin/bash launcher_git_bin=/usr/bin/git
 readonly launcher_realpath_bin=/usr/bin/realpath launcher_stat_bin=/usr/bin/stat launcher_sha256_bin=/usr/bin/sha256sum
 readonly launcher_awk_bin=/usr/bin/gawk launcher_mktemp_bin=/usr/bin/mktemp launcher_rm_bin=/usr/bin/rm
@@ -62,15 +65,16 @@ assert_file() {
   [[ $r == "$p" && $o == "$launcher_expected_uid" && $g == "$launcher_expected_gid" && $m =~ ^[0-7]+$ && $((8#$m & 022)) == 0 && ( -z $want || $m == $want ) ]] || fail "unsafe file ownership/mode: $p"
 }
 for b in "$launcher_env_bin" "$launcher_bash_bin" "$launcher_git_bin" "$launcher_realpath_bin" "$launcher_stat_bin" "$launcher_sha256_bin" "$launcher_awk_bin" "$launcher_mktemp_bin" "$launcher_rm_bin" "$launcher_find_bin" "$launcher_sleep_bin" "$launcher_getent_bin" "$launcher_id_bin" "$launcher_chmod_bin" "$launcher_setpriv_bin"; do assert_sysbin "$b"; done
-[[ "$launcher_system_prefix" != __HERDR_LAUNCHER_*__ && "$launcher_expected_uid" =~ ^[0-9]+$ && "$launcher_expected_gid" =~ ^[0-9]+$ && "$launcher_runtime_uid" =~ ^[0-9]+$ && "$launcher_runtime_gid" =~ ^[0-9]+$ && "$launcher_system_uid" =~ ^[0-9]+$ && "$launcher_system_gid" =~ ^[0-9]+$ && "$launcher_fixture_transport" != __HERDR_LAUNCHER_*__ && "$launcher_fixture_home" != __HERDR_LAUNCHER_*__ ]] || fail 'unrendered launcher template'
+[[ "$launcher_system_prefix" != __HERDR_LAUNCHER_*__ && "$launcher_expected_uid" =~ ^[0-9]+$ && "$launcher_expected_gid" =~ ^[0-9]+$ && "$launcher_runtime_uid" =~ ^[0-9]+$ && "$launcher_runtime_gid" =~ ^[0-9]+$ && "$launcher_system_uid" =~ ^[0-9]+$ && "$launcher_system_gid" =~ ^[0-9]+$ && "$launcher_fixture_transport" != __HERDR_LAUNCHER_*__ && "$launcher_fixture_home" != __HERDR_LAUNCHER_*__ && "$launcher_fixture_receipt_pause_phase" != __HERDR_LAUNCHER_*__ && "$launcher_fixture_receipt_pause_ready" != __HERDR_LAUNCHER_*__ && "$launcher_fixture_receipt_pause_continue" != __HERDR_LAUNCHER_*__ ]] || fail 'unrendered launcher template'
 [[ $launcher_system_prefix == '' || $launcher_system_prefix == /* ]] || fail 'invalid system prefix'
 install_path="$(sys_path /usr/local/libexec/herdr-workstation-bootstrap)"; policy_path="$(sys_path /etc/herdr-workstation/bootstrap-policy.conf)"; stage_root="$(sys_path /var/lib/herdr-workstation/bootstrap/staging)"
 policy_dir="$(sys_path /etc/herdr-workstation)"; libexec_dir="$(sys_path /usr/local/libexec)"
 if [[ -n "$launcher_system_prefix" ]]; then assert_dir "$launcher_system_prefix" 755; fi
 assert_dir "$policy_dir" 755; assert_dir "$libexec_dir" 755
 [[ "$($launcher_id_bin -u)" == "$launcher_expected_uid" && "$($launcher_id_bin -g)" == "$launcher_expected_gid" ]] || fail 'launcher must run as the installed trust-anchor owner'
-assert_file "$install_path" 755; assert_file "$policy_path" 644; assert_dir "$stage_root" 755
+assert_file "$install_path" 755; assert_file "$policy_path" 600; assert_dir "$stage_root" 755
 [[ "$($launcher_realpath_bin -e -- "$0" 2>/dev/null || true)" == "$install_path" ]] || fail 'launcher path is not the installed canonical path'
+exec 11<"$install_path" || fail 'installed launcher capability open failed'
 entrypoint=scripts/ubuntu/bootstrap.sh
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -82,7 +86,7 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-policy_pid=$BASHPID; policy_fd=''; policy_fd_path=''; policy_id=''; policy_hash=''; origin=''; commit=''
+policy_pid=$BASHPID; policy_fd_path=''; policy_id=''; policy_hash=''; origin=''; commit=''
 policy_identity() { "$launcher_stat_bin" -Lc '%d:%i:%u:%g:%a' -- "$1" 2>/dev/null || true; }
 policy_lifetime() {
   local fi pi ph
@@ -93,8 +97,8 @@ canonical_origin() {
   [[ "$1" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*\.git$ && "$1" != *..* && "$1" != *@* ]]
 }
 pause_at() { [[ -n $1 ]] || return 0; : > "$1"; while [[ ! -e $2 ]]; do "$launcher_sleep_bin" 0.01; done; }
-exec {policy_fd}<"$policy_path" || fail 'policy open failed'
-policy_fd_path="/proc/$policy_pid/fd/$policy_fd"; policy_id="$(policy_identity "$policy_fd_path")"; policy_hash="$($launcher_sha256_bin -- "$policy_fd_path" | "$launcher_awk_bin" '{print $1}')"
+exec 9<"$policy_path" || fail 'policy open failed'
+policy_fd_path="/proc/$policy_pid/fd/9"; policy_id="$(policy_identity "$policy_fd_path")"; policy_hash="$($launcher_sha256_bin -- "$policy_fd_path" | "$launcher_awk_bin" '{print $1}')"
 [[ $policy_id =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$ && $policy_hash =~ ^[0-9a-f]{64}$ ]] || fail 'invalid policy descriptor'
 hc=0; oc=0; cc=0
 while IFS= read -r line; do
@@ -116,7 +120,8 @@ else
   fetch_source=$origin
 fi
 stage_dir="$($launcher_mktemp_bin -d "$stage_root/.incoming.XXXXXX")" || fail 'staging directory creation failed'
-cleanup() { local s=$1; set +e; [[ -d $stage_dir ]] && "$launcher_rm_bin" -rf -- "$stage_dir"; eval "exec ${policy_fd}<&-" 2>/dev/null || true; return "$s"; }
+exec 10<"$stage_dir" || fail 'staged repository capability open failed'
+cleanup() { local s=$1; set +e; [[ -d $stage_dir ]] && "$launcher_rm_bin" -rf -- "$stage_dir"; exec 9<&- 2>/dev/null || true; exec 10<&- 2>/dev/null || true; exec 11<&- 2>/dev/null || true; return "$s"; }
 trap 'cleanup "$?"' EXIT
 "$launcher_chmod_bin" 0755 -- "$stage_dir" || fail 'staging directory publication failed'
 assert_dir "$stage_dir" 755
@@ -150,10 +155,15 @@ fi
 [[ $home == /* && $home != / && "$launcher_runtime_uid" =~ ^[0-9]+$ && "$launcher_runtime_gid" =~ ^[0-9]+$ ]] || fail 'no safe runtime user home or identity'
 launcher_env_args=(
   HOME="$home" PATH="$launcher_trusted_path" LC_ALL=C TZ=UTC BASH_ENV= ENV=
-  HERDR_BOOTSTRAP_TRUSTED_LAUNCHER=1 HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 HERDR_BOOTSTRAP_REPO_ROOT="$stage_dir" HERDR_BOOTSTRAP_GIT_OWNER_UID="$launcher_expected_uid" HERDR_BOOTSTRAP_GIT_OWNER_GID="$launcher_expected_gid"
-  HERDR_RECEIPT_TRUSTED_LAUNCHER=1 HERDR_RECEIPT_VERIFIED_ENTRYPOINT=1 HERDR_RECEIPT_REPO_ROOT="$stage_dir" HERDR_RECEIPT_GIT_OWNER_UID="$launcher_expected_uid" HERDR_RECEIPT_GIT_OWNER_GID="$launcher_expected_gid"
-  HERDR_VERIFY_TRUSTED_LAUNCHER=1 HERDR_VERIFY_VERIFIED_ENTRYPOINT=1 HERDR_VERIFY_REPO_ROOT="$stage_dir" HERDR_VERIFY_GIT_OWNER_UID="$launcher_expected_uid" HERDR_VERIFY_GIT_OWNER_GID="$launcher_expected_gid"
 )
+if [[ -n "$launcher_fixture_receipt_pause_phase" ]]; then
+  [[ -n "$launcher_fixture_receipt_pause_ready" && -n "$launcher_fixture_receipt_pause_continue" ]] || fail 'fixture receipt pause binding is incomplete'
+  launcher_env_args+=(
+    HERDR_RECEIPT_TEST_PAUSE_PHASE="$launcher_fixture_receipt_pause_phase"
+    HERDR_RECEIPT_TEST_READY_FILE="$launcher_fixture_receipt_pause_ready"
+    HERDR_RECEIPT_TEST_CONTINUE_FILE="$launcher_fixture_receipt_pause_continue"
+  )
+fi
 if [[ "$entrypoint" == scripts/ubuntu/receipt-authority.sh || "$launcher_runtime_uid" == "$launcher_expected_uid" ]]; then
   "$launcher_env_bin" -i "${launcher_env_args[@]}" "$launcher_bash_bin" "$entry_path" "$@"
 else

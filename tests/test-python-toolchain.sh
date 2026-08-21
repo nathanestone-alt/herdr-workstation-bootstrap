@@ -10,58 +10,127 @@ trap 'rm -rf "$test_root"' EXIT
 # function-only regression runnable from a mutable developer checkout by
 # testing the exact current files in a disposable clean Git fixture.
 source_fixture="$test_root/source"
+fixture_root="$test_root/fixture"
+fixture_home="$fixture_root/home"
+transport="$fixture_root/transport.git"
+mkdir -p "$fixture_root" "$fixture_home"
 cp -a -- "$repo_root/." "$source_fixture/"
 chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
+head -n -9 "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
+mv -T "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
+cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
+fixture_set_home() {
+  HOME="$1"
+  state_dir="$HOME/.local/state/herdr-workstation-bootstrap"
+  bin_dir="$HOME/.local/bin"
+}
+fixture_python_main() {
+  local fixture_base_home="$HOME"
+  case "$phase" in
+    validate-lock)
+      validate_toolchain_lock
+      ;;
+    malformed-uv)
+      UV_SHA256=not-a-sha256
+      validate_toolchain_lock
+      ;;
+    malformed-python)
+      PYTHON_VERSION=3.12.0
+      validate_toolchain_lock
+      ;;
+    malformed-tailscale)
+      TAILSCALE_VERSION=not-a-semantic-version
+      validate_toolchain_lock
+      ;;
+    wrong-python)
+      check_python_version "$fixture_base_home/wrong-python"
+      ;;
+    write-py)
+      write_py_compat
+      ;;
+    install-python-local)
+      fixture_set_home "$fixture_base_home/bootstrap-home-local"
+      install_python_toolchain
+      ;;
+    install-python-lib)
+      fixture_set_home "$fixture_base_home/bootstrap-home-lib"
+      install_python_toolchain
+      ;;
+    install-python-bin)
+      fixture_set_home "$fixture_base_home/bootstrap-home-bin"
+      install_python_toolchain
+      ;;
+    install-python-state)
+      fixture_set_home "$fixture_base_home/bootstrap-home-state"
+      install_python_toolchain
+      ;;
+    install-tools-profile)
+      fixture_set_home "$fixture_base_home/bootstrap-home-profile"
+      install_tools
+      ;;
+    write-py-race)
+      fixture_set_home "$fixture_base_home/bootstrap-home-mutation-swap"
+      HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-py-publish
+      HERDR_BOOTSTRAP_TEST_READY_FILE="$fixture_base_home/bootstrap-mutation-swap.ready"
+      HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$fixture_base_home/bootstrap-mutation-swap.continue"
+      export HERDR_BOOTSTRAP_TEST_PAUSE_PHASE HERDR_BOOTSTRAP_TEST_READY_FILE HERDR_BOOTSTRAP_TEST_CONTINUE_FILE
+      write_py_compat
+      ;;
+    *)
+      echo "Unsupported Python fixture phase: $phase" >&2
+      exit 2
+      ;;
+  esac
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  fixture_python_main
+fi
+EOF
+chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
 git -C "$source_fixture" init -q
 git -C "$source_fixture" config user.email fixture@example.invalid
 git -C "$source_fixture" config user.name fixture
 git -C "$source_fixture" add -f .
 git -C "$source_fixture" commit -qm 'clean Python toolchain fixture'
-repo_root="$source_fixture"
-bootstrap_script="$source_fixture/scripts/ubuntu/bootstrap.sh"
-export HOME="$test_root/home"
+git clone -q --bare "$source_fixture" "$transport"
+chmod 0700 "$transport"
+/usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" \
+  --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
+  --commit "$(git -C "$source_fixture" rev-parse --verify HEAD^{commit})" \
+  --fixture-root "$fixture_root" --fixture-transport "$transport" --fixture-home "$fixture_home" \
+  > "$test_root/launcher-install.out"
+launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
+export HOME="$fixture_home"
 mkdir -p "$HOME/.local/bin"
 
-# Source only: none of the download, apt, rust, Node or runtime convergence
-# phases may run in this test.
-# shellcheck disable=SC1091
-source "$bootstrap_script"
-validate_toolchain_lock
+run_fixture_phase() {
+  local phase_name="$1"
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    BASH_ENV= ENV= LC_ALL=C TZ=UTC \
+    "$launcher" --entrypoint bootstrap -- --phase "$phase_name"
+}
 
-saved_uv_sha="$UV_SHA256"
-UV_SHA256=not-a-sha256
-if validate_toolchain_lock; then
-  echo 'Lock validation accepted a malformed uv checksum.' >&2
-  exit 1
-fi
-UV_SHA256="$saved_uv_sha"
+expect_fixture_failure() {
+  local phase_name="$1" output="$test_root/phase-$1.out"
+  set +e
+  run_fixture_phase "$phase_name" > "$output" 2>&1
+  local status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || { echo "$phase_name unexpectedly passed." >&2; exit 1; }
+}
 
-saved_python_version="$PYTHON_VERSION"
-PYTHON_VERSION=3.12.0
-if validate_toolchain_lock; then
-  echo 'Lock validation accepted a non-3.13 Python version.' >&2
-  exit 1
-fi
-PYTHON_VERSION="$saved_python_version"
-
-saved_tailscale_version="$TAILSCALE_VERSION"
-TAILSCALE_VERSION=not-a-semantic-version
-if validate_toolchain_lock; then
-  echo 'Lock validation accepted a malformed Tailscale version.' >&2
-  exit 1
-fi
-TAILSCALE_VERSION="$saved_tailscale_version"
-validate_toolchain_lock
+run_fixture_phase validate-lock
+expect_fixture_failure malformed-uv
+expect_fixture_failure malformed-python
+expect_fixture_failure malformed-tailscale
 
 wrong_python="$test_root/wrong-python"
 printf '#!/usr/bin/env bash\nprintf "Python 3.12.3\\n"\n' > "$wrong_python"
 chmod 0755 "$wrong_python"
-if check_python_version "$wrong_python"; then
-  echo 'Version mismatch seam accepted the wrong Python version.' >&2
-  exit 1
-fi
+cp -- "$wrong_python" "$HOME/wrong-python"
+expect_fixture_failure wrong-python
 
 cat > "$HOME/.local/bin/python3.13" <<'EOF'
 #!/usr/bin/env bash
@@ -75,9 +144,9 @@ exit "${PYTHON_STUB_EXIT:-0}"
 EOF
 chmod 0755 "$HOME/.local/bin/python3.13"
 
-write_py_compat
+run_fixture_phase write-py
 wrapper_hash_before="$(sha256sum "$HOME/.local/bin/py" | awk '{print $1}')"
-write_py_compat
+run_fixture_phase write-py
 wrapper_hash_after="$(sha256sum "$HOME/.local/bin/py" | awk '{print $1}')"
 [[ "$wrapper_hash_before" == "$wrapper_hash_after" ]] || {
   echo 'Managed py wrapper convergence is not idempotent.' >&2
@@ -113,9 +182,10 @@ expect_bootstrap_path_blocked() {
   local home="$2"
   local phase="${3:-install-python}"
   local output="$test_root/bootstrap-$case_name.out"
+  local fixture_phase="install-python-$case_name"
+  [[ "$phase" == install-tools ]] && fixture_phase=install-tools-profile
   set +e
-  HOME="$home" bash -c 'bootstrap_script="$1"; requested_phase="$2"; set --; source "$bootstrap_script"; if [[ "$requested_phase" == install-tools ]]; then install_tools; else install_python_toolchain; fi' \
-    _ "$bootstrap_script" "$phase" > "$output" 2>&1
+  run_fixture_phase "$fixture_phase" > "$output" 2>&1
   local status=$?
   set -e
   [[ "$status" -ne 0 ]] || { echo "$case_name unexpectedly passed." >&2; exit 1; }
@@ -124,7 +194,7 @@ expect_bootstrap_path_blocked() {
 
 make_bootstrap_safety_home() {
   local case_name="$1"
-  local home="$test_root/bootstrap-home-$case_name"
+  local home="$fixture_home/bootstrap-home-$case_name"
   rm -rf "$home"
   mkdir -p "$home"
   printf '%s' "$home"
@@ -175,17 +245,13 @@ expect_bootstrap_path_blocked profile "$bootstrap_profile_home" install-tools
 bootstrap_swap_home="$(make_bootstrap_safety_home mutation-swap)"
 mkdir -p "$bootstrap_swap_home/.local/bin"
 printf 'original py wrapper\n' > "$bootstrap_swap_home/.local/bin/py"
-bootstrap_swap_outside="$test_root/bootstrap-outside-mutation-swap"
+bootstrap_swap_outside="$fixture_root/bootstrap-outside-mutation-swap"
 mkdir -p "$bootstrap_swap_outside"
 printf 'outside sentinel\n' > "$bootstrap_swap_outside/sentinel.txt"
-bootstrap_swap_ready="$test_root/bootstrap-mutation-swap.ready"
-bootstrap_swap_continue="$test_root/bootstrap-mutation-swap.continue"
+bootstrap_swap_ready="$fixture_home/bootstrap-mutation-swap.ready"
+bootstrap_swap_continue="$fixture_home/bootstrap-mutation-swap.continue"
 bootstrap_swap_output="$test_root/bootstrap-mutation-swap.out"
-HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-py-publish \
-HERDR_BOOTSTRAP_TEST_READY_FILE="$bootstrap_swap_ready" \
-HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$bootstrap_swap_continue" \
-HOME="$bootstrap_swap_home" bash -c \
-  'bootstrap_script="$1"; set --; source "$bootstrap_script"; write_py_compat' _ "$bootstrap_script" > "$bootstrap_swap_output" 2>&1 &
+run_fixture_phase write-py-race > "$bootstrap_swap_output" 2>&1 &
 bootstrap_swap_pid=$!
 for attempt in $(seq 1 1000); do
   [[ -e "$bootstrap_swap_ready" ]] && break

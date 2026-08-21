@@ -85,6 +85,8 @@ git -C "$rtk_source_root" remote add origin "$RTK_REPO_URL"
 mkdir -p "$source_root/config" "$source_root/scripts/ubuntu"
 cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$source_root/scripts/ubuntu/receipt-authority.sh"
 cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$source_root/scripts/ubuntu/source-attestation.sh"
+cp "$repo_root/scripts/ubuntu/launcher-capability.sh" "$source_root/scripts/ubuntu/launcher-capability.sh"
+cp "$repo_root/scripts/ubuntu/trusted-launcher.sh" "$source_root/scripts/ubuntu/trusted-launcher.sh"
 cp "$repo_root/config/receipt-authority-role-allowlist.txt" "$source_root/config/receipt-authority-role-allowlist.txt"
 cp "$repo_root/config/payload-manifest.sha256" "$source_root/config/payload-manifest.sha256"
 cp "$repo_root/config/ubuntu-toolchain.lock" "$source_root/config/ubuntu-toolchain.lock"
@@ -92,26 +94,41 @@ chmod 0644 \
   "$source_root/config/receipt-authority-role-allowlist.txt" \
   "$source_root/config/payload-manifest.sha256" \
   "$source_root/config/ubuntu-toolchain.lock"
+chmod 0755 "$source_root/scripts/ubuntu/launcher-capability.sh" \
+  "$source_root/scripts/ubuntu/receipt-authority.sh" \
+  "$source_root/scripts/ubuntu/source-attestation.sh" \
+  "$source_root/scripts/ubuntu/trusted-launcher.sh"
 sed -i "s/^RTK_REF=.*/RTK_REF=$rtk_commit/" "$source_root/config/ubuntu-toolchain.lock"
 git -C "$source_root" init -q
 git -C "$source_root" config user.email fixture@example.invalid
 git -C "$source_root" config user.name fixture
+git -C "$source_root" remote add origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git
 git -C "$source_root" add .
 git -C "$source_root" commit -qm 'fixture bootstrap source'
-
-# The entrypoint itself is a separate clean committed fixture.  The source
-# checkout below is intentionally mutated by later probes, while the direct
-# receipt invocation must continue to prove its own helper before it reads
-# that mutable input.
-mkdir -p "$entrypoint_root/scripts/ubuntu"
-cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$entrypoint_root/scripts/ubuntu/receipt-authority.sh"
-cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$entrypoint_root/scripts/ubuntu/source-attestation.sh"
-git -C "$entrypoint_root" init -q
-git -C "$entrypoint_root" config user.email fixture@example.invalid
-git -C "$entrypoint_root" config user.name fixture
-git -C "$entrypoint_root" add .
-git -C "$entrypoint_root" commit -qm 'fixture receipt entrypoint'
-entrypoint_script="$entrypoint_root/scripts/ubuntu/receipt-authority.sh"
+source_commit="$(git -C "$source_root" rev-parse --verify HEAD^{commit})"
+transport="$fixture_root/transport.git"
+git clone -q --bare "$source_root" "$transport"
+chmod 0700 "$transport"
+/usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" \
+  --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
+  --commit "$source_commit" \
+  --fixture-root "$fixture_root" \
+  --fixture-transport "$transport" \
+  --fixture-home "$fixture_home" > "$test_root/launcher-install.out"
+launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
+entrypoint_script="$launcher"
+repin_launcher_pause() {
+  local phase="$1" ready="$2" continue_file="$3"
+  /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" --re-pin \
+    --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
+    --commit "$source_commit" \
+    --fixture-root "$fixture_root" \
+    --fixture-transport "$transport" \
+    --fixture-home "$fixture_home" \
+    --fixture-receipt-pause-phase "$phase" \
+    --fixture-receipt-pause-ready "$ready" \
+    --fixture-receipt-pause-continue "$continue_file" > /dev/null
+}
 
 # Direct receipt help must bind the committed helper before sourcing it, and
 # must not resolve any integrity or Git seam through a hostile PATH.
@@ -130,8 +147,7 @@ EOF
   chmod 0755 "$receipt_hostile_path/$receipt_hostile_command"
 done
 if ! /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
-  HERDR_RECEIPT_TRUSTED_LAUNCHER=1 BASH_ENV= ENV= \
-  /usr/bin/bash "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
+  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --help > "$test_root/receipt-help-output" 2>&1; then
   cat "$test_root/receipt-help-output" >&2
   exit 1
 fi
@@ -147,7 +163,7 @@ done
 }
 
 dirty_entrypoint_root="$test_root/dirty-entrypoint"
-cp -a -- "$entrypoint_root" "$dirty_entrypoint_root"
+cp -a -- "$source_root" "$dirty_entrypoint_root"
 dirty_receipt_marker="$test_root/dirty-receipt-top-level"
 dirty_receipt_function_marker="$test_root/dirty-receipt-function"
 dirty_receipt_entrypoint_marker="$test_root/dirty-receipt-entrypoint"
@@ -172,7 +188,7 @@ fi
 
 run_authority() {
   /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-    BASH_ENV= ENV= HERDR_RECEIPT_TRUSTED_LAUNCHER=1 /usr/bin/bash "$entrypoint_script" "$@" \
+    BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- "$@" \
     --source-root "$source_root" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
@@ -185,11 +201,10 @@ run_authority_with_pause() {
   /usr/bin/env -i \
     HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
     BASH_ENV= ENV= \
-    HERDR_RECEIPT_TRUSTED_LAUNCHER=1 \
     HERDR_RECEIPT_TEST_PAUSE_PHASE="${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" \
     HERDR_RECEIPT_TEST_READY_FILE="${HERDR_RECEIPT_TEST_READY_FILE:-}" \
     HERDR_RECEIPT_TEST_CONTINUE_FILE="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}" \
-    /usr/bin/bash "$entrypoint_script" "$@" \
+    "$launcher" --entrypoint receipt-authority -- "$@" \
     --source-root "$source_root" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
@@ -284,8 +299,9 @@ fi
 
 # The receipt is built from the same stable RTK snapshot after the live
 # checkout is changed at the validation-to-receipt seam.
-receipt_race_ready="$test_root/receipt-race-ready"
-receipt_race_continue="$test_root/receipt-race-continue"
+receipt_race_ready="$fixture_root/receipt-race-ready"
+receipt_race_continue="$fixture_root/receipt-race-continue"
+repin_launcher_pause after-rtk-snapshot "$receipt_race_ready" "$receipt_race_continue"
 (
   export HERDR_RECEIPT_TEST_PAUSE_PHASE=after-rtk-snapshot
   export HERDR_RECEIPT_TEST_READY_FILE="$receipt_race_ready"
@@ -308,10 +324,11 @@ chmod 0644 "$rtk_source_root/README"
 # A same-user replacement of a staged role executable must fail closed without
 # executing the replacement. The pause survives the trusted entrypoint
 # re-exec because it is explicitly carried only through this test adapter.
-role_stage_race_ready="$test_root/role-stage-race-ready"
-role_stage_race_continue="$test_root/role-stage-race-continue"
+role_stage_race_ready="$fixture_root/role-stage-race-ready"
+role_stage_race_continue="$fixture_root/role-stage-race-continue"
 role_stage_race_marker="$test_root/role-stage-race-hostile"
 role_stage_race_hostile="$test_root/role-stage-race-hostile.sh"
+repin_launcher_pause after-rtk-staging "$role_stage_race_ready" "$role_stage_race_continue"
 cat > "$role_stage_race_hostile" <<EOF
 #!/usr/bin/bash
 : > '$role_stage_race_marker'
@@ -360,7 +377,9 @@ if attestation_verify_snapshot "$unbound_source_snapshot" "$duplicate_source_man
   echo 'Duplicate source-manifest header was accepted.' >&2
   exit 1
 fi
-expect_failure 'unsigned source manifest' "$entrypoint_script" --check \
+expect_failure 'unsigned source manifest' /usr/bin/env -i \
+  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC BASH_ENV= ENV= \
+  "$launcher" --entrypoint receipt-authority -- --check \
   --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
   --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
   --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
@@ -376,8 +395,7 @@ expect_payload_failure() {
   shift
   expect_failure "$label" /usr/bin/env -i \
     HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-    BASH_ENV= ENV= HERDR_RECEIPT_VERIFIED_PAYLOAD=1 \
-    /usr/bin/bash "$payload_probe/source/receipt-authority.sh" "$@" \
+    BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- "$@" \
     --source-root "$payload_probe/source" \
     --source-manifest "$payload_probe/source/.source-attestation" \
     --payload-root "$payload_probe" \
@@ -387,11 +405,46 @@ expect_payload_failure() {
 }
 expect_payload_failure 'unsigned payload source commit'
 expect_payload_failure 'unsigned payload manifest hash' --source-commit "$attestation_snapshot_commit"
+
+# This payload is internally coherent: it is a real second Git commit, its
+# source snapshot is freshly attested, and its payload manifest hash is bound.
+# It must still fail because the installed policy approves source_commit, not
+# merely any self-consistent payload commit.
+alternate_source_checkout="$test_root/alternate-source"
+git clone -q "$source_root" "$alternate_source_checkout"
+git -C "$alternate_source_checkout" config user.email fixture@example.invalid
+git -C "$alternate_source_checkout" config user.name fixture
+printf '%s\n' 'alternate coherent payload commit' > "$alternate_source_checkout/alternate.txt"
+git -C "$alternate_source_checkout" add alternate.txt
+git -C "$alternate_source_checkout" commit -qm 'alternate coherent payload commit'
+attestation_create_git_snapshot "$alternate_source_checkout" '' ''
+alternate_payload_probe="$test_root/alternate-payload-probe"
+mkdir -p "$alternate_payload_probe/source"
+cp -a -- "$attestation_snapshot_dir/." "$alternate_payload_probe/source/"
+chmod -R u+w "$alternate_payload_probe"
+alternate_payload_manifest="$alternate_payload_probe/.payload-manifest"
+attestation_build_payload_manifest "$alternate_payload_probe" "$alternate_payload_manifest"
+alternate_payload_hash="$(attestation_hash_file "$alternate_payload_manifest")"
+alternate_source_commit="$attestation_snapshot_commit"
+[[ "$alternate_source_commit" != "$source_commit" ]] || {
+  echo 'Alternate coherent payload did not receive a different commit.' >&2
+  exit 1
+}
+expect_failure 'coherent payload with non-policy source commit' /usr/bin/env -i \
+  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --check \
+  --source-root "$alternate_payload_probe/source" \
+  --source-manifest "$alternate_payload_probe/source/.source-attestation" \
+  --payload-root "$alternate_payload_probe" \
+  --payload-manifest "$alternate_payload_manifest" \
+  --payload-manifest-sha256 "$alternate_payload_hash" \
+  --source-commit "$alternate_source_commit" \
+  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
+  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
 printf 'payload tamper\n' >> "$payload_probe/source/README"
 expect_failure 'tampered payload tree' /usr/bin/env -i \
   HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-  BASH_ENV= ENV= HERDR_RECEIPT_VERIFIED_PAYLOAD=1 \
-  /usr/bin/bash "$payload_probe/source/receipt-authority.sh" --check \
+  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --check \
   --source-root "$payload_probe/source" --source-manifest "$payload_probe/source/.source-attestation" \
   --payload-root "$payload_probe" --payload-manifest "$payload_probe_manifest" \
   --payload-manifest-sha256 "$payload_probe_hash" --source-commit "$attestation_snapshot_commit" \

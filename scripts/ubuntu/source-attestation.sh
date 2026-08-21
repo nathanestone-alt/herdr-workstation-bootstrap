@@ -23,8 +23,8 @@ attestation_id_bin='/usr/bin/id'
 attestation_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
 attestation_git_dir=''
 attestation_common_git_dir=''
-attestation_git_owner_uid="${HERDR_ATTESTATION_GIT_OWNER_UID:-${HERDR_RECEIPT_GIT_OWNER_UID:-${HERDR_BOOTSTRAP_GIT_OWNER_UID:-$($attestation_id_bin -u)}}}"
-attestation_git_owner_gid="${HERDR_ATTESTATION_GIT_OWNER_GID:-${HERDR_RECEIPT_GIT_OWNER_GID:-${HERDR_BOOTSTRAP_GIT_OWNER_GID:-$($attestation_id_bin -g)}}}"
+attestation_git_owner_uid="${attestation_capability_owner_uid:-$($attestation_id_bin -u)}"
+attestation_git_owner_gid="${attestation_capability_owner_gid:-$($attestation_id_bin -g)}"
 
 if ! declare -p attestation_bound_git_paths >/dev/null 2>&1; then
   declare -a attestation_bound_git_paths=()

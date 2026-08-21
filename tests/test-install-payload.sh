@@ -97,7 +97,7 @@ EOF
 set -euo pipefail
 package="${@: -1}"
 case "$package" in
-  cifs-utils|curl|git|git-lfs|gh|jq|mosh|openssh-client|openssh-server|ripgrep|rsync)
+  cifs-utils|curl|gawk|git|git-lfs|gh|jq|mosh|openssh-client|openssh-server|ripgrep|rsync)
     printf 'apt:%s=fixture-%s\n' "$package" "$package"
     ;;
   *) exit 1 ;;
@@ -211,7 +211,7 @@ write_toolchain_receipt() {
     printf 'bun=%s\n' "$BUN_VERSION"
     printf 'herdr=herdr %s\n' "$HERDR_VERSION"
     printf 'powershell=%s\n' "$POWERSHELL_VERSION"
-    for package in cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
+    for package in cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
       printf 'apt:%s=fixture-%s\n' "$package" "$package"
     done
   } > "$home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"

@@ -73,18 +73,18 @@ The convergence pass verifies the system VHD, Generation 2, switch, CPU and dyna
 
 ## Phase E — Ubuntu bootstrap
 
-Clone this repository fresh inside Ubuntu rather than using a Windows-mounted checkout:
+Clone this repository fresh inside Ubuntu for inspection, but provision the
+trust anchor only through the independent procedure in
+docs/bootstrap-trust-anchor.md. Do not execute the installer from this
+checkout and do not derive the approved commit from its HEAD:
 
 ~~~bash
 mkdir -p ~/code
 cd ~/code
 git clone https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git
 cd herdr-workstation-bootstrap
-sudo ./scripts/ubuntu/install-trusted-launcher.sh \
-  --source-root "$PWD" \
-  --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
-  --commit "$(git rev-parse --verify HEAD^{commit})" \
-  --run-as-user "$USER"
+# Obtain the reviewed commit literal and installer SHA-256 out of band,
+# then run the verified /tmp installer exactly as documented there.
 sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --phase base
 sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --phase tools
 ~~~
