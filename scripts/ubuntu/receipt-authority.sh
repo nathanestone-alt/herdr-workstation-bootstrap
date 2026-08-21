@@ -8,6 +8,7 @@ source_root="$repo_root"
 user_home="${HOME:-}"
 authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 receipt_path='/etc/stmodel/issue-961/receipt.json'
+rtk_source_root=''
 fixture_root=''
 default_authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 default_receipt_path='/etc/stmodel/issue-961/receipt.json'
@@ -25,6 +26,7 @@ Options:
   --user-home PATH         Managed user home whose tools are attested.
   --authority-path PATH    Authority envelope path (production default is /etc/stmodel/issue-961/receipt-authority.json).
   --receipt-path PATH      Receipt body path (production default is /etc/stmodel/issue-961/receipt.json).
+  --rtk-source-root PATH   Canonical RTK source checkout (default is USER_HOME/src/rtk).
   --fixture-root PATH      Test-only role root; requires non-production output paths.
 EOF
 }
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --user-home) [[ $# -ge 2 ]] || { usage; exit 2; }; user_home="$2"; shift 2 ;;
     --authority-path) [[ $# -ge 2 ]] || { usage; exit 2; }; authority_path="$2"; shift 2 ;;
     --receipt-path) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_path="$2"; shift 2 ;;
+    --rtk-source-root) [[ $# -ge 2 ]] || { usage; exit 2; }; rtk_source_root="$2"; shift 2 ;;
     --fixture-root) [[ $# -ge 2 ]] || { usage; exit 2; }; fixture_root="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -49,7 +52,7 @@ fail() {
 }
 
 [[ "$mode" == install || "$mode" == check ]] || fail "unsupported mode '$mode'"
-[[ "$source_root" == /* && "$user_home" == /* && "$authority_path" == /* && "$receipt_path" == /* ]] || {
+[[ "$source_root" == /* && "$user_home" == /* && "$authority_path" == /* && "$receipt_path" == /* && ( -z "$rtk_source_root" || "$rtk_source_root" == /* ) ]] || {
   fail 'source, home, authority, and receipt paths must be absolute'
 }
 
@@ -74,6 +77,9 @@ source_root="$(realpath -e -- "$source_root" 2>/dev/null || true)"
 [[ -n "$source_root" && -d "$source_root" ]] || fail 'source root does not exist'
 user_home="$(realpath -e -- "$user_home" 2>/dev/null || true)"
 [[ -n "$user_home" && -d "$user_home" ]] || fail 'managed user home does not exist'
+if [[ -z "$rtk_source_root" ]]; then rtk_source_root="$user_home/src/rtk"; fi
+rtk_source_root="$(realpath -e -- "$rtk_source_root" 2>/dev/null || true)"
+[[ -n "$rtk_source_root" && -d "$rtk_source_root" ]] || fail 'RTK source checkout does not exist'
 [[ "$(uname -s)" == 'Linux' && "$(uname -m)" == 'x86_64' ]] || fail 'receipt authority requires Ubuntu x86_64 Linux'
 if [[ -z "$fixture_root" ]]; then
   # shellcheck disable=SC1091
@@ -98,6 +104,8 @@ reject_symlink_components() {
 
 reject_symlink_components "$user_home" || fail "managed user home contains a symlink: $user_home"
 [[ "$(realpath -e -- "$user_home" 2>/dev/null || true)" == "$user_home" ]] || fail "managed user home is not lexically canonical: $user_home"
+reject_symlink_components "$rtk_source_root" || fail "RTK source checkout contains a symlink: $rtk_source_root"
+[[ "$(realpath -e -- "$rtk_source_root" 2>/dev/null || true)" == "$rtk_source_root" ]] || fail "RTK source checkout is not lexically canonical: $rtk_source_root"
 
 lock_file="$source_root/config/ubuntu-toolchain.lock"
 allowlist_file="$source_root/config/receipt-authority-role-allowlist.txt"
@@ -105,6 +113,9 @@ payload_manifest="$source_root/config/payload-manifest.sha256"
 [[ -f "$lock_file" && -f "$allowlist_file" && -f "$payload_manifest" ]] || fail 'source authority inputs are incomplete'
 # shellcheck disable=SC1090
 source "$lock_file"
+
+[[ "${RTK_REPO_URL:-}" =~ ^https://[^[:space:]]+$ ]] || fail 'RTK_REPO_URL is not a valid locked HTTPS URL'
+[[ "${RTK_REF:-}" =~ ^[0-9a-f]{40}$ ]] || fail 'RTK_REF is not a full locked commit'
 
 repo_commit="$(/usr/bin/git -C "$source_root" rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
 [[ "$repo_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source HEAD is not a full commit'
@@ -115,6 +126,20 @@ if ! /usr/bin/git -C "$source_root" diff --cached --quiet; then fail 'source wor
 payload_manifest_sha256="$(/usr/bin/sha256sum "$payload_manifest" | awk '{print $1}')"
 allowlist_sha256="$(/usr/bin/sha256sum "$allowlist_file" | awk '{print $1}')"
 script_sha256="$(/usr/bin/sha256sum "$script_path" | awk '{print $1}')"
+source_script_path="$source_root/scripts/ubuntu/receipt-authority.sh"
+reject_symlink_components "$source_script_path" || fail 'source-root receipt authority script contains a symlink'
+[[ -f "$source_script_path" && ! -L "$source_script_path" ]] || fail 'source-root receipt authority script is missing or not regular'
+[[ "$(/usr/bin/sha256sum "$source_script_path" | awk '{print $1}')" == "$script_sha256" ]] || fail 'source-root receipt authority script does not match the invoked script'
+
+[[ -d "$rtk_source_root/.git" && ! -L "$rtk_source_root/.git" ]] || fail 'RTK source checkout is missing its Git metadata'
+if ! /usr/bin/git -C "$rtk_source_root" diff --quiet; then fail 'RTK source checkout has unstaged changes'; fi
+if ! /usr/bin/git -C "$rtk_source_root" diff --cached --quiet; then fail 'RTK source checkout has staged changes'; fi
+[[ -z "$(/usr/bin/git -C "$rtk_source_root" status --porcelain --untracked-files=all)" ]] || fail 'RTK source checkout has untracked changes'
+rtk_source_url="$(/usr/bin/git -C "$rtk_source_root" remote get-url origin 2>/dev/null || true)"
+[[ "$rtk_source_url" == "$RTK_REPO_URL" ]] || fail 'RTK source checkout origin differs from the locked URL'
+rtk_source_commit="$(/usr/bin/git -C "$rtk_source_root" rev-parse HEAD 2>/dev/null || true)"
+[[ "$rtk_source_commit" == "$RTK_REF" ]] || fail 'RTK source checkout HEAD differs from the locked commit'
+rtk_source_clean=true
 
 declare -A role_registry role_names role_argv role_implementation
 roles=()
@@ -162,11 +187,80 @@ canonical_executable() {
   printf '%s' "$path"
 }
 
+build_tree_manifest() {
+  local root="$1"
+  local output="$2"
+  local relative full target resolved
+  local count=0
+  : > "$output"
+  printf 'D\t.\n' >> "$output"
+  while IFS= read -r -d '' relative; do
+    full="$root/$relative"
+    if [[ -L "$full" ]]; then
+      target="$(readlink -- "$full")"
+      resolved="$(realpath -e -- "$full" 2>/dev/null || true)"
+      [[ -n "$resolved" && ( "$resolved" == "$root" || "$resolved" == "$root/"* ) ]] || fail "Python runtime symlink escapes its managed root: $full"
+      printf 'L\t%s\t%s\t%s\n' "$relative" "$target" "$resolved" >> "$output"
+    elif [[ -d "$full" ]]; then
+      printf 'D\t%s\n' "$relative" >> "$output"
+    elif [[ -f "$full" ]]; then
+      printf 'F\t%s\t%s\n' "$relative" "$(/usr/bin/sha256sum "$full" | awk '{print $1}')" >> "$output"
+    else
+      fail "Python runtime contains an unsupported filesystem entry: $full"
+    fi
+    ((count += 1))
+  done < <(find -P "$root" -mindepth 1 -printf '%P\0' | sort -z)
+  printf '%s' "$count"
+}
+
 for role in "${roles[@]}"; do
   role_path["$role"]="$(canonical_executable "${role_path[$role]}" "$role")"
 done
 python_path="$(canonical_executable "${role_path[python313]}" 'python3.13')"
 rtk_path="${role_path[rtk]}"
+python_venv_path="$user_home/.local/pyvenv.cfg"
+python_runtime_root="$user_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+python_stdlib_root="$python_runtime_root/lib/python3.13"
+reject_symlink_components "$python_venv_path" || fail 'Python pyvenv.cfg contains a symlinked path component'
+[[ -f "$python_venv_path" && ! -L "$python_venv_path" ]] || fail 'Python pyvenv.cfg is missing or not a regular file'
+reject_symlink_components "$python_runtime_root" || fail 'Python runtime contains a symlinked path component'
+[[ -d "$python_runtime_root" && ! -L "$python_runtime_root" ]] || fail 'Python managed runtime is missing or not a directory'
+[[ "$(realpath -e -- "$python_runtime_root" 2>/dev/null || true)" == "$python_runtime_root" ]] || fail 'Python managed runtime is not lexically canonical'
+[[ -d "$python_stdlib_root" && ! -L "$python_stdlib_root" ]] || fail 'Python managed standard library is missing or not a directory'
+
+read_pyvenv_value() {
+  local key="$1"
+  awk -F= -v key="$key" '
+    $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
+      value=$2
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      result=value
+      count++
+    }
+    END { if (count == 1) print result; else exit 1 }
+  ' "$python_venv_path"
+}
+
+python_venv_home="$(read_pyvenv_value home 2>/dev/null || true)"
+python_venv_site="$(read_pyvenv_value include-system-site-packages 2>/dev/null || true)"
+python_venv_version="$(read_pyvenv_value version 2>/dev/null || true)"
+[[ "$python_venv_home" == "$python_runtime_root" ]] || fail 'Python pyvenv.cfg selects an unexpected runtime home'
+[[ "$python_venv_site" == false ]] || fail 'Python pyvenv.cfg enables system site packages'
+[[ "$python_venv_version" == "$PYTHON_VERSION" ]] || fail 'Python pyvenv.cfg version differs from the lock'
+python_venv_sha256="$(/usr/bin/sha256sum "$python_venv_path" | awk '{print $1}')"
+
+runtime_manifest_file="$(mktemp)"
+stdlib_manifest_file="$(mktemp)"
+role_fragments="$(mktemp)"
+receipt_tmp="$(mktemp)"
+authority_tmp="$(mktemp)"
+cleanup() { rm -f -- "$runtime_manifest_file" "$stdlib_manifest_file" "$role_fragments" "$receipt_tmp" "$authority_tmp"; }
+trap cleanup EXIT
+runtime_file_count="$(build_tree_manifest "$python_runtime_root" "$runtime_manifest_file")"
+stdlib_file_count="$(build_tree_manifest "$python_stdlib_root" "$stdlib_manifest_file")"
+runtime_manifest_sha256="$(/usr/bin/sha256sum "$runtime_manifest_file" | awk '{print $1}')"
+stdlib_manifest_sha256="$(/usr/bin/sha256sum "$stdlib_manifest_file" | awk '{print $1}')"
 
 if [[ -n "$fixture_root" ]]; then
   rtk_candidates=("$user_home/.local/bin/rtk" "$user_home/.cargo/bin/rtk" "$system_bin/rtk")
@@ -212,16 +306,39 @@ done
 
 python_version_output="$(PATH="$trusted_path" "$python_path" --version 2>&1)" || fail 'python3.13 --version failed'
 [[ "$python_version_output" == "Python $PYTHON_VERSION" ]] || fail "Python version does not match lock: $python_version_output"
-python_probe="$(PYTHONNOUSERSITE=1 PYTHONPATH= PATH="$trusted_path" "$python_path" -c 'import json, platform, sys; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation()}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
-python_json="$("$jq_bin" -n -cS --arg executable "$python_path" --arg sha256 "$(/usr/bin/sha256sum "$python_path" | awk '{print $1}')" --arg version "$PYTHON_VERSION" --arg implementation "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" --argjson version_info "$(printf '%s' "$python_probe" | "$jq_bin" -c '.version_info')" '{executable:$executable, sha256:$sha256, version:$version, version_info:$version_info, implementation:$implementation}')" || fail 'Python identity probe was not valid JSON'
+python_probe="$(PYTHONNOUSERSITE=1 PYTHONPATH= PATH="$trusted_path" "$python_path" -c 'import json, os, platform, sys, sysconfig; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation(), "executable": sys.executable, "prefix": os.path.realpath(sys.prefix), "base_prefix": os.path.realpath(sys.base_prefix), "stdlib": os.path.realpath(sysconfig.get_path("stdlib"))}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
+python_probe_executable="$(printf '%s' "$python_probe" | "$jq_bin" -r '.executable' 2>/dev/null || true)"
+python_probe_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.prefix' 2>/dev/null || true)"
+python_probe_base_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.base_prefix' 2>/dev/null || true)"
+python_probe_stdlib="$(printf '%s' "$python_probe" | "$jq_bin" -r '.stdlib' 2>/dev/null || true)"
+[[ "$python_probe_executable" == "$python_path" ]] || fail 'Python probe executable differs from the canonical launcher'
+[[ "$python_probe_prefix" == "$user_home/.local" ]] || fail 'Python probe prefix differs from the managed user environment'
+[[ "$python_probe_base_prefix" == "$python_runtime_root" ]] || fail 'Python probe base_prefix differs from the locked managed runtime'
+[[ "$python_probe_stdlib" == "$python_stdlib_root" ]] || fail 'Python probe stdlib differs from the locked managed runtime'
+python_json="$("$jq_bin" -n -cS \
+  --arg executable "$python_path" \
+  --arg sha256 "$(/usr/bin/sha256sum "$python_path" | awk '{print $1}')" \
+  --arg version "$PYTHON_VERSION" \
+  --arg implementation "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" \
+  --argjson version_info "$(printf '%s' "$python_probe" | "$jq_bin" -c '.version_info')" \
+  --arg venv_path "$python_venv_path" \
+  --arg venv_sha256 "$python_venv_sha256" \
+  --arg venv_home "$python_venv_home" \
+  --arg venv_site "$python_venv_site" \
+  --arg venv_version "$python_venv_version" \
+  --arg runtime_root "$python_runtime_root" \
+  --arg runtime_manifest_sha256 "$runtime_manifest_sha256" \
+  --argjson runtime_file_count "$runtime_file_count" \
+  --arg stdlib_root "$python_stdlib_root" \
+  --arg stdlib_manifest_sha256 "$stdlib_manifest_sha256" \
+  --argjson stdlib_file_count "$stdlib_file_count" \
+  --arg prefix "$python_probe_prefix" \
+  --arg base_prefix "$python_probe_base_prefix" \
+  --arg stdlib "$python_probe_stdlib" \
+  '{executable:$executable, sha256:$sha256, version:$version, version_info:$version_info, implementation:$implementation, venv:{path:$venv_path, sha256:$venv_sha256, home:$venv_home, include_system_site_packages:($venv_site == "true"), version:$venv_version}, runtime:{root:$runtime_root, manifest_sha256:$runtime_manifest_sha256, file_count:$runtime_file_count, stdlib_root:$stdlib_root, stdlib_manifest_sha256:$stdlib_manifest_sha256, stdlib_file_count:$stdlib_file_count, prefix:$prefix, base_prefix:$base_prefix, stdlib:$stdlib}}')" || fail 'Python identity probe was not valid JSON'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.version')" == "$PYTHON_VERSION" ]] || fail 'Python probe version mismatch'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" == CPython ]] || fail 'Python implementation is not CPython'
 
-role_fragments="$(mktemp)"
-receipt_tmp="$(mktemp)"
-authority_tmp="$(mktemp)"
-cleanup() { rm -f -- "$role_fragments" "$receipt_tmp" "$authority_tmp"; }
-trap cleanup EXIT
 for role in "${roles[@]}"; do
   role_json="$("$jq_bin" -cn \
     --arg role "$role" \
@@ -234,10 +351,24 @@ for role in "${roles[@]}"; do
     --arg version_output_sha256 "${role_version_hash[$role]}" \
     --arg implementation "${role_implementation[$role]}" \
     '{($role): {executable:$executable, sha256:$sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation}}')"
+  if [[ "$role" == rtk ]]; then
+    role_json="$(printf '%s' "$role_json" | "$jq_bin" -cS \
+      --arg source_commit_sha "$rtk_source_commit" \
+      --arg repository_url "$rtk_source_url" \
+      --arg locked_ref "$RTK_REF" \
+      'with_entries(.value.source_commit_sha = $source_commit_sha | .value.source_attestation += {repository_url:$repository_url, locked_ref:$locked_ref, source_commit_sha:$source_commit_sha, clean:true})')"
+  fi
   printf '%s\n' "$role_json" >> "$role_fragments"
 done
 role_manifest_json="$("$jq_bin" -sc 'add' "$role_fragments" | "$jq_bin" -cS .)" || fail 'role manifest is not valid JSON'
 role_manifest_sha256="$(printf '%s' "$role_manifest_json" | /usr/bin/sha256sum | awk '{print $1}')"
+rtk_source_json="$("$jq_bin" -cSn \
+  --arg repository_url "$rtk_source_url" \
+  --arg locked_ref "$RTK_REF" \
+  --arg commit_sha "$rtk_source_commit" \
+  --arg checkout_path "$rtk_source_root" \
+  --argjson clean true \
+  '{repository_url:$repository_url, locked_ref:$locked_ref, commit_sha:$commit_sha, checkout_path:$checkout_path, clean:$clean}')"
 
 issued_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 expires_at_utc="$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"
@@ -259,10 +390,11 @@ build_receipt() {
     --arg expires_at_utc "$expires_at_utc" \
     --argjson python313 "$python_json" \
     --argjson role_identities "$role_manifest_json" \
+    --argjson rtk_source "$rtk_source_json" \
     --arg role_manifest_sha256 "$role_manifest_sha256" \
     --arg source_root "$source_root" \
     --arg script_sha256 "$script_sha256" \
-    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expires_at_utc:$expires_at_utc, python313:$python313, role_identities:$role_identities, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
+    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expires_at_utc:$expires_at_utc, python313:$python313, role_identities:$role_identities, rtk_source:$rtk_source, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
 }
 
 validate_parent_chain() {
@@ -276,7 +408,7 @@ validate_parent_chain() {
     while :; do
       owner="$(stat -c '%u' -- "$current" 2>/dev/null || true)"
       mode="$(stat -c '%a' -- "$current" 2>/dev/null || true)"
-      [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ && $((8#$mode & 22)) == 0 ]] || fail "production output parent is not root-owned and non-writable: $current"
+      [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || fail "production output parent is not root-owned and non-writable: $current"
       [[ "$current" == '/' ]] && break
       current="$(dirname -- "$current")"
     done
@@ -315,9 +447,23 @@ validate_json_field() {
   "$jq_bin" -e "$expression" "$path" >/dev/null 2>&1 || fail "JSON contract failed for $path"
 }
 
+validate_output_file_security() {
+  local path="$1"
+  local owner mode
+  [[ -f "$path" && ! -L "$path" ]] || fail "installed authority output is missing or symlinked: $path"
+  mode="$(stat -c '%a' -- "$path" 2>/dev/null || true)"
+  [[ "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || fail "installed authority output is group/other writable: $path"
+  if [[ -z "$fixture_root" ]]; then
+    owner="$(stat -c '%u' -- "$path" 2>/dev/null || true)"
+    [[ "$owner" == 0 ]] || fail "installed authority output is not root-owned: $path"
+  fi
+}
+
 validate_installed_authority() {
   [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || fail "receipt body is missing or symlinked: $receipt_path"
   [[ -f "$authority_path" && ! -L "$authority_path" ]] || fail "authority envelope is missing or symlinked: $authority_path"
+  validate_output_file_security "$receipt_path"
+  validate_output_file_security "$authority_path"
   validate_parent_chain "${receipt_path%/*}"
   validate_parent_chain "${authority_path%/*}"
   validate_json_field "$receipt_path" '.schema_version == 1 and .verification_status == "verified" and .clean == true and .python313_lock_verified == true and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.role_identities|type == "object") and ((.role_identities|keys) == ["bash","gh","git","node","pwsh","rtk"])'
@@ -337,6 +483,7 @@ validate_installed_authority() {
   [[ "$stored_allowlist" == "$allowlist_sha256" ]] || fail 'receipt role allowlist hash differs from source'
   stored_role_hash="$("$jq_bin" -r '.role_manifest_sha256' "$receipt_path")"
   [[ "$stored_role_hash" == "$role_manifest_sha256" ]] || fail 'receipt role manifest hash differs from live roles'
+  [[ "$("$jq_bin" -cS '.rtk_source' "$receipt_path")" == "$rtk_source_json" ]] || fail 'receipt RTK source provenance differs from the locked checkout'
   stored_python="$("$jq_bin" -cS '.python313' "$receipt_path")"
   [[ "$stored_python" == "$python_json" ]] || fail 'receipt Python identity differs from the live regular executable'
   stored_roles="$("$jq_bin" -cS '.role_identities' "$receipt_path")"
@@ -346,6 +493,7 @@ validate_installed_authority() {
   [[ "$("$jq_bin" -r '.payload_manifest_sha256' "$authority_path")" == "$payload_manifest_sha256" ]] || fail 'authority payload hash differs from source'
   [[ "$("$jq_bin" -r '.bridge_allowlist_sha256' "$authority_path")" == "$allowlist_sha256" ]] || fail 'authority allowlist hash differs from source'
   [[ "$("$jq_bin" -r '.role_manifest_sha256' "$authority_path")" == "$role_manifest_sha256" ]] || fail 'authority role manifest hash differs from receipt'
+  [[ "$("$jq_bin" -cS '.rtk_source' "$authority_path")" == "$rtk_source_json" ]] || fail 'authority RTK source provenance differs from the locked checkout'
   [[ "$("$jq_bin" -cS '.python313' "$authority_path")" == "$python_json" ]] || fail 'authority Python identity differs from receipt'
   [[ "$("$jq_bin" -r '.provenance.receipt_authority_script_sha256 // empty' "$authority_path")" == "$script_sha256" ]] || fail 'authority script provenance differs from source'
   local expires_epoch
@@ -370,10 +518,11 @@ if [[ "$mode" == install ]]; then
     --arg platform 'Ubuntu' \
     --arg architecture 'x86_64' \
     --argjson python313 "$python_json" \
+    --argjson rtk_source "$rtk_source_json" \
     --arg role_manifest_sha256 "$role_manifest_sha256" \
     --arg source_root "$source_root" \
     --arg script_sha256 "$script_sha256" \
-    '{schema_version:$schema_version, authority_id:$authority_id, receipt_path:$receipt_path, receipt_sha256:$receipt_sha256, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, python313:$python313, role_manifest_sha256:$role_manifest_sha256, provenance:{source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, secrets_excluded:true}}' > "$authority_tmp"
+    '{schema_version:$schema_version, authority_id:$authority_id, receipt_path:$receipt_path, receipt_sha256:$receipt_sha256, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, python313:$python313, rtk_source:$rtk_source, role_manifest_sha256:$role_manifest_sha256, provenance:{source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, secrets_excluded:true}}' > "$authority_tmp"
   atomic_install_json "$authority_tmp" "$authority_path"
 fi
 

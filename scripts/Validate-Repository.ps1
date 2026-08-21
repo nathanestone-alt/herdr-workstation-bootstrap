@@ -54,6 +54,10 @@ if ($bashCandidates) {
         'tests\test-receipt-authority.sh',
         'tests\test-install-payload.sh'
     )) {
+        if ($relativeTest -eq 'tests\test-receipt-authority.sh' -and -not $IsLinux) {
+            Write-Host "SKIP: $relativeTest requires a Linux Ubuntu execution environment."
+            continue
+        }
         $testPath = Join-Path $RepoRoot $relativeTest
         & $bash (Convert-ToBashPath -Path $testPath)
         if ($LASTEXITCODE -ne 0) { $failures.Add("Behavioral regression test failed: $relativeTest") }

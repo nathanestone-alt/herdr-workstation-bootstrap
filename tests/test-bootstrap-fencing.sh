@@ -5,11 +5,60 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 export HOME="$test_root/home"
-mkdir -p "$HOME/.local/bin" "$HOME/.local/lib/herdr-workstation" "$HOME/.config/herdr-workstation"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib/herdr-workstation" "$HOME/.config/herdr-workstation" "$HOME/.cargo/bin"
 
 # Source only: the real base/tools phases must not run in this regression.
 # shellcheck disable=SC1091
 source "$repo_root/scripts/ubuntu/bootstrap.sh"
+
+# Cargo roots are validated before any Cargo operation can run.
+mkdir -p "$HOME/.cargo"
+CARGO_HOME="$HOME/noncanonical-cargo"
+if validate_cargo_roots; then
+  echo 'Noncanonical CARGO_HOME was accepted.' >&2
+  exit 1
+fi
+unset CARGO_HOME
+CARGO_INSTALL_ROOT="$HOME/noncanonical-cargo"
+if validate_cargo_roots; then
+  echo 'Noncanonical CARGO_INSTALL_ROOT was accepted.' >&2
+  exit 1
+fi
+unset CARGO_INSTALL_ROOT
+validate_cargo_roots
+
+# RTK source provenance rejects dirty, staged and untracked source before build.
+rtk_source="$test_root/rtk-source"
+mkdir -p "$rtk_source"
+git -C "$rtk_source" init -q
+git -C "$rtk_source" config user.email fixture@example.invalid
+git -C "$rtk_source" config user.name fixture
+printf 'locked source\n' > "$rtk_source/README"
+git -C "$rtk_source" add README
+git -C "$rtk_source" commit -qm 'fixture source'
+rtk_source_commit="$(git -C "$rtk_source" rev-parse HEAD)"
+git -C "$rtk_source" remote add origin https://example.invalid/rtk.git
+validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+printf 'dirty\n' >> "$rtk_source/README"
+if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  echo 'Dirty RTK source was accepted.' >&2
+  exit 1
+fi
+git -C "$rtk_source" checkout -- README
+printf 'staged\n' >> "$rtk_source/README"
+git -C "$rtk_source" add README
+if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  echo 'Staged RTK source was accepted.' >&2
+  exit 1
+fi
+git -C "$rtk_source" reset -q HEAD -- README
+git -C "$rtk_source" checkout -- README
+printf 'untracked\n' > "$rtk_source/untracked"
+if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  echo 'Untracked RTK source was accepted.' >&2
+  exit 1
+fi
+rm -- "$rtk_source/untracked"
 
 # These callers intentionally use the generic fd/anchor/parent names that
 # collided with fence_open_parent's dynamic-scope locals on the starting
@@ -20,6 +69,37 @@ fence_replace_link "$generic_link_source" "$HOME/.local/bin/generic-link" before
 [[ -L "$HOME/.local/bin/generic-link" ]] || { echo 'Generic fenced link was not published.' >&2; exit 1; }
 [[ "$(readlink "$HOME/.local/bin/generic-link")" == "$generic_link_source" ]] || {
   echo 'Generic fenced link target changed.' >&2
+  exit 1
+}
+
+# The managed RTK alias is revalidated after the synchronization pause and
+# must not remove a replacement symlink from the same parent.
+canonical_rtk="$HOME/.cargo/bin/rtk"
+printf 'canonical rtk\n' > "$canonical_rtk"
+chmod 0755 "$canonical_rtk"
+ln -s "$canonical_rtk" "$HOME/.local/bin/rtk"
+race_ready="$test_root/rtk-race-ready"
+race_continue="$test_root/rtk-race-continue"
+race_other="$test_root/other-rtk"
+printf 'replacement rtk\n' > "$race_other"
+chmod 0755 "$race_other"
+(
+  HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-rtk-alias-removal \
+  HERDR_BOOTSTRAP_TEST_READY_FILE="$race_ready" \
+  HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$race_continue" \
+  fence_remove_managed_link "$canonical_rtk" "$HOME/.local/bin/rtk" before-rtk-alias-removal
+) > "$test_root/rtk-race-output" 2>&1 &
+race_pid=$!
+while [[ ! -e "$race_ready" ]]; do sleep 0.01; done
+rm -- "$HOME/.local/bin/rtk"
+ln -s "$race_other" "$HOME/.local/bin/rtk"
+: > "$race_continue"
+if wait "$race_pid"; then
+  echo 'RTK alias replacement race was accepted.' >&2
+  exit 1
+fi
+[[ -L "$HOME/.local/bin/rtk" && "$(readlink "$HOME/.local/bin/rtk")" == "$race_other" ]] || {
+  echo 'RTK alias replacement race changed the replacement path.' >&2
   exit 1
 }
 

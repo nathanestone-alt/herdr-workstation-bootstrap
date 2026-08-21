@@ -42,6 +42,60 @@ path_is_under() {
   [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
 }
 
+validate_cargo_roots() {
+  local expected_root="$HOME/.cargo"
+  cargo_home="${CARGO_HOME:-$expected_root}"
+  cargo_install_root="${CARGO_INSTALL_ROOT:-$cargo_home}"
+  [[ "$cargo_home" == "$expected_root" ]] || {
+    echo "CARGO_HOME must be the canonical cargo root '$expected_root', got '$cargo_home'." >&2
+    return 1
+  }
+  [[ "$cargo_install_root" == "$expected_root" ]] || {
+    echo "CARGO_INSTALL_ROOT must be the canonical cargo root '$expected_root', got '$cargo_install_root'." >&2
+    return 1
+  }
+  export CARGO_HOME="$expected_root"
+  export CARGO_INSTALL_ROOT="$expected_root"
+}
+
+validate_rtk_source_checkout() {
+  local source_path="$1"
+  local expected_url="${2:-}"
+  local expected_ref="${3:-}"
+  local actual_url
+  local actual_ref
+  [[ -d "$source_path/.git" && ! -L "$source_path" ]] || {
+    echo "RTK source checkout is missing or unsafe: $source_path" >&2
+    return 1
+  }
+  if ! git -C "$source_path" diff --quiet; then
+    echo "RTK source checkout has unstaged changes: $source_path" >&2
+    return 1
+  fi
+  if ! git -C "$source_path" diff --cached --quiet; then
+    echo "RTK source checkout has staged changes: $source_path" >&2
+    return 1
+  fi
+  if [[ -n "$(git -C "$source_path" status --porcelain --untracked-files=all)" ]]; then
+    echo "RTK source checkout has untracked changes: $source_path" >&2
+    return 1
+  fi
+  actual_url="$(git -C "$source_path" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$expected_url" && "$actual_url" != "$expected_url" ]]; then
+    echo "RTK source checkout origin differs from the lock: $actual_url" >&2
+    return 1
+  fi
+  actual_ref="$(git -C "$source_path" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "RTK source checkout HEAD is not a full commit: $source_path" >&2
+    return 1
+  }
+  if [[ -n "$expected_ref" && "$actual_ref" != "$expected_ref" ]]; then
+    echo "RTK source checkout does not match the locked commit: $actual_ref" >&2
+    return 1
+  fi
+}
+
 validate_user_home() {
   [[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != '/' && -d "$HOME" ]] || {
     echo 'HOME is not a safe absolute user directory.' >&2
@@ -404,6 +458,17 @@ fence_remove_managed_link() {
     }
     bootstrap_test_pause "$phase"
     fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
+    [[ -L "$anchor" ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Managed alias changed to a non-symlink: $target_path" >&2
+      exit 24
+    }
+    actual_real="$(realpath -e -- "$target_path" 2>/dev/null || true)"
+    [[ "$actual_real" == "$expected_real" ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Managed alias changed before removal: $target_path" >&2
+      exit 24
+    }
     rm -f -- "$anchor"
   fi
   fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
@@ -922,6 +987,7 @@ install_tools() {
   local manifest_tmp
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
+  validate_cargo_roots || exit 24
   validate_managed_paths \
     "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
     "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" "$HOME/src" \
@@ -965,6 +1031,7 @@ install_tools() {
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
   fi
+  validate_cargo_roots || exit 24
   command -v rustup >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 || {
     echo 'The locked rustup is present but rustup/cargo are not both discoverable. Use the default ~/.cargo layout or set CARGO_HOME before retrying.' >&2
     exit 24
@@ -980,8 +1047,14 @@ install_tools() {
   }
 
   fence_require_directory "$HOME/src" "$src_fd" 'source directory'
+  [[ ! -L "$src_anchor/rtk" ]] || {
+    echo 'RTK source checkout path must not be a symlink.' >&2
+    exit 24
+  }
   if [[ ! -d "$src_anchor/rtk/.git" ]]; then
     git clone "$RTK_REPO_URL" "$src_anchor/rtk"
+  else
+    validate_rtk_source_checkout "$src_anchor/rtk" || exit 24
   fi
   fence_require_directory "$HOME/src" "$src_fd" 'source directory'
   git -C "$src_anchor/rtk" remote set-url origin "$RTK_REPO_URL"
@@ -990,17 +1063,12 @@ install_tools() {
   [[ "$(git -C "$src_anchor/rtk" rev-parse HEAD)" == "$RTK_REF" ]] || {
     echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
   }
+  validate_rtk_source_checkout "$src_anchor/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
   cargo install --path "$src_anchor/rtk" --locked --force
   for executable in rustup cargo rustc; do
     executable_path="$(command -v "$executable")"
     fence_replace_link "$executable_path" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
-  cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-  cargo_install_root="${CARGO_INSTALL_ROOT:-$cargo_home}"
-  [[ "$cargo_install_root" == "$HOME/.cargo" ]] || {
-    echo "RTK must use the canonical cargo root '$HOME/.cargo', got '$cargo_install_root'." >&2
-    exit 24
-  }
   [[ -x "$cargo_install_root/bin/rtk" ]] || {
     echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
     exit 24
