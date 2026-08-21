@@ -343,6 +343,16 @@ fence_replace_python_launcher() {
       echo "Refusing to replace an unmanaged Python launcher symlink: $target_path" >&2
       exit 24
     }
+    [[ -f "$existing_real" && ! -L "$existing_real" ]] || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Managed Python launcher symlink does not target a regular runtime: $target_path" >&2
+      exit 24
+    }
+    fence_components_safe "$existing_real" || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Managed Python launcher symlink target has unsafe components: $target_path" >&2
+      exit 24
+    }
   elif [[ -e "$anchor" && ! -f "$anchor" ]]; then
     if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
     echo "Refusing to replace a non-file Python launcher: $target_path" >&2
@@ -915,6 +925,7 @@ install_tools() {
   validate_managed_paths \
     "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
     "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" "$HOME/src" \
+    "$HOME/.cargo" "$HOME/.cargo/bin" "$HOME/.cargo/bin/rtk" \
     "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" || {
       echo 'Managed bootstrap paths are unsafe.' >&2
       exit 24
@@ -992,6 +1003,10 @@ install_tools() {
   }
   [[ -x "$cargo_install_root/bin/rtk" ]] || {
     echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
+    exit 24
+  }
+  [[ -f "$cargo_install_root/bin/rtk" && ! -L "$cargo_install_root/bin/rtk" ]] || {
+    echo 'Canonical cargo RTK is not a regular executable.' >&2
     exit 24
   }
   fence_remove_managed_link "$cargo_install_root/bin/rtk" "$bin_dir/rtk" before-rtk-alias-removal "$bin_fd"
