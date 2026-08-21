@@ -24,10 +24,21 @@ dirty_bootstrap_root="$test_root/dirty-bootstrap"
 cp -a -- "$source_fixture" "$dirty_bootstrap_root"
 dirty_bootstrap_marker="$test_root/dirty-bootstrap-top-level"
 dirty_bootstrap_function_marker="$test_root/dirty-bootstrap-function"
+dirty_bootstrap_entrypoint_marker="$test_root/dirty-bootstrap-entrypoint"
 cat >> "$dirty_bootstrap_root/scripts/ubuntu/source-attestation.sh" <<EOF
 : > '$dirty_bootstrap_marker'
 attestation_create_git_snapshot() { : > '$dirty_bootstrap_function_marker'; return 0; }
 EOF
+cat >> "$dirty_bootstrap_root/scripts/ubuntu/bootstrap.sh" <<EOF
+: > '$dirty_bootstrap_entrypoint_marker'
+EOF
+
+bash_env_marker="$test_root/bash-env-reached"
+bash_env_file="$test_root/bash-env"
+cat > "$bash_env_file" <<EOF
+: > '$bash_env_marker'
+EOF
+chmod 0755 "$bash_env_file"
 
 # Every prelude command is deliberately shadowed by a marker binary.  The
 # entrypoints must bind to absolute system tools before any PATH lookup.
@@ -43,19 +54,20 @@ EOF
 done
 
 set +e
-env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" \
-  /usr/bin/bash "$dirty_bootstrap_root/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
+env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" BASH_ENV="$bash_env_file" \
+  "$dirty_bootstrap_root/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
   > "$test_root/dirty-bootstrap-output" 2>&1
 dirty_bootstrap_status=$?
 set -e
 (( dirty_bootstrap_status != 0 )) || { echo 'Dirty live bootstrap helper was accepted.' >&2; exit 1; }
-[[ ! -e "$dirty_bootstrap_marker" && ! -e "$dirty_bootstrap_function_marker" ]] || {
+[[ ! -e "$dirty_bootstrap_marker" && ! -e "$dirty_bootstrap_function_marker" && \
+   ! -e "$dirty_bootstrap_entrypoint_marker" && ! -e "$bash_env_marker" ]] || {
   echo 'Dirty bootstrap helper code executed before attestation.' >&2
   exit 1
 }
 
-if ! env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" \
-  /usr/bin/bash "$source_fixture/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
+if ! env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" BASH_ENV="$bash_env_file" \
+  "$source_fixture/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
   > "$test_root/hostile-bootstrap-output" 2>&1; then
   cat "$test_root/hostile-bootstrap-output" >&2
   exit 1
@@ -76,6 +88,21 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/lib/herdr-workstation" "$HOME/.config/
 # Source only: the real base/tools phases must not run in this regression.
 # shellcheck disable=SC1091
 source "$bootstrap_script"
+
+# Re-sourcing the helper must not reset the cleanup registry. This mirrors the
+# bootstrap/receipt helper reload path and makes failure cleanup observable.
+cleanup_registry_probe="$(mktemp -d)"
+attestation_register_temporary_path "$cleanup_registry_probe"
+source "$attestation_helper"
+[[ "${attestation_temporary_paths[*]}" == *"$cleanup_registry_probe"* ]] || {
+  echo 'Helper re-source discarded the cleanup registry.' >&2
+  exit 1
+}
+attestation_cleanup_temporary_paths
+[[ ! -e "$cleanup_registry_probe" ]] || {
+  echo 'Cleanup registry did not remove the re-source probe.' >&2
+  exit 1
+}
 
 # Cargo roots are validated before any Cargo operation can run.
 mkdir -p "$HOME/.cargo"
@@ -106,6 +133,56 @@ git -C "$rtk_source" commit -qm 'fixture source'
 rtk_source_commit="$(git -C "$rtk_source" rev-parse HEAD)"
 git -C "$rtk_source" remote add origin https://example.invalid/rtk.git
 validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+
+# Linked worktrees are accepted only when the checkout pointer, reciprocal
+# worktree record, exact ../.. common-directory relationship, and local object
+# storage all agree on the same source. Each substitution below is rejected
+# before any snapshot bytes reach Cargo.
+linked_main="$test_root/linked-main"
+linked_checkout="$test_root/linked-checkout"
+mkdir -p "$linked_main"
+git -C "$linked_main" init -q
+git -C "$linked_main" config user.email fixture@example.invalid
+git -C "$linked_main" config user.name fixture
+printf 'linked source\n' > "$linked_main/README"
+git -C "$linked_main" add README
+git -C "$linked_main" commit -qm 'linked source fixture'
+git -C "$linked_main" remote add origin https://example.invalid/rtk.git
+git -C "$linked_main" worktree add -q --detach "$linked_checkout" HEAD
+linked_commit="$(git -C "$linked_checkout" rev-parse HEAD)"
+validate_rtk_source_checkout "$linked_checkout" https://example.invalid/rtk.git "$linked_commit"
+linked_git_pointer_before="$(< "$linked_checkout/.git")"
+linked_git_dir="$(git -C "$linked_checkout" rev-parse --absolute-git-dir)"
+linked_common_dir="$(git -C "$linked_checkout" rev-parse --git-common-dir)"
+linked_common_dir="$(realpath -e -- "$linked_common_dir")"
+linked_record="$linked_git_dir/gitdir"
+linked_record_before="$(< "$linked_record")"
+linked_commondir_before="$(< "$linked_git_dir/commondir")"
+printf 'gitdir: %s\n' "$linked_main/.git" > "$linked_checkout/.git"
+expect_linked_failure() {
+  local label="$1"
+  if attestation_create_git_snapshot "$linked_checkout" https://example.invalid/rtk.git "$linked_commit"; then
+    echo "$label was accepted." >&2
+    exit 1
+  fi
+}
+expect_linked_failure 'Substituted linked-worktree checkout pointer'
+printf '%s\n' "$linked_git_pointer_before" > "$linked_checkout/.git"
+printf '%s\n' "$linked_main/.git" > "$linked_record"
+expect_linked_failure 'Substituted linked-worktree reciprocal record'
+printf '%s\n' "$linked_record_before" > "$linked_record"
+printf '../' > "$linked_git_dir/commondir"
+expect_linked_failure 'Substituted linked-worktree commondir'
+printf '%s\n' "$linked_commondir_before" > "$linked_git_dir/commondir"
+mkdir -p "$linked_common_dir/worktrees/substitution"
+printf '%s\n' "$linked_checkout/.git" > "$linked_common_dir/worktrees/substitution/gitdir"
+expect_linked_failure 'Duplicate linked-worktree source owner'
+rm -rf -- "$linked_common_dir/worktrees/substitution"
+mv "$linked_common_dir/objects" "$linked_common_dir/objects-real"
+ln -s objects-real "$linked_common_dir/objects"
+expect_linked_failure 'Substituted linked-worktree object storage'
+rm -- "$linked_common_dir/objects"
+mv "$linked_common_dir/objects-real" "$linked_common_dir/objects"
 
 # Git configuration, environment, and PATH are all hostile inputs to the
 # attestation seam. They must fail closed before any filter or forged Git is
@@ -180,6 +257,11 @@ cat > "$HOME/.cargo/bin/cargo" <<EOF
 : > "$cargo_install_marker"
 EOF
 chmod 0755 "$HOME/.cargo/bin/cargo"
+cat > "$HOME/.cargo/bin/rustc" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "$HOME/.cargo/bin/rustc"
 install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
 [[ -f "$cargo_install_marker" ]] || { echo 'Clean RTK source did not reach the Cargo seam.' >&2; exit 1; }
 
@@ -230,40 +312,106 @@ cargo_race_safe="$test_root/cargo-race-safe"
 cargo_race_hostile="$test_root/cargo-race-hostile"
 cargo_race_safe_marker="$test_root/cargo-race-safe-executed"
 cargo_race_hostile_marker="$test_root/cargo-race-hostile-executed"
+rustc_race_safe="$test_root/rustc-race-safe"
+rustc_race_hostile="$test_root/rustc-race-hostile"
+rustc_race_safe_marker="$test_root/rustc-race-safe-executed"
+rustc_race_hostile_marker="$test_root/rustc-race-hostile-executed"
+stage_race_hostile_marker="$test_root/cargo-stage-race-hostile-executed"
 cat > "$cargo_race_safe" <<EOF
 #!/usr/bin/bash
 : > '$cargo_race_safe_marker'
+\${RUSTC:?} --version
 EOF
 cat > "$cargo_race_hostile" <<EOF
 #!/usr/bin/bash
 : > '$cargo_race_hostile_marker'
 EOF
-chmod 0755 "$cargo_race_safe" "$cargo_race_hostile"
+cat > "$rustc_race_safe" <<EOF
+#!/usr/bin/bash
+: > '$rustc_race_safe_marker'
+EOF
+cat > "$rustc_race_hostile" <<EOF
+#!/usr/bin/bash
+: > '$rustc_race_hostile_marker'
+EOF
+chmod 0755 "$cargo_race_safe" "$cargo_race_hostile" "$rustc_race_safe" "$rustc_race_hostile"
 cp -- "$cargo_race_safe" "$HOME/.cargo/bin/cargo"
-cargo_race_ready="$test_root/cargo-race-ready"
-cargo_race_continue="$test_root/cargo-race-continue"
-(
-  HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-cargo-exec \
-  HERDR_BOOTSTRAP_TEST_READY_FILE="$cargo_race_ready" \
-  HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$cargo_race_continue" \
-  install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
-) > "$test_root/cargo-race-output" 2>&1 &
-cargo_race_pid=$!
-while [[ ! -e "$cargo_race_ready" ]]; do sleep 0.01; done
-rm -- "$HOME/.cargo/bin/cargo"
-ln -s "$cargo_race_hostile" "$HOME/.cargo/bin/cargo"
-: > "$cargo_race_continue"
-set +e
-wait "$cargo_race_pid"
-cargo_race_status=$?
-set -e
-(( cargo_race_status != 0 )) || { echo 'Cargo replacement race was accepted.' >&2; exit 1; }
-[[ -e "$cargo_race_safe_marker" && ! -e "$cargo_race_hostile_marker" ]] || {
-  echo 'Cargo replacement race executed the swapped user path.' >&2
-  exit 1
+cp -- "$rustc_race_safe" "$HOME/.cargo/bin/rustc"
+run_cargo_race_probe() {
+  local label="$1"
+  local replacement="$2"
+  local cargo_race_ready="$test_root/cargo-race-$label-ready"
+  local cargo_race_continue="$test_root/cargo-race-$label-continue"
+  local cargo_race_output="$test_root/cargo-race-$label-output"
+  local cargo_race_pid cargo_race_status cargo_stage_dir previous_stage_dir already_present
+  local -a cargo_stage_dirs_before=()
+  rm -f -- "$cargo_race_safe_marker" "$rustc_race_safe_marker" \
+    "$cargo_race_hostile_marker" "$rustc_race_hostile_marker" "$stage_race_hostile_marker"
+  mapfile -t cargo_stage_dirs_before < <(find /tmp -maxdepth 1 -type d -name 'herdr-cargo-exec.*' -print)
+  (
+    HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-cargo-exec \
+    HERDR_BOOTSTRAP_TEST_READY_FILE="$cargo_race_ready" \
+    HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$cargo_race_continue" \
+    install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+  ) > "$cargo_race_output" 2>&1 &
+  cargo_race_pid=$!
+  while [[ ! -e "$cargo_race_ready" ]]; do sleep 0.01; done
+  case "$replacement" in
+    cargo)
+      rm -- "$HOME/.cargo/bin/cargo"
+      ln -s "$cargo_race_hostile" "$HOME/.cargo/bin/cargo"
+      ;;
+    rustc)
+      rm -- "$HOME/.cargo/bin/rustc"
+      ln -s "$rustc_race_hostile" "$HOME/.cargo/bin/rustc"
+      ;;
+    stage)
+      for cargo_stage_dir in /tmp/herdr-cargo-exec.*; do
+        [[ -d "$cargo_stage_dir" ]] || continue
+        already_present=0
+        for previous_stage_dir in "${cargo_stage_dirs_before[@]}"; do
+          [[ "$cargo_stage_dir" == "$previous_stage_dir" ]] && already_present=1
+        done
+        if (( already_present == 0 )); then
+          rm -- "$cargo_stage_dir/cargo"
+          cat > "$cargo_stage_dir/cargo" <<EOF
+#!/usr/bin/bash
+: > '$stage_race_hostile_marker'
+EOF
+          chmod 0755 "$cargo_stage_dir/cargo"
+        fi
+      done
+      ;;
+    *)
+      echo "Unknown Cargo race replacement: $replacement" >&2
+      exit 1
+      ;;
+  esac
+  : > "$cargo_race_continue"
+  set +e
+  wait "$cargo_race_pid"
+  cargo_race_status=$?
+  set -e
+  (( cargo_race_status != 0 )) || { echo "$label Cargo replacement race was accepted." >&2; exit 1; }
+  [[ ! -e "$cargo_race_hostile_marker" && ! -e "$rustc_race_hostile_marker" && \
+     ! -e "$stage_race_hostile_marker" ]] || {
+    echo "Cargo, staged Cargo, or rustc replacement race executed an attacker path ($label)." >&2
+    exit 1
+  }
+  if [[ "$replacement" == cargo ]]; then
+    [[ -e "$cargo_race_safe_marker" && -e "$rustc_race_safe_marker" ]] || {
+      echo 'Stable Cargo or rustc descriptors did not execute their validated material.' >&2
+      exit 1
+    }
+  fi
+  rm -f -- "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc"
+  cp -- "$cargo_race_safe" "$HOME/.cargo/bin/cargo"
+  cp -- "$rustc_race_safe" "$HOME/.cargo/bin/rustc"
 }
-rm -- "$HOME/.cargo/bin/cargo"
-cp -- "$cargo_race_safe" "$HOME/.cargo/bin/cargo"
+
+run_cargo_race_probe cargo cargo
+run_cargo_race_probe rustc rustc
+run_cargo_race_probe stage stage
 
 expect_rtk_install_rejected() {
   local label="$1"

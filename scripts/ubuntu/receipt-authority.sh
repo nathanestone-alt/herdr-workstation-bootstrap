@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/env -S -i BASH_ENV= ENV= CDPATH= PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TZ=UTC /usr/bin/bash
 set -euo pipefail
 
 # Receipt authority is also an entrypoint.  Its live sibling helper is never
@@ -18,10 +18,38 @@ readonly receipt_awk_bin='/usr/bin/gawk'
 readonly receipt_head_bin='/usr/bin/head'
 readonly receipt_cp_bin='/usr/bin/cp'
 readonly receipt_rm_bin='/usr/bin/rm'
+readonly receipt_chown_bin='/usr/bin/chown'
+readonly receipt_getent_bin='/usr/bin/getent'
+readonly receipt_id_bin='/usr/bin/id'
 
 export PATH="$receipt_trusted_path"
 export LC_ALL=C
 export TZ=UTC
+receipt_reject_dangerous_environment() {
+  local receipt_env_name
+  while IFS= read -r receipt_env_name; do
+    case "$receipt_env_name" in
+      BASH_ENV|ENV|CDPATH)
+        [[ -z "${!receipt_env_name:-}" ]] && continue
+        echo "receipt authority trust prelude: dangerous caller environment is not permitted: $receipt_env_name" >&2
+        exit 24
+        ;;
+      IFS|SHELLOPTS|BASHOPTS|GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_COMMON_DIR|GIT_CONFIG_*|LD_*|DYLD_*|LIBRARY_PATH|CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|CMAKE_PREFIX_PATH|CARGO_*|RUSTC|RUSTDOC|RUSTFLAGS|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTUP_TOOLCHAIN|RUSTUP_HOME|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NPM_CONFIG_*|COREPACK_*|PYTHONHOME|PYTHONPATH|PYTHONSTARTUP|PYTHONINSPECT|PYTHONUSERBASE|PYTHONWARNINGS|PYTHONBREAKPOINT|CURL_HOME|CURL_CA_BUNDLE|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|GCONV_PATH|TMPDIR)
+        echo "receipt authority trust prelude: dangerous caller environment is not permitted: $receipt_env_name" >&2
+        exit 24
+        ;;
+    esac
+  done < <(compgen -e)
+}
+receipt_reject_dangerous_environment
+if [[ -z "${HOME:-}" ]]; then
+  receipt_launch_home="$($receipt_getent_bin passwd "$($receipt_id_bin -u)" 2>/dev/null | "$receipt_awk_bin" -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
+  [[ "$receipt_launch_home" == /* && "$receipt_launch_home" != '/' ]] || {
+    echo 'receipt authority trust prelude: the current user has no safe passwd home' >&2
+    exit 24
+  }
+  export HOME="$receipt_launch_home"
+fi
 while IFS= read -r receipt_env_name; do
   case "$receipt_env_name" in
     GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_COMMON_DIR|GIT_CONFIG_*)
@@ -30,6 +58,73 @@ while IFS= read -r receipt_env_name; do
       ;;
   esac
 done < <(compgen -e)
+
+receipt_reexec_committed_entrypoint() {
+  local receipt_arg
+  for receipt_arg in "$@"; do
+    if [[ "$receipt_arg" == --payload-root ]]; then
+      [[ "${HERDR_RECEIPT_VERIFIED_PAYLOAD:-}" == 1 ]] || {
+        echo 'receipt authority trust boundary: payload entrypoint requires the verified root launcher' >&2
+        exit 24
+      }
+      return 0
+    fi
+  done
+  [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_RECEIPT_VERIFIED_ENTRYPOINT:-}" != 1 ]] || return 0
+  local live_script live_dir repo_root commit committed_oid temp_dir committed_script materialized_oid
+  live_script="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  live_dir="$(/usr/bin/dirname -- "$live_script")"
+  repo_root="$(/usr/bin/realpath -e -- "$live_dir/../.." 2>/dev/null || true)"
+  [[ -n "$live_script" && -n "$repo_root" && "$live_script" == "$repo_root/scripts/ubuntu/receipt-authority.sh" && \
+    -d "$repo_root" && ! -L "$repo_root" ]] || {
+    echo 'receipt authority trust boundary: live entrypoint is not at the canonical repository path' >&2
+    exit 24
+  }
+  commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+  committed_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$commit:scripts/ubuntu/receipt-authority.sh" 2>/dev/null || true)"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ && "$committed_oid" =~ ^[0-9a-f]{40}$ ]] || exit 24
+  temp_dir="$(/usr/bin/mktemp -d /tmp/herdr-receipt-entrypoint.XXXXXX)" || exit 24
+  trap '/usr/bin/rm -rf -- "$temp_dir"' EXIT
+  committed_script="$temp_dir/receipt-authority.sh"
+  /usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$commit:scripts/ubuntu/receipt-authority.sh" > "$committed_script" || {
+      /usr/bin/rm -rf -- "$temp_dir"
+      exit 24
+    }
+  materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$committed_script")"
+  [[ "$materialized_oid" == "$committed_oid" ]] || {
+    /usr/bin/rm -rf -- "$temp_dir"
+    exit 24
+  }
+  /usr/bin/chmod 0700 -- "$temp_dir"
+  exec /usr/bin/env -i \
+    HOME="${HOME:-/nonexistent}" \
+    PATH="$receipt_trusted_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    HERDR_RECEIPT_VERIFIED_ENTRYPOINT=1 \
+    HERDR_RECEIPT_REPO_ROOT="$repo_root" \
+    HERDR_RECEIPT_ENTRYPOINT_TEMP="$temp_dir" \
+    HERDR_RECEIPT_TEST_PAUSE_PHASE="${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" \
+    HERDR_RECEIPT_TEST_READY_FILE="${HERDR_RECEIPT_TEST_READY_FILE:-}" \
+    HERDR_RECEIPT_TEST_CONTINUE_FILE="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}" \
+    /usr/bin/bash "$committed_script" "$@"
+}
+receipt_reexec_committed_entrypoint "$@"
+if [[ "${HERDR_RECEIPT_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
+  trap '/usr/bin/rm -rf -- "$HERDR_RECEIPT_ENTRYPOINT_TEMP"' EXIT
+fi
 unset BASH_ENV ENV CDPATH GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG_PARAMETERS
 while IFS= read -r receipt_env_name; do
@@ -76,9 +171,70 @@ for receipt_trusted_binary in \
   "$receipt_env_bin" "$receipt_realpath_bin" "$receipt_dirname_bin" \
   "$receipt_find_bin" "$receipt_mktemp_bin" "$receipt_chmod_bin" \
   "$receipt_stat_bin" "$receipt_sha256_bin" "$receipt_awk_bin" \
-  "$receipt_head_bin" "$receipt_cp_bin" "$receipt_rm_bin"; do
+  "$receipt_head_bin" "$receipt_cp_bin" "$receipt_rm_bin" "$receipt_chown_bin" \
+  "$receipt_getent_bin" "$receipt_id_bin"; do
   receipt_trust_assert_binary "$receipt_trusted_binary"
 done
+
+receipt_exec_system() {
+  local receipt_exec_arg
+  local -a receipt_exec_args=()
+  for receipt_exec_arg in "$@"; do
+    if [[ "$receipt_exec_arg" == /proc/self/fd/* ]]; then
+      receipt_exec_args+=("/proc/${BASHPID}/fd/${receipt_exec_arg##*/}")
+    else
+      receipt_exec_args+=("$receipt_exec_arg")
+    fi
+  done
+  "$receipt_env_bin" -i \
+    PATH="$receipt_trusted_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    "${receipt_exec_args[@]}"
+}
+
+receipt_exec_role() {
+  local receipt_exec_arg
+  local -a receipt_exec_args=()
+  for receipt_exec_arg in "$@"; do
+    if [[ "$receipt_exec_arg" == /proc/self/fd/* ]]; then
+      receipt_exec_args+=("/proc/${BASHPID}/fd/${receipt_exec_arg##*/}")
+    else
+      receipt_exec_args+=("$receipt_exec_arg")
+    fi
+  done
+  "$receipt_env_bin" -i \
+    HOME=/nonexistent \
+    PATH="$receipt_trusted_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    BASH_ENV= \
+    ENV= \
+    "${receipt_exec_args[@]}"
+}
+
+receipt_exec_python() {
+  local receipt_exec_arg
+  local -a receipt_exec_args=()
+  for receipt_exec_arg in "$@"; do
+    if [[ "$receipt_exec_arg" == /proc/self/fd/* ]]; then
+      receipt_exec_args+=("/proc/${BASHPID}/fd/${receipt_exec_arg##*/}")
+    else
+      receipt_exec_args+=("$receipt_exec_arg")
+    fi
+  done
+  "$receipt_env_bin" -i \
+    HOME=/nonexistent \
+    PATH="$receipt_trusted_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    PYTHONNOUSERSITE=1 \
+    PYTHONPATH= \
+    PYTHONHOME= \
+    PYTHONSTARTUP= \
+    PYTHONINSPECT=0 \
+    "${receipt_exec_args[@]}"
+}
 
 receipt_trust_git() {
   "$receipt_env_bin" -i \
@@ -129,6 +285,28 @@ receipt_materialize_helper_from_git() {
     receipt_commondir_spec="$(< "$receipt_git_dir/commondir")"
     [[ "$receipt_commondir_spec" == '../..' ]] || receipt_trust_fail 'receipt Git common directory is not local'
     receipt_common_git_dir="$($receipt_realpath_bin -e -- "$receipt_git_dir/$receipt_commondir_spec" 2>/dev/null || true)"
+    receipt_worktree_record="$receipt_common_git_dir/worktrees/${receipt_git_dir##*/}"
+    [[ -d "$receipt_common_git_dir/worktrees" && ! -L "$receipt_common_git_dir/worktrees" && \
+      "$($receipt_realpath_bin -e -- "$receipt_worktree_record" 2>/dev/null || true)" == "$receipt_git_dir" && \
+      -f "$receipt_git_dir/gitdir" && ! -L "$receipt_git_dir/gitdir" ]] || {
+      receipt_trust_fail 'receipt Git worktree record is not exact and reciprocal'
+    }
+    receipt_worktree_record_pointer="$(< "$receipt_git_dir/gitdir")"
+    receipt_worktree_record_canonical="$($receipt_realpath_bin -e -- "$receipt_worktree_record_pointer" 2>/dev/null || true)"
+    [[ "$receipt_worktree_record_pointer" != *$'\n'* && "$receipt_worktree_record_pointer" != *$'\r'* && \
+      "$receipt_worktree_record_canonical" == "$receipt_repo_root/.git" ]] || {
+      receipt_trust_fail 'receipt Git worktree record does not own this source path'
+    }
+    while IFS= read -r -d '' receipt_other_worktree_record; do
+      [[ "${receipt_other_worktree_record%/gitdir}" == "$receipt_git_dir" ]] && continue
+      receipt_other_worktree_pointer="$(< "$receipt_other_worktree_record")"
+      [[ "$receipt_other_worktree_pointer" != *$'\n'* && "$receipt_other_worktree_pointer" != *$'\r'* ]] || {
+        receipt_trust_fail 'receipt Git worktree record contains unsafe text'
+      }
+      [[ "$($receipt_realpath_bin -e -- "$receipt_other_worktree_pointer" 2>/dev/null || true)" != "$receipt_repo_root/.git" ]] || {
+        receipt_trust_fail 'receipt Git worktree source ownership is ambiguous'
+      }
+    done < <("$receipt_find_bin" -P "$receipt_common_git_dir/worktrees" -mindepth 2 -maxdepth 2 -type f -name gitdir -print0 2>/dev/null)
   fi
   [[ -n "$receipt_git_dir" && -d "$receipt_git_dir" && ! -L "$receipt_git_dir" && \
     -n "$receipt_common_git_dir" && -d "$receipt_common_git_dir" && ! -L "$receipt_common_git_dir" ]] || receipt_trust_fail 'receipt Git directory is not canonical'
@@ -138,7 +316,10 @@ receipt_materialize_helper_from_git() {
   receipt_refs_dir="$receipt_common_git_dir/refs"
   receipt_config_path="$receipt_common_git_dir/config"
   receipt_index_path="$receipt_git_dir/index"
-  [[ -d "$receipt_objects_dir" && ! -L "$receipt_objects_dir" && -d "$receipt_refs_dir" && ! -L "$receipt_refs_dir" && \
+  [[ -d "$receipt_objects_dir" && ! -L "$receipt_objects_dir" && \
+    "$($receipt_realpath_bin -e -- "$receipt_objects_dir" 2>/dev/null || true)" == "$receipt_objects_dir" && \
+    -d "$receipt_refs_dir" && ! -L "$receipt_refs_dir" && \
+    "$($receipt_realpath_bin -e -- "$receipt_refs_dir" 2>/dev/null || true)" == "$receipt_refs_dir" && \
     -f "$receipt_config_path" && ! -L "$receipt_config_path" && -f "$receipt_index_path" && ! -L "$receipt_index_path" ]] || {
     receipt_trust_fail 'receipt Git object, ref, config, or index storage is unsafe'
   }
@@ -216,22 +397,37 @@ receipt_materialize_helper_from_payload() {
     "$receipt_script_path" == "$receipt_prelude_source_root/scripts/ubuntu/receipt-authority.sh" ]] || {
     receipt_trust_fail 'payload receipt paths are not topology-bound'
   }
+  if [[ -z "$fixture_root" ]]; then
+    [[ "$(/usr/bin/id -u)" == 0 ]] || receipt_trust_fail 'production payload receipt requires root'
+    while IFS= read -r -d '' receipt_stage_entry; do
+      [[ "$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$receipt_stage_entry" 2>/dev/null || true)" == 0 && \
+        "$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$receipt_stage_entry" 2>/dev/null || true)" =~ ^[0-7]+$ && \
+        $((8#$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$receipt_stage_entry" 2>/dev/null || echo 777) & 022)) == 0 ]] || {
+        receipt_trust_fail 'payload receipt stage is not root-owned and non-writable'
+      }
+    done < <("$receipt_find_bin" -P "$receipt_prelude_payload_root" -print0)
+  fi
   receipt_trust_reject_symlink_components "$receipt_prelude_payload_root" || receipt_trust_fail 'payload root contains symlinked components'
   [[ -f "$receipt_prelude_payload_manifest" && ! -L "$receipt_prelude_payload_manifest" && \
     "$($receipt_head_bin -n 1 -- "$receipt_prelude_payload_manifest")" == herdr-payload-manifest-v1 ]] || {
     receipt_trust_fail 'payload manifest is missing or malformed'
   }
-  [[ -z "$receipt_prelude_payload_hash" || "$receipt_prelude_payload_hash" =~ ^[0-9a-f]{64}$ ]] || {
-    receipt_trust_fail 'payload manifest hash is malformed'
+  [[ "$receipt_prelude_payload_hash" =~ ^[0-9a-f]{64}$ ]] || {
+    receipt_trust_fail 'payload manifest requires a mandatory external SHA-256 binding'
   }
-  if [[ -n "$receipt_prelude_payload_hash" ]]; then
-    [[ "$($receipt_sha256_bin -- "$receipt_prelude_payload_manifest" | "$receipt_awk_bin" '{print $1}')" == "$receipt_prelude_payload_hash" ]] || {
-      receipt_trust_fail 'payload manifest hash does not match the trusted stage'
-    }
-  fi
+  [[ "$receipt_prelude_source_commit" =~ ^[0-9a-f]{40}$ ]] || {
+    receipt_trust_fail 'payload source requires a mandatory externally bound commit'
+  }
+  [[ "$($receipt_sha256_bin -- "$receipt_prelude_payload_manifest" | "$receipt_awk_bin" '{print $1}')" == "$receipt_prelude_payload_hash" ]] || {
+    receipt_trust_fail 'payload manifest hash does not match the trusted stage'
+  }
   [[ -f "$receipt_prelude_source_manifest" && ! -L "$receipt_prelude_source_manifest" && \
     "$($receipt_head_bin -n 1 -- "$receipt_prelude_source_manifest")" == herdr-source-snapshot-v2 ]] || {
     receipt_trust_fail 'source snapshot manifest is missing or malformed'
+  }
+  receipt_prelude_manifest_commit="$($receipt_awk -F= '$1 == "commit" { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_source_manifest" 2>/dev/null || true)"
+  [[ "$receipt_prelude_manifest_commit" == "$receipt_prelude_source_commit" ]] || {
+    receipt_trust_fail 'source snapshot commit is not externally bound'
   }
   receipt_payload_helper_record="$($receipt_awk -F '\t' '$1 == "F" && $4 == "source/scripts/ubuntu/source-attestation.sh" { print; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_payload_manifest" 2>/dev/null || true)"
   IFS=$'\t' read -r _ receipt_payload_helper_mode receipt_payload_helper_sha receipt_payload_helper_path <<< "$receipt_payload_helper_record"
@@ -262,6 +458,9 @@ declare -a receipt_cleanup_paths=()
 receipt_register_cleanup() {
   [[ -n "${1:-}" ]] && receipt_cleanup_paths+=("$1")
 }
+if [[ "${HERDR_RECEIPT_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
+  receipt_register_cleanup "$HERDR_RECEIPT_ENTRYPOINT_TEMP"
+fi
 
 receipt_private_helper_dir=''
 receipt_cleanup() {
@@ -278,9 +477,15 @@ receipt_cleanup() {
 }
 trap 'receipt_cleanup "$?"' EXIT
 
-receipt_script_path="$($receipt_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-receipt_script_dir="$($receipt_dirname_bin -- "$receipt_script_path")"
-receipt_repo_root="$($receipt_realpath_bin -e -- "$receipt_script_dir/../.." 2>/dev/null || true)"
+if [[ "${HERDR_RECEIPT_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
+  receipt_repo_root="${HERDR_RECEIPT_REPO_ROOT:-}"
+  receipt_script_path="$receipt_repo_root/scripts/ubuntu/receipt-authority.sh"
+  receipt_script_dir="$receipt_repo_root/scripts/ubuntu"
+else
+  receipt_script_path="$($receipt_realpath_bin -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  receipt_script_dir="$($receipt_dirname_bin -- "$receipt_script_path")"
+  receipt_repo_root="$($receipt_realpath_bin -e -- "$receipt_script_dir/../.." 2>/dev/null || true)"
+fi
 [[ -n "$receipt_script_path" && "$receipt_script_path" == "$receipt_repo_root/scripts/ubuntu/receipt-authority.sh" ]] || {
   receipt_trust_fail 'receipt authority entrypoint is not at the canonical repository path'
 }
@@ -290,6 +495,7 @@ receipt_prelude_source_manifest=''
 receipt_prelude_payload_root=''
 receipt_prelude_payload_manifest=''
 receipt_prelude_payload_hash=''
+receipt_prelude_source_commit=''
 receipt_prelude_args=("$@")
 for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; receipt_arg_index++)); do
   case "${receipt_prelude_args[$receipt_arg_index]}" in
@@ -316,6 +522,11 @@ for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; rece
     --payload-manifest-sha256)
       ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--payload-manifest-sha256 requires a value'
       receipt_prelude_payload_hash="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
+      ((receipt_arg_index++))
+      ;;
+    --source-commit)
+      ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--source-commit requires a value'
+      receipt_prelude_source_commit="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
       ((receipt_arg_index++))
       ;;
   esac
@@ -350,8 +561,11 @@ receipt_path='/etc/stmodel/issue-961/receipt.json'
 rtk_source_root=''
 source_manifest=''
 rtk_source_manifest=''
+source_manifest_supplied=0
+rtk_source_manifest_supplied=0
 payload_root=''
 payload_manifest_arg=''
+source_commit_binding=''
 fixture_root=''
 default_authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 default_receipt_path='/etc/stmodel/issue-961/receipt.json'
@@ -375,6 +589,7 @@ Options:
   --payload-root PATH      Root of the root-owned verified payload staging tree.
   --payload-manifest PATH  Verified payload manifest within PAYLOAD_ROOT.
   --payload-manifest-sha256 SHA256  Internal root-stage payload manifest binding.
+  --source-commit SHA1     External binding for the committed source snapshot.
   --fixture-root PATH      Test-only role root; requires non-production output paths.
 EOF
 }
@@ -393,11 +608,13 @@ while [[ $# -gt 0 ]]; do
     --payload-root) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_root="$2"; shift 2 ;;
     --payload-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_manifest_arg="$2"; shift 2 ;;
     --payload-manifest-sha256) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_prelude_payload_hash="$2"; shift 2 ;;
+    --source-commit) [[ $# -ge 2 ]] || { usage; exit 2; }; source_commit_binding="$2"; shift 2 ;;
     --fixture-root) [[ $# -ge 2 ]] || { usage; exit 2; }; fixture_root="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+[[ -n "$rtk_source_manifest" ]] && rtk_source_manifest_supplied=1
 
 fail() {
   echo "receipt authority: $*" >&2
@@ -445,9 +662,10 @@ attestation_assert_canonical_git || fail 'canonical /usr/bin/git is unavailable'
 source_root="$(/usr/bin/realpath -e -- "$source_root" 2>/dev/null || true)"
 [[ -n "$source_root" && -d "$source_root" ]] || fail 'source root does not exist'
 if [[ -n "$source_manifest" ]]; then
+  source_manifest_supplied=1
   source_manifest="$(/usr/bin/realpath -e -- "$source_manifest" 2>/dev/null || true)"
   [[ "$source_manifest" == "$source_root/.source-attestation" ]] || fail 'source manifest is not bound to the source snapshot'
-  attestation_verify_snapshot "$source_root" "$source_manifest" || fail 'source snapshot manifest is invalid'
+  attestation_verify_snapshot "$source_root" "$source_manifest" "$source_commit_binding" || fail 'source snapshot manifest is invalid or externally unbound'
 else
   attestation_create_git_snapshot "$source_root" '' '' || fail 'source Git checkout failed hardened source attestation'
   source_root="$attestation_snapshot_dir"
@@ -468,11 +686,14 @@ expected_helper_sha256="$(attestation_snapshot_file_digest "$source_manifest" sc
 
 if [[ -n "$payload_root" || -n "$payload_manifest_arg" ]]; then
   [[ -n "$payload_root" && -n "$payload_manifest_arg" ]] || fail 'payload root and manifest must be supplied together'
+  [[ "$source_commit_binding" == "$receipt_prelude_source_commit" && "$source_commit_binding" =~ ^[0-9a-f]{40}$ ]] || fail 'payload source commit binding is missing or inconsistent'
   payload_root="$(/usr/bin/realpath -e -- "$payload_root" 2>/dev/null || true)"
   payload_manifest_arg="$(/usr/bin/realpath -e -- "$payload_manifest_arg" 2>/dev/null || true)"
   [[ "$payload_manifest_arg" == "$payload_root/.payload-manifest" ]] || fail 'payload manifest is not bound to the payload root'
-  attestation_verify_payload_manifest "$payload_root" "$payload_manifest_arg" || fail 'payload manifest is invalid'
+  attestation_verify_payload_manifest "$payload_root" "$payload_manifest_arg" "$receipt_prelude_payload_hash" || fail 'payload manifest is invalid or externally unbound'
 fi
+[[ "$source_manifest_supplied" == 0 || -n "$payload_root" ]] || fail 'a supplied source manifest requires an externally bound payload'
+[[ "$rtk_source_manifest_supplied" == 0 || -n "$payload_root" ]] || fail 'a supplied RTK manifest requires an externally bound payload'
 
 user_home="$(/usr/bin/realpath -e -- "$user_home" 2>/dev/null || true)"
 [[ -n "$user_home" && -d "$user_home" ]] || fail 'managed user home does not exist'
@@ -584,6 +805,21 @@ else
   fi
 fi
 
+if [[ -z "$fixture_root" ]]; then
+  [[ "${role_path[bash]}" == /usr/bin/bash && "${role_path[git]}" == /usr/bin/git && \
+    "${role_path[gh]}" == /usr/bin/gh && \
+    ( "${role_path[pwsh]}" == /usr/bin/pwsh || "${role_path[pwsh]}" == /opt/microsoft/powershell/7/pwsh ) ]] || {
+    fail 'system-only receipt roles are not bound to canonical system binaries'
+  }
+  for role in bash git gh pwsh; do
+    [[ "$(/usr/bin/stat -c '%u' -- "${role_path[$role]}" 2>/dev/null || true)" == 0 && \
+      "$(/usr/bin/stat -c '%a' -- "${role_path[$role]}" 2>/dev/null || true)" =~ ^[0-7]+$ && \
+      $((8#$(/usr/bin/stat -c '%a' -- "${role_path[$role]}" 2>/dev/null || echo 777) & 022)) == 0 ]] || {
+      fail "system-only role is not root-owned and non-writable: $role"
+    }
+  done
+fi
+
 canonical_executable() {
   local path="$1"
   local label="$2"
@@ -593,6 +829,77 @@ canonical_executable() {
   resolved="$(/usr/bin/realpath -e -- "$path" 2>/dev/null || true)"
   [[ "$resolved" == "$path" ]] || fail "$label is not lexically canonical: $path -> $resolved"
   printf '%s' "$path"
+}
+
+declare -A role_execution_path role_execution_command_path role_execution_fd role_execution_owner role_source_identity role_source_hash role_execution_hash
+receipt_exec_stage_dir=''
+
+receipt_stage_executable() {
+  local role="$1"
+  local path="${role_path[$role]}"
+  local mode source_id live_id source_hash stage stage_fd stage_id stage_hash current_id current_hash owner_pid descriptor_path
+  exec {stage_fd}<"$path" || fail "could not open stable $role source"
+  owner_pid="$BASHPID"
+  descriptor_path="/proc/$owner_pid/fd/$stage_fd"
+  mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$path" 2>/dev/null || true)"
+  source_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$descriptor_path" 2>/dev/null || true)"
+  live_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  source_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$descriptor_path" | "$receipt_awk_bin" '{print $1}')"
+  [[ "$source_id" =~ ^[0-9]+:[0-9]+$ && "$source_hash" =~ ^[0-9a-f]{64}$ && "$mode" =~ ^[0-7]+$ ]] || {
+    eval "exec ${stage_fd}<&-" 2>/dev/null || true
+    fail "$role source identity is invalid"
+  }
+  [[ "$source_id" == "$live_id" ]] || {
+    eval "exec ${stage_fd}<&-" 2>/dev/null || true
+    fail "$role source changed while opening"
+  }
+  receipt_test_pause "before-$role-staging"
+  stage="$receipt_exec_stage_dir/$role"
+  receipt_exec_system "$receipt_cp_bin" -- "$descriptor_path" "$stage" || {
+    eval "exec ${stage_fd}<&-" 2>/dev/null || true
+    fail "$role could not be copied from its stable descriptor"
+  }
+  # Re-open the canonical source after the first open and compare it with the
+  # bytes copied from the stable descriptor.  A same-user replacement is
+  # rejected; the staged descriptor is the only object later executed.
+  current_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  current_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$path" 2>/dev/null | "$receipt_awk_bin" '{print $1}' || true)"
+  [[ "$current_id" == "$source_id" && "$current_hash" == "$source_hash" ]] || {
+    eval "exec ${stage_fd}<&-" 2>/dev/null || true
+    fail "$role source changed during staging"
+  }
+  receipt_exec_system "$receipt_chmod_bin" "$mode" -- "$stage"
+  stage_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$stage" 2>/dev/null || true)"
+  stage_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$stage" | "$receipt_awk_bin" '{print $1}')"
+  [[ "$stage_id" =~ ^[0-9]+:[0-9]+$ && "$stage_hash" == "$source_hash" ]] || fail "$role staged identity does not match its source"
+  if [[ -z "$fixture_root" ]]; then
+    receipt_exec_system "$receipt_chown_bin" 0:0 -- "$stage" "$receipt_exec_stage_dir"
+    receipt_exec_system "$receipt_chmod_bin" 0500 -- "$stage"
+  fi
+  eval "exec ${stage_fd}<&-" 2>/dev/null || true
+  exec {stage_fd}<"$stage" || fail "could not open stable $role executable"
+  role_execution_path["$role"]="/proc/self/fd/$stage_fd"
+  role_execution_command_path["$role"]="$descriptor_path"
+  role_execution_fd["$role"]="$stage_fd"
+  role_execution_owner["$role"]="$owner_pid"
+  role_source_identity["$role"]="$source_id"
+  role_source_hash["$role"]="$source_hash"
+  role_execution_hash["$role"]="$stage_hash"
+  receipt_test_pause "after-$role-staging"
+}
+
+receipt_assert_source_identity() {
+  local role="$1"
+  local path="${role_path[$role]}"
+  local current_id current_hash
+  current_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  current_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$path" 2>/dev/null | "$receipt_awk_bin" '{print $1}' || true)"
+  [[ "$current_id" == "${role_source_identity[$role]}" && "$current_hash" == "${role_source_hash[$role]}" ]] || {
+    fail "$role source identity changed during receipt authority execution"
+  }
+  [[ "$(receipt_exec_system "$receipt_sha256_bin" -- "${role_execution_command_path[$role]}" | "$receipt_awk_bin" '{print $1}')" == "${role_execution_hash[$role]}" ]] || {
+    fail "$role stable execution object changed"
+  }
 }
 
 build_tree_manifest() {
@@ -636,6 +943,16 @@ reject_symlink_components "$python_runtime_root" || fail 'Python runtime contain
 [[ "$(/usr/bin/realpath -e -- "$python_runtime_root" 2>/dev/null || true)" == "$python_runtime_root" ]] || fail 'Python managed runtime is not lexically canonical'
 [[ -d "$python_stdlib_root" && ! -L "$python_stdlib_root" ]] || fail 'Python managed standard library is missing or not a directory'
 
+receipt_exec_stage_dir="$($receipt_mktemp_bin -d /tmp/herdr-receipt-exec.XXXXXX)"
+receipt_register_cleanup "$receipt_exec_stage_dir"
+receipt_exec_system "$receipt_chmod_bin" 0700 -- "$receipt_exec_stage_dir"
+if [[ -z "$fixture_root" ]]; then
+  receipt_exec_system "$receipt_chown_bin" 0:0 -- "$receipt_exec_stage_dir"
+fi
+for role in "${roles[@]}" python313; do
+  receipt_stage_executable "$role"
+done
+
 read_pyvenv_value() {
   local key="$1"
   /usr/bin/gawk -F= -v key="$key" '
@@ -659,14 +976,14 @@ python_venv_version="$(read_pyvenv_value version 2>/dev/null || true)"
 python_venv_sha256="$(/usr/bin/sha256sum "$python_venv_path" | /usr/bin/gawk '{print $1}')"
 
 runtime_manifest_file="$($receipt_mktemp_bin /tmp/herdr-receipt-runtime.XXXXXX)"
-stdlib_manifest_file="$($receipt_mktemp_bin /tmp/herdr-receipt-stdlib.XXXXXX)"
-role_fragments="$($receipt_mktemp_bin /tmp/herdr-receipt-roles.XXXXXX)"
-receipt_tmp="$($receipt_mktemp_bin /tmp/herdr-receipt-body.XXXXXX)"
-authority_tmp="$($receipt_mktemp_bin /tmp/herdr-receipt-authority.XXXXXX)"
 receipt_register_cleanup "$runtime_manifest_file"
+stdlib_manifest_file="$($receipt_mktemp_bin /tmp/herdr-receipt-stdlib.XXXXXX)"
 receipt_register_cleanup "$stdlib_manifest_file"
+role_fragments="$($receipt_mktemp_bin /tmp/herdr-receipt-roles.XXXXXX)"
 receipt_register_cleanup "$role_fragments"
+receipt_tmp="$($receipt_mktemp_bin /tmp/herdr-receipt-body.XXXXXX)"
 receipt_register_cleanup "$receipt_tmp"
+authority_tmp="$($receipt_mktemp_bin /tmp/herdr-receipt-authority.XXXXXX)"
 receipt_register_cleanup "$authority_tmp"
 runtime_file_count="$(build_tree_manifest "$python_runtime_root" "$runtime_manifest_file")"
 stdlib_file_count="$(build_tree_manifest "$python_stdlib_root" "$stdlib_manifest_file")"
@@ -694,9 +1011,9 @@ version_output_sha256() {
 
 probe_role_version() {
   local role="$1"
-  local path="${role_path[$role]}"
+  local path="${role_execution_command_path[$role]}"
   local output first
-  output="$(PATH="$trusted_path" "$path" --version 2>&1)" || fail "$role --version failed"
+  output="$(receipt_exec_role "$path" --version 2>&1)" || fail "$role --version failed"
   [[ -n "$output" ]] || fail "$role --version output is empty"
   first="${output%%$'\n'*}"
   case "$role" in
@@ -715,20 +1032,22 @@ for role in "${roles[@]}"; do
   IFS=$'\t' read -r role_version["$role"] role_version_hash["$role"] role_version_output["$role"] < <(probe_role_version "$role")
 done
 
-python_version_output="$(PATH="$trusted_path" "$python_path" --version 2>&1)" || fail 'python3.13 --version failed'
+python_version_output="$(receipt_exec_python "${role_execution_command_path[python313]}" --version 2>&1)" || fail 'python3.13 --version failed'
 [[ "$python_version_output" == "Python $PYTHON_VERSION" ]] || fail "Python version does not match lock: $python_version_output"
-python_probe="$(PYTHONNOUSERSITE=1 PYTHONPATH= PATH="$trusted_path" "$python_path" -c 'import json, os, platform, sys, sysconfig; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation(), "executable": sys.executable, "prefix": os.path.realpath(sys.prefix), "base_prefix": os.path.realpath(sys.base_prefix), "stdlib": os.path.realpath(sysconfig.get_path("stdlib"))}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
+python_probe="$(receipt_exec_python "${role_execution_command_path[python313]}" -c 'import json, os, platform, sys, sysconfig; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation(), "executable": os.path.realpath(sys.executable), "prefix": os.path.realpath(sys.prefix), "base_prefix": os.path.realpath(sys.base_prefix), "stdlib": os.path.realpath(sysconfig.get_path("stdlib"))}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
 python_probe_executable="$(printf '%s' "$python_probe" | "$jq_bin" -r '.executable' 2>/dev/null || true)"
 python_probe_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.prefix' 2>/dev/null || true)"
 python_probe_base_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.base_prefix' 2>/dev/null || true)"
 python_probe_stdlib="$(printf '%s' "$python_probe" | "$jq_bin" -r '.stdlib' 2>/dev/null || true)"
-[[ "$python_probe_executable" == "$python_path" ]] || fail 'Python probe executable differs from the canonical launcher'
+[[ "$python_probe_executable" == "$(/usr/bin/realpath -e -- "${role_execution_command_path[python313]}" 2>/dev/null || true)" ]] || fail 'Python probe executable differs from the stable launcher'
 [[ "$python_probe_prefix" == "$user_home/.local" ]] || fail 'Python probe prefix differs from the managed user environment'
 [[ "$python_probe_base_prefix" == "$python_runtime_root" ]] || fail 'Python probe base_prefix differs from the locked managed runtime'
 [[ "$python_probe_stdlib" == "$python_stdlib_root" ]] || fail 'Python probe stdlib differs from the locked managed runtime'
 python_json="$("$jq_bin" -n -cS \
   --arg executable "$python_path" \
   --arg sha256 "$($receipt_sha256_bin "$python_path" | /usr/bin/gawk '{print $1}')" \
+  --arg execution_path "${role_execution_path[python313]}" \
+  --arg execution_sha256 "${role_execution_hash[python313]}" \
   --arg version "$PYTHON_VERSION" \
   --arg implementation "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" \
   --argjson version_info "$(printf '%s' "$python_probe" | "$jq_bin" -c '.version_info')" \
@@ -746,22 +1065,27 @@ python_json="$("$jq_bin" -n -cS \
   --arg prefix "$python_probe_prefix" \
   --arg base_prefix "$python_probe_base_prefix" \
   --arg stdlib "$python_probe_stdlib" \
-  '{executable:$executable, sha256:$sha256, version:$version, version_info:$version_info, implementation:$implementation, venv:{path:$venv_path, sha256:$venv_sha256, home:$venv_home, include_system_site_packages:($venv_site == "true"), version:$venv_version}, runtime:{root:$runtime_root, manifest_sha256:$runtime_manifest_sha256, file_count:$runtime_file_count, stdlib_root:$stdlib_root, stdlib_manifest_sha256:$stdlib_manifest_sha256, stdlib_file_count:$stdlib_file_count, prefix:$prefix, base_prefix:$base_prefix, stdlib:$stdlib}}')" || fail 'Python identity probe was not valid JSON'
+  '{executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, version:$version, version_info:$version_info, implementation:$implementation, venv:{path:$venv_path, sha256:$venv_sha256, home:$venv_home, include_system_site_packages:($venv_site == "true"), version:$venv_version}, runtime:{root:$runtime_root, manifest_sha256:$runtime_manifest_sha256, file_count:$runtime_file_count, stdlib_root:$stdlib_root, stdlib_manifest_sha256:$stdlib_manifest_sha256, stdlib_file_count:$stdlib_file_count, prefix:$prefix, base_prefix:$base_prefix, stdlib:$stdlib}}')" || fail 'Python identity probe was not valid JSON'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.version')" == "$PYTHON_VERSION" ]] || fail 'Python probe version mismatch'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" == CPython ]] || fail 'Python implementation is not CPython'
+for role in "${roles[@]}" python313; do
+  receipt_assert_source_identity "$role"
+done
 
 for role in "${roles[@]}"; do
   role_json="$("$jq_bin" -cn \
     --arg role "$role" \
     --arg executable "${role_path[$role]}" \
     --arg sha256 "$($receipt_sha256_bin "${role_path[$role]}" | /usr/bin/gawk '{print $1}')" \
+    --arg execution_path "${role_execution_path[$role]}" \
+    --arg execution_sha256 "${role_execution_hash[$role]}" \
     --arg registry_id "${role_registry[$role]}" \
     --arg source_commit_sha "$repo_commit" \
     --arg kind '#961-role-manifest-v1' \
     --arg version "${role_version[$role]}" \
     --arg version_output_sha256 "${role_version_hash[$role]}" \
     --arg implementation "${role_implementation[$role]}" \
-    '{($role): {executable:$executable, sha256:$sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation}}')"
+    '{($role): {executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation}}')"
   if [[ "$role" == rtk ]]; then
     role_json="$(printf '%s' "$role_json" | "$jq_bin" -cS \
       --arg source_commit_sha "$rtk_source_commit" \

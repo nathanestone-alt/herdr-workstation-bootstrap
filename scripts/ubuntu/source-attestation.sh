@@ -23,7 +23,9 @@ attestation_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
 attestation_git_dir=''
 attestation_common_git_dir=''
 
-declare -a attestation_temporary_paths=()
+if ! declare -p attestation_temporary_paths >/dev/null 2>&1; then
+  declare -a attestation_temporary_paths=()
+fi
 
 attestation_register_temporary_path() {
   [[ -n "${1:-}" ]] && attestation_temporary_paths+=("$1")
@@ -80,6 +82,89 @@ attestation_assert_canonical_git() {
     echo "Trusted Git is writable by group or other users: $attestation_git_bin" >&2
     return 1
   }
+}
+
+attestation_validate_git_layout() {
+  local source_path="$1"
+  local metadata="$source_path/.git"
+  local git_pointer git_pointer_path record_pointer gitdir_record
+  local commondir_spec common_expected worktree_record record_gitdir record_name
+  local duplicate_record
+
+  [[ -e "$metadata" && ! -L "$metadata" && ( -d "$metadata" || -f "$metadata" ) ]] || {
+    echo "Git checkout metadata is missing or unsafe: $source_path" >&2
+    return 1
+  }
+  if [[ -d "$metadata" ]]; then
+    attestation_git_dir="$metadata"
+    attestation_common_git_dir="$metadata"
+  else
+    git_pointer="$(< "$metadata")"
+    [[ "$git_pointer" != *$'\n'* && "$git_pointer" != *$'\r'* && "$git_pointer" == gitdir:\ /* ]] || {
+      echo "Git checkout pointer cannot be read safely: $source_path" >&2
+      return 1
+    }
+    git_pointer_path="${git_pointer#gitdir: }"
+    attestation_git_dir="$($attestation_realpath_bin -e -- "$git_pointer_path" 2>/dev/null || true)"
+    [[ -n "$attestation_git_dir" && "$git_pointer" == "gitdir: $attestation_git_dir" ]] || {
+      echo "Git checkout pointer is not canonical: $source_path" >&2
+      return 1
+    }
+    [[ -d "$attestation_git_dir" && ! -L "$attestation_git_dir" && \
+      -f "$attestation_git_dir/commondir" && ! -L "$attestation_git_dir/commondir" && \
+      -f "$attestation_git_dir/gitdir" && ! -L "$attestation_git_dir/gitdir" ]] || {
+      echo "Git checkout worktree metadata is missing or unsafe: $source_path" >&2
+      return 1
+    }
+    record_pointer="$(< "$attestation_git_dir/gitdir")"
+    [[ "$record_pointer" != *$'\n'* && "$record_pointer" != *$'\r'* ]] || return 1
+    gitdir_record="$($attestation_realpath_bin -e -- "$record_pointer" 2>/dev/null || true)"
+    [[ "$gitdir_record" == "$metadata" ]] || {
+      echo "Git worktree record does not reciprocally own the checkout: $source_path" >&2
+      return 1
+    }
+    commondir_spec="$(< "$attestation_git_dir/commondir")"
+    [[ "$commondir_spec" == '../..' && "$commondir_spec" != *$'\n'* && "$commondir_spec" != *$'\r'* ]] || {
+      echo "Git checkout common directory is not the exact local parent: $source_path" >&2
+      return 1
+    }
+    common_expected="$($attestation_realpath_bin -e -- "$attestation_git_dir/../.." 2>/dev/null || true)"
+    attestation_common_git_dir="$($attestation_realpath_bin -e -- "$attestation_git_dir/$commondir_spec" 2>/dev/null || true)"
+    [[ -n "$common_expected" && "$attestation_common_git_dir" == "$common_expected" ]] || {
+      echo "Git checkout common directory relationship is not canonical: $source_path" >&2
+      return 1
+    }
+    worktree_record="$attestation_common_git_dir/worktrees/${attestation_git_dir##*/}"
+    [[ "$($attestation_realpath_bin -e -- "$worktree_record" 2>/dev/null || true)" == "$attestation_git_dir" ]] || {
+      echo "Git checkout is not owned by its exact common worktree record: $source_path" >&2
+      return 1
+    }
+    [[ -d "$attestation_common_git_dir/worktrees" && ! -L "$attestation_common_git_dir/worktrees" ]] || return 1
+    while IFS= read -r -d '' record_gitdir; do
+      record_name="${record_gitdir%/gitdir}"
+      [[ "$record_name" == "$attestation_git_dir" ]] && continue
+      duplicate_record="$(< "$record_gitdir")"
+      [[ "$duplicate_record" != *$'\n'* && "$duplicate_record" != *$'\r'* ]] || return 1
+      [[ "$($attestation_realpath_bin -e -- "$duplicate_record" 2>/dev/null || true)" != "$metadata" ]] || {
+        echo "Multiple Git worktree records claim the checkout: $source_path" >&2
+        return 1
+      }
+    done < <("$attestation_find_bin" -P "$attestation_common_git_dir/worktrees" -mindepth 2 -maxdepth 2 -type f -name gitdir -print0 2>/dev/null)
+  fi
+  attestation_reject_symlink_components "$attestation_git_dir" || return 1
+  attestation_reject_symlink_components "$attestation_common_git_dir" || return 1
+  [[ -d "$attestation_common_git_dir/objects" && ! -L "$attestation_common_git_dir/objects" && \
+    "$($attestation_realpath_bin -e -- "$attestation_common_git_dir/objects" 2>/dev/null || true)" == "$attestation_common_git_dir/objects" && \
+    -d "$attestation_common_git_dir/refs" && ! -L "$attestation_common_git_dir/refs" && \
+    "$($attestation_realpath_bin -e -- "$attestation_common_git_dir/refs" 2>/dev/null || true)" == "$attestation_common_git_dir/refs" && \
+    -f "$attestation_common_git_dir/config" && ! -L "$attestation_common_git_dir/config" && \
+    -f "$attestation_git_dir/index" && ! -L "$attestation_git_dir/index" ]] || {
+    echo "Git checkout object, ref, config, or index storage is not locally owned: $source_path" >&2
+    return 1
+  }
+  [[ ! -e "$attestation_common_git_dir/shallow" && ! -e "$attestation_git_dir/shallow" && \
+    ! -e "$attestation_common_git_dir/objects/info/alternates" && \
+    ! -e "$attestation_common_git_dir/objects/info/http-alternates" ]] || return 1
 }
 
 attestation_git() {
@@ -363,59 +448,9 @@ attestation_create_git_snapshot() {
     echo "Git checkout contains a symlinked path component: $source_path" >&2
     return 1
   }
-  [[ -e "$canonical_source_path/.git" && ! -L "$canonical_source_path/.git" && \
-    ( -d "$canonical_source_path/.git" || -f "$canonical_source_path/.git" ) ]] || {
-    echo "Git checkout metadata is missing or unsafe: $source_path" >&2
-    return 1
-  }
-  if [[ -d "$canonical_source_path/.git" ]]; then
-    git_dir="$canonical_source_path/.git"
-    common_git_dir="$git_dir"
-  else
-    git_pointer="$(< "$canonical_source_path/.git")"
-    [[ "$git_pointer" != *$'\n'* && "$git_pointer" != *$'\r'* && \
-      "$git_pointer" == gitdir:\ /* ]] || {
-      echo "Git checkout pointer cannot be read safely: $source_path" >&2
-      return 1
-    }
-    git_pointer_path="${git_pointer#gitdir: }"
-    git_dir="$($attestation_realpath_bin -e -- "$git_pointer_path" 2>/dev/null || true)"
-    [[ -n "$git_dir" && "$git_pointer" == "gitdir: $git_dir" ]] || {
-      echo "Git checkout pointer is not canonical: $source_path" >&2
-      return 1
-    }
-    [[ -d "$git_dir" && ! -L "$git_dir" && -f "$git_dir/commondir" && \
-      ! -L "$git_dir/commondir" ]] || {
-      echo "Git checkout worktree metadata is missing or unsafe: $source_path" >&2
-      return 1
-    }
-    commondir_spec="$(< "$git_dir/commondir")"
-    [[ "$commondir_spec" == '../..' ]] || {
-      echo "Git checkout common directory is not local: $source_path" >&2
-      return 1
-    }
-    common_git_dir="$($attestation_realpath_bin -e -- "$git_dir/$commondir_spec" 2>/dev/null || true)"
-    [[ -n "$common_git_dir" && -d "$common_git_dir" && ! -L "$common_git_dir" ]] || {
-      echo "Git checkout common directory is missing or unsafe: $source_path" >&2
-      return 1
-    }
-  fi
-  attestation_git_dir="$git_dir"
-  attestation_common_git_dir="$common_git_dir"
-  attestation_reject_symlink_components "$git_dir" || {
-    echo "Git checkout Git directory contains a symlinked component: $source_path" >&2
-    return 1
-  }
-  attestation_reject_symlink_components "$common_git_dir" || {
-    echo "Git checkout common Git directory contains a symlinked component: $source_path" >&2
-    return 1
-  }
-  [[ -d "$common_git_dir/objects" && ! -L "$common_git_dir/objects" && \
-    -d "$common_git_dir/refs" && ! -L "$common_git_dir/refs" && \
-    -f "$git_dir/index" && ! -L "$git_dir/index" ]] || {
-    echo "Git checkout object, ref, or index storage is missing: $source_path" >&2
-    return 1
-  }
+  attestation_validate_git_layout "$canonical_source_path" || return 1
+  git_dir="$attestation_git_dir"
+  common_git_dir="$attestation_common_git_dir"
   git_metadata_entry="$("$attestation_find_bin" -P "$git_dir" -mindepth 1 \
     \( -type l -o \( ! -type f ! -type d \) \) -print -quit 2>/dev/null || true)"
   [[ -z "$git_metadata_entry" ]] || {
@@ -429,10 +464,6 @@ attestation_create_git_snapshot() {
     return 1
   }
   config_file="$common_git_dir/config"
-  [[ -f "$config_file" && ! -L "$config_file" ]] || {
-    echo "Git checkout config is missing or not a regular file: $source_path" >&2
-    return 1
-  }
   attestation_config_is_safe "$canonical_source_path" || return 1
 
   git_toplevel="$(attestation_git "$canonical_source_path" rev-parse --show-toplevel 2>/dev/null || true)"
@@ -703,10 +734,19 @@ attestation_verify_snapshot() {
   declare -A verify_oid=()
   declare -A verify_dirs=()
   verify_dirs['.']='1'
+  local manifest_commit_count=0
+  local manifest_url_count=0
   while IFS= read -r line; do
-    [[ "$line" == F$'\t'* ]] || continue
+    case "$line" in
+      herdr-source-snapshot-v2) continue ;;
+      commit=*) ((manifest_commit_count += 1)); continue ;;
+      repository_url=*) ((manifest_url_count += 1)); continue ;;
+      F$'\t'*) ;;
+      *) return 1 ;;
+    esac
     IFS=$'\t' read -r _ mode oid digest path <<< "$line"
     attestation_valid_relative_path "$path" || return 1
+    [[ -z "${verify_sha[$path]+x}" ]] || return 1
     [[ "$mode" == 444 || "$mode" == 555 || "$mode" == 644 || "$mode" == 755 || "$mode" == 0444 || "$mode" == 0555 || "$mode" == 0644 || "$mode" == 0755 ]] || return 1
     [[ "$oid" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
     verify_mode["$path"]="$mode"
@@ -721,7 +761,7 @@ attestation_verify_snapshot() {
       verify_dirs["$current"]='1'
     done
   done < "$manifest"
-  [[ "${#verify_sha[@]}" -gt 0 ]] || return 1
+  [[ "${manifest_commit_count}" == 1 && "${manifest_url_count}" == 1 && "${#verify_sha[@]}" -gt 0 ]] || return 1
   while IFS= read -r -d '' full; do
     relative="${full#"$root"/}"
     [[ "$relative" == .source-attestation ]] && continue
@@ -755,6 +795,7 @@ attestation_build_payload_manifest() {
   local full relative mode digest entries
   [[ -d "$root" && ! -L "$root" ]] || return 1
   entries="$($attestation_mktemp_bin)"
+  attestation_register_temporary_path "$entries"
   while IFS= read -r -d '' full; do
     relative="${full#"$root"/}"
     [[ "$relative" != .payload-manifest ]] || continue
@@ -786,11 +827,17 @@ attestation_verify_payload_manifest() {
   declare -A payload_sha=()
   declare -A payload_dirs=()
   payload_dirs['.']='1'
+  local manifest_header_count=0
   while IFS= read -r line; do
-    [[ "$line" == F$'\t'* ]] || continue
+    case "$line" in
+      herdr-payload-manifest-v1) ((manifest_header_count += 1)); continue ;;
+      F$'\t'*) ;;
+      *) return 1 ;;
+    esac
     IFS=$'\t' read -r _ mode digest path <<< "$line"
     attestation_valid_relative_path "$path" || return 1
     [[ "$mode" =~ ^(444|555|644|755)$ && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ -z "${payload_sha[$path]+x}" ]] || return 1
     payload_mode["$path"]="$mode"
     payload_sha["$path"]="$digest"
     local current='.' component
@@ -802,7 +849,7 @@ attestation_verify_payload_manifest() {
       payload_dirs["$current"]='1'
     done
   done < "$manifest"
-  [[ "${#payload_sha[@]}" -gt 0 ]] || return 1
+  [[ "$manifest_header_count" == 1 && "${#payload_sha[@]}" -gt 0 ]] || return 1
   while IFS= read -r -d '' full; do
     relative="${full#"$root"/}"
     [[ "$relative" != .payload-manifest ]] || continue

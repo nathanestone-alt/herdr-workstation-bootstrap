@@ -169,25 +169,40 @@ run_case() {
   printf '%s\n' "$initial_version" > "$case_root/tailscale.version"
   printf '#!/bin/sh\nset -eu\nversion="${TAILSCALE_VERSION}"\nif [ "${CASE_MODE:-}" = arbitrary-installer ]; then version=9.99.9; fi\nif [ "${CASE_MODE:-}" = hostile-path ] && command -v installer-helper >/dev/null 2>&1; then installer-helper; fi\napt-get install -y "tailscale=$version" tailscale-archive-keyring\n' > "$case_root/installer.sh"
   chmod 0755 "$case_root/installer.sh"
+  installer_sha256="$(/usr/bin/sha256sum -- "$case_root/installer.sh" | /usr/bin/gawk '{print $1}')"
 
   set +e
   CASE_ROOT="$case_root" \
   CASE_MODE="$case_mode" \
   EXPECTED_TAILSCALE_VERSION='1.102.2' \
+  EXPECTED_INSTALLER_SHA256="$installer_sha256" \
   HOME="$home" \
   PATH="$case_root/bin:/usr/bin:/bin" \
-  HERDR_BOOTSTRAP_TEST_MODE=1 \
-  HERDR_BOOTSTRAP_TEST_SUDO="$case_root/bin/sudo" \
-  HERDR_BOOTSTRAP_TEST_APT_GET="$case_root/bin/apt-get" \
-  HERDR_BOOTSTRAP_TEST_PS="$case_root/bin/ps" \
-  HERDR_BOOTSTRAP_TEST_PWSH="$case_root/bin/pwsh" \
-  HERDR_BOOTSTRAP_TEST_SYSTEMCTL="$case_root/bin/systemctl" \
-  HERDR_BOOTSTRAP_TEST_TAILSCALE="$case_root/bin/tailscale" \
-  bash -c '
+  /usr/bin/bash -c '
     set -euo pipefail
     bootstrap_script="$1"
     set --
     source "$bootstrap_script"
+    TAILSCALE_INSTALLER_SHA256="${EXPECTED_INSTALLER_SHA256:?}"
+    bootstrap_command_path() {
+      case "$1" in
+        sudo|apt-get|ps|pwsh|systemctl|tailscale) printf "%s/bin/%s\n" "${CASE_ROOT:?}" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    bootstrap_exec_system() {
+      /usr/bin/env -i \
+        HOME="${HOME:?}" \
+        PATH="${CASE_ROOT:?}/bin:/usr/bin:/bin" \
+        CASE_ROOT="${CASE_ROOT:?}" \
+        CASE_MODE="${CASE_MODE:-}" \
+        EXPECTED_TAILSCALE_VERSION="${EXPECTED_TAILSCALE_VERSION:?}" \
+        APT_SEAM_LOG="${APT_SEAM_LOG:-}" \
+        "$@"
+    }
+    bootstrap_validate_tailscale_apt_identity() {
+      [[ "$1" == "${CASE_ROOT:?}/bin/apt-get" ]]
+    }
     if [[ "${CASE_MODE:-}" == invalid-lock ]]; then
       TAILSCALE_VERSION=not-a-semantic-version
     fi
@@ -198,14 +213,20 @@ run_case() {
       fi
       [[ ! -e "${CASE_ROOT:?}/download-probe" ]] || exit 1
     fi
-    download_verified() {
-      printf "download_verified %s\\n" "$1" >> "${CASE_ROOT:?}/command.log"
-      if [[ "${CASE_MODE:-}" == checksum-failure ]]; then
-        printf "simulated checksum failure\\n" >&2
-        return 23
-      fi
-      cp "${CASE_ROOT:?}/installer.sh" "$3"
-    }
+    if declare -F bootstrap_download_transport >/dev/null 2>&1; then
+      bootstrap_download_transport() {
+        [[ "$1" != 'https://[invalid' ]] || return 1
+        cp "${CASE_ROOT:?}/installer.sh" "$2"
+      }
+    else
+      download_verified() {
+        [[ "${CASE_MODE:-}" != checksum-failure ]] || return 23
+        cp "${CASE_ROOT:?}/installer.sh" "$3"
+      }
+    fi
+    if [[ "${CASE_MODE:-}" == checksum-failure ]]; then
+      TAILSCALE_INSTALLER_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+    fi
     install_base
   ' _ "$fixture_repo/scripts/ubuntu/bootstrap.sh" > "$output" 2>&1
   status=$?

@@ -80,8 +80,8 @@ mkdir -p ~/code
 cd ~/code
 git clone https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git
 cd herdr-workstation-bootstrap
-bash scripts/ubuntu/bootstrap.sh --phase base
-bash scripts/ubuntu/bootstrap.sh --phase tools
+./scripts/ubuntu/bootstrap.sh --phase base
+./scripts/ubuntu/bootstrap.sh --phase tools
 ~~~
 
 This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
@@ -184,7 +184,7 @@ Follow [VPS-ACCESS.md](VPS-ACCESS.md). Preserve hPanel recovery and the Surface 
 ## Phase K — Verify and hand off
 
 ~~~bash
-bash scripts/ubuntu/verify.sh
+./scripts/ubuntu/verify.sh
 ~~~
 
 Bootstrap installs a convergent hook in `~/.profile` and updates `~/.bash_profile` only when that file already exists, preserving Ubuntu's normal `.profile` to `.bashrc` login chain. The verification script checks both its controlled PATH and a separate real Bash login shell; Phase K fails if `rtk`, `codex`, `claude`, or `herdr` is not discoverable through the login profile.

@@ -151,6 +151,34 @@ mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
   done
 } > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 
+# Direct verify launches clear caller startup files and re-execute only the
+# committed verify bytes. The dirty copy is expected to fail later in its
+# environment checks, but neither dirty top-level code nor BASH_ENV may run.
+dirty_verify_root="$test_root/dirty-verify"
+cp -a -- "$source_fixture" "$dirty_verify_root"
+dirty_verify_entrypoint_marker="$test_root/dirty-verify-entrypoint"
+dirty_verify_bash_env_marker="$test_root/dirty-verify-bash-env"
+cat >> "$dirty_verify_root/scripts/ubuntu/verify.sh" <<EOF
+: > '$dirty_verify_entrypoint_marker'
+EOF
+dirty_verify_bash_env="$test_root/dirty-verify-bash-env.sh"
+printf ': > %q\n' "$dirty_verify_bash_env_marker" > "$dirty_verify_bash_env"
+chmod 0755 "$dirty_verify_bash_env"
+set +e
+timeout 60s /usr/bin/env -i HOME="$HOME" PATH="$managed_bin:/usr/bin:/bin" \
+  BASH_ENV="$dirty_verify_bash_env" "$dirty_verify_root/scripts/ubuntu/verify.sh" \
+  > "$test_root/dirty-verify-output" 2>&1
+dirty_verify_status=$?
+set -e
+(( dirty_verify_status != 0 && dirty_verify_status != 124 )) || {
+  echo 'Dirty verify entrypoint unexpectedly completed or timed out.' >&2
+  exit 1
+}
+[[ ! -e "$dirty_verify_entrypoint_marker" && ! -e "$dirty_verify_bash_env_marker" ]] || {
+  echo 'Dirty verify entrypoint or BASH_ENV executed before committed proof.' >&2
+  exit 1
+}
+
 # Exercise verify.sh's real bash -lc branch without allowing Git Bash's
 # machine-wide /etc/profile to replace the fixture HOME. The wrapper still
 # passes the exact -lc payload to Bash, so malformed nested quoting fails.
@@ -187,6 +215,31 @@ printf 'systemd\n'
 EOF
 chmod +x "$managed_bin/bash" "$managed_bin/uname" "$managed_bin/grep" "$managed_bin/ps"
 
+# The production verifier is sourceable only to expose its main function to a
+# sealed fixture adapter.  The adapter supplies fixture paths for system-only
+# roles; production verify_resolve_command has no such substitution path.
+for verify_dangerous_var in \
+  BASH_ENV ENV CDPATH GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 \
+  GIT_CONFIG_VALUE_0 HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy \
+  all_proxy no_proxy LD_PRELOAD PYTHONPATH PYTHONHOME NODE_OPTIONS NODE_PATH RUSTC \
+  RUSTFLAGS RUSTC_WRAPPER CARGO_HOME RUSTUP_HOME; do
+  unset "$verify_dangerous_var"
+done
+# shellcheck disable=SC1091
+source "$repo_root/scripts/ubuntu/verify.sh"
+verify_system_command_path() {
+  case "$1" in
+    bash|git|gh|ssh|sshd|mosh|tailscale|pwsh|mount.cifs|systemctl|dpkg-query|uname|grep|ps)
+      printf '%s/%s\n' "$managed_bin" "$1"
+      ;;
+    *) return 1 ;;
+  esac
+}
+verify_assert_system_binary() {
+  [[ "$1" == "$managed_bin/"* && -f "$1" && -x "$1" && ! -L "$1" ]]
+}
+
 run_verify_layout() {
   local layout="$1"
   local output="$test_root/verify-output-$layout.txt"
@@ -199,7 +252,7 @@ run_verify_layout() {
     *) echo "Unknown fixture layout: $layout" >&2; exit 1 ;;
   esac
   set +e
-  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  (verify_main) > "$output" 2>&1
   status=$?
   set -e
   if [[ "$status" -ne 0 ]]; then
@@ -257,7 +310,7 @@ expect_unmanaged_managed_path_failure() {
   mv "$managed_path" "$managed_backup"
   cp -L "$managed_backup" "$unmanaged_path"
   set +e
-  PATH="$unmanaged_bin:/usr/bin:/bin" /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  (verify_main) > "$output" 2>&1
   local status=$?
   set -e
   mv "$managed_backup" "$managed_path"
@@ -286,7 +339,7 @@ expect_receipt_field_failure() {
   cp "$receipt" "$backup"
   sed -i "/^${field}=/c\\${field}=tampered" "$receipt"
   set +e
-  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  (verify_main) > "$output" 2>&1
   local status=$?
   set -e
   mv "$backup" "$receipt"
@@ -314,7 +367,7 @@ expect_receipt_missing_field() {
   cp "$receipt" "$backup"
   sed -i "/^${field}=/d" "$receipt"
   set +e
-  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  (verify_main) > "$output" 2>&1
   local status=$?
   set -e
   mv "$backup" "$receipt"
@@ -338,7 +391,7 @@ expect_receipt_structure_failure() {
   cp "$receipt" "$backup"
   printf '%s\n' "$extra_line" >> "$receipt"
   set +e
-  PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$output" 2>&1
+  (verify_main) > "$output" 2>&1
   local status=$?
   set -e
   mv "$backup" "$receipt"
@@ -361,7 +414,7 @@ expect_receipt_structure_failure extra-apt 'apt:future-package=fixture-1'
 rm -f "$HOME/.bash_profile" "$HOME/.bash_login"
 : > "$HOME/.profile"
 negative_output="$test_root/verify-output-missing-hook.txt"
-if PATH='/usr/bin:/bin' /bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$negative_output" 2>&1; then
+if (verify_main) > "$negative_output" 2>&1; then
   cat "$negative_output" >&2
   echo 'verify.sh passed even though the managed login-shell PATH hook was absent.' >&2
   exit 1

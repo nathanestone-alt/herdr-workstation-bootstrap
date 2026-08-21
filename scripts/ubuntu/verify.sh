@@ -1,26 +1,111 @@
-#!/usr/bin/bash
+#!/usr/bin/env -S -i BASH_ENV= ENV= CDPATH= PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TZ=UTC /usr/bin/bash
 set -euo pipefail
 readonly verify_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
+readonly verify_getent_bin='/usr/bin/getent'
+readonly verify_id_bin='/usr/bin/id'
 export PATH="$verify_trusted_path"
-verify_script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
-repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_script_path")/../..")"
+if [[ -z "${HOME:-}" ]]; then
+  verify_launch_home="$($verify_getent_bin passwd "$($verify_id_bin -u)" 2>/dev/null | /usr/bin/gawk -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
+  [[ "$verify_launch_home" == /* && "$verify_launch_home" != '/' ]] || exit 24
+  export HOME="$verify_launch_home"
+fi
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" != 1 ]]; then
+  verify_live_script="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  verify_repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_live_script")/../.." 2>/dev/null || true)"
+  verify_commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+  verify_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$verify_commit:scripts/ubuntu/verify.sh" 2>/dev/null || true)"
+  [[ "$verify_commit" =~ ^[0-9a-f]{40}$ && "$verify_oid" =~ ^[0-9a-f]{40}$ ]] || exit 24
+  verify_temp="$(/usr/bin/mktemp -d /tmp/herdr-verify-entrypoint.XXXXXX)"
+  trap '/usr/bin/rm -rf -- "$verify_temp"' EXIT
+  /usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$verify_commit:scripts/ubuntu/verify.sh" > "$verify_temp/verify.sh" || exit 24
+  verify_materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$verify_temp/verify.sh")"
+  [[ "$verify_materialized_oid" == "$verify_oid" ]] || {
+    /usr/bin/rm -rf -- "$verify_temp"
+    exit 24
+  }
+  /usr/bin/chmod 0700 -- "$verify_temp"
+  exec /usr/bin/env -i HOME="$HOME" PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    HERDR_VERIFY_VERIFIED_ENTRYPOINT=1 HERDR_VERIFY_REPO_ROOT="$verify_repo_root" \
+    HERDR_VERIFY_ENTRYPOINT_TEMP="$verify_temp" /usr/bin/bash "$verify_temp/verify.sh" "$@"
+fi
+if [[ "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
+  repo_root="${HERDR_VERIFY_REPO_ROOT:-}"
+  verify_script_path="$repo_root/scripts/ubuntu/verify.sh"
+  trap '/usr/bin/rm -rf -- "$HERDR_VERIFY_ENTRYPOINT_TEMP"' EXIT
+else
+  verify_script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
+  repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_script_path")/../..")"
+fi
 
-lock_file="$repo_root/config/ubuntu-toolchain.lock"
-[[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
-# shellcheck disable=SC1091
-source "$repo_root/scripts/ubuntu/bootstrap.sh"
-# Keep the process PATH system-only.  Managed user tools are resolved below
-# through explicitly validated absolute paths instead of a global user-writable
-# PATH prefix.
-export PATH="$verify_trusted_path"
-hash -r
-validate_toolchain_lock || { echo 'Toolchain lock validation failed.' >&2; exit 22; }
+verify_system_command_path() {
+  case "$1" in
+    bash) printf '%s\n' /usr/bin/bash ;;
+    git) printf '%s\n' /usr/bin/git ;;
+    gh) printf '%s\n' /usr/bin/gh ;;
+    ssh) printf '%s\n' /usr/bin/ssh ;;
+    sshd) printf '%s\n' /usr/sbin/sshd ;;
+    mosh) printf '%s\n' /usr/bin/mosh ;;
+    tailscale) printf '%s\n' /usr/bin/tailscale ;;
+    pwsh)
+      if [[ -x /opt/microsoft/powershell/7/pwsh ]]; then
+        printf '%s\n' /opt/microsoft/powershell/7/pwsh
+      else
+        printf '%s\n' /usr/bin/pwsh
+      fi
+      ;;
+    mount.cifs) printf '%s\n' /usr/sbin/mount.cifs ;;
+    systemctl) printf '%s\n' /usr/bin/systemctl ;;
+    dpkg-query) printf '%s\n' /usr/bin/dpkg-query ;;
+    uname|grep|ps) printf '/usr/bin/%s\n' "$1" ;;
+    *) return 1 ;;
+  esac
+}
 
-verify_home_real="$(/usr/bin/realpath -e -- "$HOME" 2>/dev/null || true)"
+verify_assert_system_binary() {
+  local path="$1"
+  local resolved uid mode
+  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
+  resolved="$(/usr/bin/realpath -e -- "$path" 2>/dev/null || true)"
+  [[ "$resolved" == "$path" ]] || return 1
+  uid="$(/usr/bin/stat -c '%u' -- "$path" 2>/dev/null || true)"
+  mode="$(/usr/bin/stat -c '%a' -- "$path" 2>/dev/null || true)"
+  [[ "$uid" == 0 && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]]
+}
+
+verify_host_command_path() {
+  local path
+  path="$(verify_system_command_path "$1" 2>/dev/null || true)"
+  [[ -n "$path" ]] || return 1
+  verify_assert_system_binary "$path" || return 1
+  printf '%s\n' "$path"
+}
+
+verify_home_real=''
 verify_resolve_command() {
   local name="$1"
   local candidate
   local resolved
+  if candidate="$(verify_system_command_path "$name" 2>/dev/null)"; then
+    verify_assert_system_binary "$candidate" || return 1
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  case "$name" in
+    rustup|rustc|cargo|rtk|codex|claude|herdr|bun|uv|python3.13|py|node|npm) ;;
+    *) return 1 ;;
+  esac
   for candidate in "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name"; do
     if [[ -e "$candidate" || -L "$candidate" ]]; then
       resolved="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
@@ -32,14 +117,66 @@ verify_resolve_command() {
       return 1
     fi
   done
- candidate="$(PATH="$verify_trusted_path" command -v "$name" 2>/dev/null || true)"
- [[ "$candidate" == /* ]] || return 1
- resolved="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
-  [[ -f "$resolved" && -x "$resolved" ]] || return 1
-  path_is_under "$resolved" /usr/bin || path_is_under "$resolved" /usr/sbin || \
-    path_is_under "$resolved" /bin || path_is_under "$resolved" /sbin || return 1
-  printf '%s\n' "$candidate"
+  return 1
 }
+
+verify_main() {
+lock_file="$repo_root/config/ubuntu-toolchain.lock"
+[[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
+# Bind the bootstrap library to the same committed source object before any
+# of its top-level code is sourced.  The live sibling is never executable in
+# this verification path.
+verify_bootstrap_temp="$(/usr/bin/mktemp -d /tmp/herdr-verify-bootstrap.XXXXXX)"
+trap '/usr/bin/rm -rf -- "$verify_bootstrap_temp"' EXIT
+verify_bootstrap_script="$verify_bootstrap_temp/bootstrap.sh"
+verify_bootstrap_commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+verify_bootstrap_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" 2>/dev/null || true)"
+[[ "$verify_bootstrap_commit" =~ ^[0-9a-f]{40}$ && "$verify_bootstrap_oid" =~ ^[0-9a-f]{40}$ ]] || {
+  /usr/bin/rm -rf -- "$verify_bootstrap_temp"
+  echo 'Committed bootstrap object is unavailable.' >&2
+  exit 24
+}
+/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" > "$verify_bootstrap_script" || {
+    /usr/bin/rm -rf -- "$verify_bootstrap_temp"
+    echo 'Committed bootstrap bytes could not be materialized.' >&2
+    exit 24
+  }
+verify_bootstrap_materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
+  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$verify_bootstrap_script")"
+[[ "$verify_bootstrap_materialized_oid" == "$verify_bootstrap_oid" ]] || {
+  /usr/bin/rm -rf -- "$verify_bootstrap_temp"
+  echo 'Materialized bootstrap bytes differ from the committed object.' >&2
+  exit 24
+}
+/usr/bin/chmod 0700 -- "$verify_bootstrap_temp"
+# shellcheck disable=SC1090
+HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 \
+HERDR_BOOTSTRAP_REPO_ROOT="$repo_root" \
+HERDR_BOOTSTRAP_ENTRYPOINT_TEMP="$verify_bootstrap_temp" \
+source "$verify_bootstrap_script"
+bootstrap_register_cleanup "$verify_bootstrap_temp"
+if [[ "${HERDR_VERIFY_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
+  bootstrap_register_cleanup "$HERDR_VERIFY_ENTRYPOINT_TEMP"
+fi
+# Keep the process PATH system-only.  Managed user tools are resolved below
+# through explicitly validated absolute paths instead of a global user-writable
+# PATH prefix.
+export PATH="$verify_trusted_path"
+hash -r
+validate_toolchain_lock || { echo 'Toolchain lock validation failed.' >&2; exit 22; }
+
+verify_home_real="$(/usr/bin/realpath -e -- "$HOME" 2>/dev/null || true)"
 
 failures=0
 check_command() {
@@ -53,15 +190,18 @@ check_command() {
   fi
 }
 
-printf 'Kernel: %s\n' "$(uname -r)"
-if grep -qi microsoft /proc/sys/kernel/osrelease; then
+verify_uname_path="$(verify_host_command_path uname)" || { echo 'Host uname is unavailable.' >&2; exit 22; }
+verify_grep_path="$(verify_host_command_path grep)" || { echo 'Host grep is unavailable.' >&2; exit 22; }
+verify_ps_path="$(verify_host_command_path ps)" || { echo 'Host ps is unavailable.' >&2; exit 22; }
+printf 'Kernel: %s\n' "$("$verify_uname_path" -r)"
+if "$verify_grep_path" -qi microsoft /proc/sys/kernel/osrelease; then
   echo 'FAIL environment is WSL; the primary architecture requires an Ubuntu Hyper-V VM'
   failures=$((failures + 1))
 else
   echo 'PASS environment is a standalone Linux VM'
 fi
-printf 'PID 1: %s\n' "$(ps -p 1 -o comm=)"
-[[ "$(ps -p 1 -o comm=)" == "systemd" ]] || failures=$((failures + 1))
+printf 'PID 1: %s\n' "$("$verify_ps_path" -p 1 -o comm=)"
+[[ "$("$verify_ps_path" -p 1 -o comm=)" == "systemd" ]] || failures=$((failures + 1))
 
 for command in git gh ssh sshd mosh tailscale rustup cargo rtk codex claude herdr bun pwsh mount.cifs uv python3.13 py; do
   check_command "$command"
@@ -450,9 +590,15 @@ for version_command in rtk codex claude herdr; do
     "$version_path" --version 2>/dev/null || true
   fi
 done
-git --version 2>/dev/null || true
-gh --version 2>/dev/null | /usr/bin/head -n 1 || true
-mosh --version 2>/dev/null | /usr/bin/head -n 1 || true
+if version_path="$(verify_resolve_command git 2>/dev/null)"; then
+  "$version_path" --version 2>/dev/null || true
+fi
+if version_path="$(verify_resolve_command gh 2>/dev/null)"; then
+  "$version_path" --version 2>/dev/null | /usr/bin/head -n 1 || true
+fi
+if version_path="$(verify_resolve_command mosh 2>/dev/null)"; then
+  "$version_path" --version 2>/dev/null | /usr/bin/head -n 1 || true
+fi
 if pwsh_path="$(verify_resolve_command pwsh 2>/dev/null)"; then
   "$pwsh_path" --version 2>/dev/null || true
 fi
@@ -462,3 +608,8 @@ if [[ "$failures" -ne 0 ]]; then
   exit 1
 fi
 echo 'Ubuntu bootstrap verification passed.'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  verify_main "$@"
+fi

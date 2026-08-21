@@ -49,16 +49,14 @@ make_tool "$fixture_root/bin/pwsh" 'PowerShell 7.6.5'
 make_tool "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin/node" "v$NODE_VERSION"
 make_tool "$fixture_home/.cargo/bin/rtk" 'rtk 0.42.4'
 
-export FIXTURE_HOME="$fixture_home"
-export FIXTURE_RUNTIME_ROOT="$runtime_root"
-cat > "$fixture_home/.local/bin/python3.13" <<'EOF'
+cat > "$fixture_home/.local/bin/python3.13" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == '--version' ]]; then
+if [[ "\${1:-}" == '--version' ]]; then
   printf 'Python 3.13.15\n'
-elif [[ "${1:-}" == '-c' ]]; then
+elif [[ "\${1:-}" == '-c' ]]; then
   printf '{"version":"3.13.15","version_info":[3,13,15,"final",0],"implementation":"CPython","executable":"%s","prefix":"%s/.local","base_prefix":"%s","stdlib":"%s/lib/python3.13"}\n' \
-    "$0" "$FIXTURE_HOME" "$FIXTURE_RUNTIME_ROOT" "$FIXTURE_RUNTIME_ROOT"
+    "\$(readlink -f "\$0")" "$fixture_home" "$runtime_root" "$runtime_root"
 else
   exit 2
 fi
@@ -118,6 +116,10 @@ entrypoint_script="$entrypoint_root/scripts/ubuntu/receipt-authority.sh"
 # must not resolve any integrity or Git seam through a hostile PATH.
 receipt_hostile_path="$test_root/receipt-hostile-path"
 mkdir -p "$receipt_hostile_path"
+receipt_bash_env_marker="$test_root/receipt-bash-env-reached"
+receipt_bash_env="$test_root/receipt-bash-env"
+printf ': > %q\n' "$receipt_bash_env_marker" > "$receipt_bash_env"
+chmod 0755 "$receipt_bash_env"
 for receipt_hostile_command in env git realpath dirname find mktemp chmod stat sha256sum gawk head cp rm; do
   cat > "$receipt_hostile_path/$receipt_hostile_command" <<EOF
 #!/usr/bin/bash
@@ -127,7 +129,7 @@ EOF
   chmod 0755 "$receipt_hostile_path/$receipt_hostile_command"
 done
 if ! /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
-  /usr/bin/bash "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
+  BASH_ENV="$test_root/receipt-bash-env" "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
   cat "$test_root/receipt-help-output" >&2
   exit 1
 fi
@@ -137,28 +139,53 @@ for receipt_hostile_command in env git realpath dirname find mktemp chmod stat s
     exit 1
   }
 done
+[[ ! -e "$receipt_bash_env_marker" ]] || {
+  echo 'Receipt authority direct launch honored caller BASH_ENV.' >&2
+  exit 1
+}
 
 dirty_entrypoint_root="$test_root/dirty-entrypoint"
 cp -a -- "$entrypoint_root" "$dirty_entrypoint_root"
 dirty_receipt_marker="$test_root/dirty-receipt-top-level"
 dirty_receipt_function_marker="$test_root/dirty-receipt-function"
+dirty_receipt_entrypoint_marker="$test_root/dirty-receipt-entrypoint"
 cat >> "$dirty_entrypoint_root/scripts/ubuntu/source-attestation.sh" <<EOF
 : > '$dirty_receipt_marker'
 attestation_create_git_snapshot() { : > '$dirty_receipt_function_marker'; return 0; }
 EOF
+cat >> "$dirty_entrypoint_root/scripts/ubuntu/receipt-authority.sh" <<EOF
+: > '$dirty_receipt_entrypoint_marker'
+EOF
 if /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
-  /usr/bin/bash "$dirty_entrypoint_root/scripts/ubuntu/receipt-authority.sh" --help \
+  BASH_ENV="$test_root/receipt-bash-env" "$dirty_entrypoint_root/scripts/ubuntu/receipt-authority.sh" --help \
   > "$test_root/dirty-receipt-output" 2>&1; then
   echo 'Dirty live receipt helper was accepted.' >&2
   exit 1
 fi
-[[ ! -e "$dirty_receipt_marker" && ! -e "$dirty_receipt_function_marker" ]] || {
+[[ ! -e "$dirty_receipt_marker" && ! -e "$dirty_receipt_function_marker" && \
+   ! -e "$dirty_receipt_entrypoint_marker" ]] || {
   echo 'Dirty receipt helper code executed before attestation.' >&2
   exit 1
 }
 
 run_authority() {
-  bash "$entrypoint_script" "$@" \
+  "$entrypoint_script" "$@" \
+    --source-root "$source_root" \
+    --user-home "$fixture_home" \
+    --authority-path "$authority_path" \
+    --receipt-path "$receipt_path" \
+    --rtk-source-root "$rtk_source_root" \
+    --fixture-root "$fixture_root"
+}
+
+run_authority_with_pause() {
+  /usr/bin/env -i \
+    HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+    BASH_ENV= ENV= \
+    HERDR_RECEIPT_TEST_PAUSE_PHASE="${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" \
+    HERDR_RECEIPT_TEST_READY_FILE="${HERDR_RECEIPT_TEST_READY_FILE:-}" \
+    HERDR_RECEIPT_TEST_CONTINUE_FILE="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}" \
+    /usr/bin/bash "$entrypoint_script" "$@" \
     --source-root "$source_root" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
@@ -219,12 +246,12 @@ expect_failure 'source-root repository filter' run_authority --check
 [[ ! -e "$source_filter_marker" ]] || { echo 'Source-root filter executed.' >&2; exit 1; }
 git -C "$source_root" config --unset-all filter.attacker.clean
 rm -- "$source_root/.gitattributes"
-if (export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.filemode GIT_CONFIG_VALUE_0=false; run_authority --check >/dev/null 2>&1); then
-  echo 'Receipt authority accepted GIT_CONFIG_COUNT override.' >&2
+if ! (export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.filemode GIT_CONFIG_VALUE_0=false; run_authority --check >/dev/null 2>&1); then
+  echo 'Receipt authority did not sanitize GIT_CONFIG_COUNT override.' >&2
   exit 1
 fi
-if (export GIT_COMMON_DIR="$test_root/external-common"; run_authority --check >/dev/null 2>&1); then
-  echo 'Receipt authority accepted GIT_COMMON_DIR override.' >&2
+if ! (export GIT_COMMON_DIR="$test_root/external-common"; run_authority --check >/dev/null 2>&1); then
+  echo 'Receipt authority did not sanitize GIT_COMMON_DIR override.' >&2
   exit 1
 fi
 
@@ -236,7 +263,7 @@ receipt_race_continue="$test_root/receipt-race-continue"
   export HERDR_RECEIPT_TEST_PAUSE_PHASE=after-rtk-snapshot
   export HERDR_RECEIPT_TEST_READY_FILE="$receipt_race_ready"
   export HERDR_RECEIPT_TEST_CONTINUE_FILE="$receipt_race_continue"
-  run_authority --install
+  run_authority_with_pause --install
 ) > "$test_root/receipt-race-output" 2>&1 &
 receipt_race_pid=$!
 while [[ ! -e "$receipt_race_ready" ]]; do sleep 0.01; done
@@ -250,6 +277,91 @@ wait "$receipt_race_pid"
 }
 printf 'locked RTK source\n' > "$rtk_source_root/README"
 chmod 0644 "$rtk_source_root/README"
+
+# A same-user replacement of a staged role executable must fail closed without
+# executing the replacement. The pause survives the trusted entrypoint
+# re-exec because it is explicitly carried only through this test adapter.
+role_stage_race_ready="$test_root/role-stage-race-ready"
+role_stage_race_continue="$test_root/role-stage-race-continue"
+role_stage_race_marker="$test_root/role-stage-race-hostile"
+role_stage_race_hostile="$test_root/role-stage-race-hostile.sh"
+cat > "$role_stage_race_hostile" <<EOF
+#!/usr/bin/bash
+: > '$role_stage_race_marker'
+printf 'rtk 0.42.4\n'
+EOF
+chmod 0755 "$role_stage_race_hostile"
+(
+  export HERDR_RECEIPT_TEST_PAUSE_PHASE=after-rtk-staging
+  export HERDR_RECEIPT_TEST_READY_FILE="$role_stage_race_ready"
+  export HERDR_RECEIPT_TEST_CONTINUE_FILE="$role_stage_race_continue"
+  run_authority_with_pause --install
+) > "$test_root/role-stage-race-output" 2>&1 &
+role_stage_race_pid=$!
+while [[ ! -e "$role_stage_race_ready" ]]; do sleep 0.01; done
+role_stage_race_replaced=0
+for role_stage_dir in /tmp/herdr-receipt-exec.*; do
+  [[ -f "$role_stage_dir/rtk" ]] || continue
+  mv -- "$role_stage_dir/rtk" "$role_stage_dir/rtk-original"
+  cp -- "$role_stage_race_hostile" "$role_stage_dir/rtk"
+  role_stage_race_replaced=1
+done
+(( role_stage_race_replaced == 1 )) || { echo 'Receipt staged-role race did not find its stage.' >&2; exit 1; }
+: > "$role_stage_race_continue"
+set +e
+wait "$role_stage_race_pid"
+role_stage_race_status=$?
+set -e
+(( role_stage_race_status == 0 )) || { echo 'Receipt stable staged-role replacement did not complete safely.' >&2; exit 1; }
+[[ ! -e "$role_stage_race_marker" ]] || { echo 'Receipt staged-role replacement executed an attacker payload.' >&2; exit 1; }
+
+# A manifest/tree supplied without the root-bound payload hash and commit is
+# self-authenticating and must not be allowed to source authority inputs.
+while IFS= read -r receipt_test_git_var; do
+  unset "$receipt_test_git_var"
+done < <(compgen -e | /usr/bin/grep '^GIT_')
+source "$repo_root/scripts/ubuntu/source-attestation.sh"
+attestation_create_git_snapshot "$source_root" '' ''
+unbound_source_snapshot="$attestation_snapshot_dir"
+unbound_source_manifest="$attestation_snapshot_manifest"
+expect_failure 'unsigned source manifest' "$entrypoint_script" --check \
+  --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
+  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
+  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+payload_probe="$test_root/payload-probe"
+mkdir -p "$payload_probe/source"
+cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
+chmod -R u+w "$payload_probe"
+payload_probe_manifest="$payload_probe/.payload-manifest"
+attestation_build_payload_manifest "$payload_probe" "$payload_probe_manifest"
+payload_probe_hash="$(attestation_hash_file "$payload_probe_manifest")"
+expect_payload_failure() {
+  local label="$1"
+  shift
+  expect_failure "$label" /usr/bin/env -i \
+    HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+    BASH_ENV= ENV= HERDR_RECEIPT_VERIFIED_PAYLOAD=1 \
+    /usr/bin/bash "$payload_probe/source/receipt-authority.sh" "$@" \
+    --source-root "$payload_probe/source" \
+    --source-manifest "$payload_probe/source/.source-attestation" \
+    --payload-root "$payload_probe" \
+    --payload-manifest "$payload_probe_manifest" \
+    --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
+    --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+}
+expect_payload_failure 'unsigned payload source commit'
+expect_payload_failure 'unsigned payload manifest hash' --source-commit "$attestation_snapshot_commit"
+printf 'payload tamper\n' >> "$payload_probe/source/README"
+expect_failure 'tampered payload tree' /usr/bin/env -i \
+  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+  BASH_ENV= ENV= HERDR_RECEIPT_VERIFIED_PAYLOAD=1 \
+  /usr/bin/bash "$payload_probe/source/receipt-authority.sh" --check \
+  --source-root "$payload_probe/source" --source-manifest "$payload_probe/source/.source-attestation" \
+  --payload-root "$payload_probe" --payload-manifest "$payload_probe_manifest" \
+  --payload-manifest-sha256 "$payload_probe_hash" --source-commit "$attestation_snapshot_commit" \
+  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
+  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+attestation_cleanup_temporary_paths
 
 # The race run intentionally produced a new content-bound receipt pair.  Make
 # that pair the baseline for the remaining reconciliation probes.
