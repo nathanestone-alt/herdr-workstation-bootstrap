@@ -19,8 +19,13 @@ readonly receipt_head_bin='/usr/bin/head'
 readonly receipt_cp_bin='/usr/bin/cp'
 readonly receipt_rm_bin='/usr/bin/rm'
 readonly receipt_chown_bin='/usr/bin/chown'
+readonly receipt_setpriv_bin='/usr/bin/setpriv'
 readonly receipt_getent_bin='/usr/bin/getent'
 readonly receipt_id_bin='/usr/bin/id'
+receipt_git_owner_uid="${HERDR_RECEIPT_GIT_OWNER_UID:-$($receipt_id_bin -u)}"
+receipt_git_owner_gid="${HERDR_RECEIPT_GIT_OWNER_GID:-$($receipt_id_bin -g)}"
+declare -a receipt_bound_git_paths=()
+declare -A receipt_bound_git_identities=()
 
 export PATH="$receipt_trusted_path"
 export LC_ALL=C
@@ -60,6 +65,11 @@ while IFS= read -r receipt_env_name; do
 done < <(compgen -e)
 
 receipt_reexec_committed_entrypoint() {
+  if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_RECEIPT_TRUSTED_LAUNCHER:-}" != 1 && \
+    "${HERDR_RECEIPT_VERIFIED_PAYLOAD:-}" != 1 ]]; then
+    echo 'receipt authority must be launched through the installed trusted launcher' >&2
+    exit 24
+  fi
   local receipt_arg
   for receipt_arg in "$@"; do
     if [[ "$receipt_arg" == --payload-root ]]; then
@@ -70,56 +80,6 @@ receipt_reexec_committed_entrypoint() {
       return 0
     fi
   done
-  [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_RECEIPT_VERIFIED_ENTRYPOINT:-}" != 1 ]] || return 0
-  local live_script live_dir repo_root commit committed_oid temp_dir committed_script materialized_oid
-  live_script="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-  live_dir="$(/usr/bin/dirname -- "$live_script")"
-  repo_root="$(/usr/bin/realpath -e -- "$live_dir/../.." 2>/dev/null || true)"
-  [[ -n "$live_script" && -n "$repo_root" && "$live_script" == "$repo_root/scripts/ubuntu/receipt-authority.sh" && \
-    -d "$repo_root" && ! -L "$repo_root" ]] || {
-    echo 'receipt authority trust boundary: live entrypoint is not at the canonical repository path' >&2
-    exit 24
-  }
-  commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-  committed_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$commit:scripts/ubuntu/receipt-authority.sh" 2>/dev/null || true)"
-  [[ "$commit" =~ ^[0-9a-f]{40}$ && "$committed_oid" =~ ^[0-9a-f]{40}$ ]] || exit 24
-  temp_dir="$(/usr/bin/mktemp -d /tmp/herdr-receipt-entrypoint.XXXXXX)" || exit 24
-  trap '/usr/bin/rm -rf -- "$temp_dir"' EXIT
-  committed_script="$temp_dir/receipt-authority.sh"
-  /usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$commit:scripts/ubuntu/receipt-authority.sh" > "$committed_script" || {
-      /usr/bin/rm -rf -- "$temp_dir"
-      exit 24
-    }
-  materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$committed_script")"
-  [[ "$materialized_oid" == "$committed_oid" ]] || {
-    /usr/bin/rm -rf -- "$temp_dir"
-    exit 24
-  }
-  /usr/bin/chmod 0700 -- "$temp_dir"
-  exec /usr/bin/env -i \
-    HOME="${HOME:-/nonexistent}" \
-    PATH="$receipt_trusted_path" \
-    LC_ALL=C \
-    TZ=UTC \
-    HERDR_RECEIPT_VERIFIED_ENTRYPOINT=1 \
-    HERDR_RECEIPT_REPO_ROOT="$repo_root" \
-    HERDR_RECEIPT_ENTRYPOINT_TEMP="$temp_dir" \
-    HERDR_RECEIPT_TEST_PAUSE_PHASE="${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" \
-    HERDR_RECEIPT_TEST_READY_FILE="${HERDR_RECEIPT_TEST_READY_FILE:-}" \
-    HERDR_RECEIPT_TEST_CONTINUE_FILE="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}" \
-    /usr/bin/bash "$committed_script" "$@"
 }
 receipt_reexec_committed_entrypoint "$@"
 if [[ "${HERDR_RECEIPT_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
@@ -172,7 +132,7 @@ for receipt_trusted_binary in \
   "$receipt_find_bin" "$receipt_mktemp_bin" "$receipt_chmod_bin" \
   "$receipt_stat_bin" "$receipt_sha256_bin" "$receipt_awk_bin" \
   "$receipt_head_bin" "$receipt_cp_bin" "$receipt_rm_bin" "$receipt_chown_bin" \
-  "$receipt_getent_bin" "$receipt_id_bin"; do
+  "$receipt_getent_bin" "$receipt_id_bin" "$receipt_setpriv_bin"; do
   receipt_trust_assert_binary "$receipt_trusted_binary"
 done
 
@@ -236,8 +196,87 @@ receipt_exec_python() {
     "${receipt_exec_args[@]}"
 }
 
-receipt_trust_git() {
+receipt_exec_python_unprivileged() {
+  local receipt_exec_arg
+  local -a receipt_exec_args=()
+  for receipt_exec_arg in "$@"; do
+    if [[ "$receipt_exec_arg" == /proc/self/fd/* ]]; then
+      receipt_exec_args+=("/proc/${BASHPID}/fd/${receipt_exec_arg##*/}")
+    else
+      receipt_exec_args+=("$receipt_exec_arg")
+    fi
+  done
+  if [[ -n "$fixture_root" || "$(/usr/bin/id -u)" != 0 ]]; then
+    receipt_exec_python "${receipt_exec_args[@]}"
+    return
+  fi
   "$receipt_env_bin" -i \
+    HOME=/nonexistent \
+    PATH="$receipt_trusted_path" \
+    LC_ALL=C \
+    TZ=UTC \
+    PYTHONNOUSERSITE=1 \
+    PYTHONPATH= \
+    PYTHONHOME= \
+    PYTHONSTARTUP= \
+    PYTHONINSPECT=0 \
+    PYTHONSAFEPATH=1 \
+    "$receipt_setpriv_bin" --reuid="$receipt_user_uid" --regid="$receipt_user_gid" --clear-groups --no-new-privs \
+    "${receipt_exec_args[@]}"
+}
+
+receipt_bind_git_path() {
+  local path="$1" owner group mode identity
+  [[ -e "$path" && ! -L "$path" ]] || return 1
+  owner="$($receipt_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+  group="$($receipt_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+  mode="$($receipt_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+  [[ "$owner" == "$receipt_git_owner_uid" && "$group" == "$receipt_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || return 1
+  identity="$($receipt_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+  [[ -n "$identity" ]] || return 1
+  if [[ -z "${receipt_bound_git_identities[$path]+x}" ]]; then
+    receipt_bound_git_paths+=("$path")
+  fi
+  receipt_bound_git_identities["$path"]="$identity"
+}
+
+receipt_bind_git_layout() {
+  local path
+  receipt_bound_git_paths=()
+  receipt_bound_git_identities=()
+  for path in "$receipt_repo_root" "$receipt_repo_root/.git" "$receipt_git_dir" "$receipt_common_git_dir" \
+    "$receipt_common_git_dir/objects" "$receipt_common_git_dir/refs" \
+    "$receipt_common_git_dir/config" "$receipt_git_dir/index"; do
+    receipt_bind_git_path "$path" || return 1
+  done
+  for path in "$receipt_git_dir/commondir" "$receipt_git_dir/gitdir" \
+    "$receipt_common_git_dir/worktrees" "$receipt_git_dir/HEAD" "$receipt_common_git_dir/HEAD" \
+    "$receipt_common_git_dir/packed-refs"; do
+    [[ -e "$path" ]] || continue
+    receipt_bind_git_path "$path" || return 1
+  done
+  if [[ -n "${receipt_worktree_record:-}" ]]; then
+    receipt_bind_git_path "$receipt_worktree_record" || return 1
+    receipt_bind_git_path "$receipt_worktree_record/gitdir" || return 1
+  fi
+}
+
+receipt_assert_git_lifetime() {
+  local path owner group mode identity
+  for path in "${receipt_bound_git_paths[@]}"; do
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    owner="$($receipt_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+    group="$($receipt_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+    mode="$($receipt_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+    identity="$($receipt_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$receipt_git_owner_uid" && "$group" == "$receipt_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 && "$identity" == "${receipt_bound_git_identities[$path]:-}" ]] || return 1
+  done
+}
+
+receipt_trust_git() {
+  local receipt_git_status
+  receipt_assert_git_lifetime || return 70
+  if "$receipt_env_bin" -i \
     HOME=/nonexistent \
     PATH="$receipt_trusted_path" \
     LC_ALL=C \
@@ -246,6 +285,7 @@ receipt_trust_git() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
     "$receipt_git_bin" --no-replace-objects \
     -C "$receipt_repo_root" --git-dir="${receipt_git_dir:-.git}" --work-tree=. \
     -c core.attributesfile=/dev/null \
@@ -253,7 +293,22 @@ receipt_trust_git() {
     -c core.hooksPath=/dev/null \
     -c core.filemode=true \
     -c core.ignoreCase=false \
-    "$@"
+    "$@"; then
+    receipt_git_status=0
+  else
+    receipt_git_status=$?
+  fi
+  receipt_assert_git_lifetime || return 70
+  return "$receipt_git_status"
+}
+
+receipt_trust_git_optional() {
+  local output status
+  output="$(receipt_trust_git "$@" 2>/dev/null)" || {
+    status=$?
+    ((status == 1)) || return "$status"
+  }
+  printf '%s\n' "$output"
 }
 
 receipt_canonical_git_storage_path() {
@@ -323,6 +378,7 @@ receipt_materialize_helper_from_git() {
     -f "$receipt_config_path" && ! -L "$receipt_config_path" && -f "$receipt_index_path" && ! -L "$receipt_index_path" ]] || {
     receipt_trust_fail 'receipt Git object, ref, config, or index storage is unsafe'
   }
+  receipt_bind_git_layout || receipt_trust_fail 'receipt Git metadata owner, mode, or identity is unsafe'
   for receipt_git_metadata_root in "$receipt_git_dir" "$receipt_common_git_dir"; do
     receipt_git_metadata_entry="$($receipt_find_bin -P "$receipt_git_metadata_root" -mindepth 1 \
       \( -type l -o \( ! -type f ! -type d \) \) -print -quit 2>/dev/null || true)"
@@ -333,25 +389,32 @@ receipt_materialize_helper_from_git() {
     ! -e "$receipt_common_git_dir/objects/info/http-alternates" ]] || {
     receipt_trust_fail 'receipt repository uses external or shallow Git storage'
   }
-  receipt_dangerous_config="$(receipt_trust_git config --local --no-includes --name-only --get-regexp \
+  receipt_dangerous_config="$(receipt_trust_git_optional config --local --no-includes --name-only --get-regexp \
     '^(include|filter\.|diff\..*\.textconv$|merge\..*\.driver$|credential\.|url\..*\.insteadOf$|core\.(attributesfile|excludesfile|fsmonitor|hooksPath|worktree|alternateRefsCommand|askPass|gitProxy|sshCommand)$|extensions\.|remote\..*\.(promisor|partialclonefilter|uploadpack|receivepack)$)' \
-    2>/dev/null || true)"
+    )"
   [[ -z "$receipt_dangerous_config" ]] || receipt_trust_fail 'receipt repository-local Git configuration is unsafe'
-  [[ "$(receipt_trust_git config --local --no-includes --bool --get core.sparseCheckout 2>/dev/null || true)" != true && \
-    "$(receipt_trust_git config --local --no-includes --bool --get index.sparse 2>/dev/null || true)" != true && \
+  receipt_sparse_checkout="$(receipt_trust_git_optional config --local --no-includes --bool --get core.sparseCheckout)" || receipt_trust_fail 'receipt Git lifetime failed while reading sparse-checkout configuration'
+  receipt_sparse_index="$(receipt_trust_git_optional config --local --no-includes --bool --get index.sparse)" || receipt_trust_fail 'receipt Git lifetime failed while reading sparse-index configuration'
+  [[ "$receipt_sparse_checkout" != true && \
+    "$receipt_sparse_index" != true && \
     ! -e "$receipt_common_git_dir/info/sparse-checkout" && \
     ! -e "$receipt_git_dir/info/sparse-checkout" ]] || receipt_trust_fail 'receipt repository sparse checkout metadata is unsafe'
-  [[ "$(receipt_trust_git rev-parse --show-toplevel 2>/dev/null || true)" == "$receipt_repo_root" && \
-    "$(receipt_trust_git rev-parse --absolute-git-dir 2>/dev/null || true)" == "$receipt_git_dir" && \
-    "$(receipt_trust_git rev-parse --is-inside-work-tree 2>/dev/null || true)" == true && \
-    "$(receipt_trust_git rev-parse --is-bare-repository 2>/dev/null || true)" == false && \
-    "$(receipt_trust_git rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
+  receipt_git_top_level="$(receipt_trust_git rev-parse --show-toplevel 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading the worktree root'
+  receipt_git_absolute_dir="$(receipt_trust_git rev-parse --absolute-git-dir 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading the Git directory'
+  receipt_git_inside_worktree="$(receipt_trust_git rev-parse --is-inside-work-tree 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading worktree state'
+  receipt_git_bare="$(receipt_trust_git rev-parse --is-bare-repository 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading bare state'
+  receipt_git_shallow="$(receipt_trust_git rev-parse --is-shallow-repository 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading shallow state'
+  [[ "$receipt_git_top_level" == "$receipt_repo_root" && \
+    "$receipt_git_absolute_dir" == "$receipt_git_dir" && \
+    "$receipt_git_inside_worktree" == true && \
+    "$receipt_git_bare" == false && \
+    "$receipt_git_shallow" == false ]] || {
     receipt_trust_fail 'receipt repository topology is not a local full worktree'
   }
-  receipt_commit="$(receipt_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+  receipt_commit="$(receipt_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading HEAD'
   [[ "$receipt_commit" =~ ^[0-9a-f]{40}$ ]] || receipt_trust_fail 'receipt HEAD is not a full committed object'
   receipt_trust_git cat-file -e "$receipt_commit^{commit}" || receipt_trust_fail 'receipt HEAD object is unavailable'
-  receipt_helper_tree="$(receipt_trust_git ls-tree "$receipt_commit" -- scripts/ubuntu/source-attestation.sh 2>/dev/null || true)"
+  receipt_helper_tree="$(receipt_trust_git ls-tree "$receipt_commit" -- scripts/ubuntu/source-attestation.sh 2>/dev/null)" || receipt_trust_fail 'receipt Git lifetime failed while reading the committed helper tree'
   [[ "$receipt_helper_tree" != *$'\n'* ]] || receipt_trust_fail 'receipt helper tree lookup was ambiguous'
   IFS=$'\t' read -r receipt_helper_meta receipt_helper_path <<< "$receipt_helper_tree"
   read -r receipt_helper_mode receipt_helper_type receipt_helper_oid <<< "$receipt_helper_meta"
@@ -369,10 +432,7 @@ receipt_materialize_helper_from_git() {
   [[ "$receipt_helper_mode" == 100755 ]] && receipt_helper_mode_value=0755
   "$receipt_chmod_bin" "$receipt_helper_mode_value" -- "$receipt_private_helper"
   [[ -f "$receipt_private_helper" && ! -L "$receipt_private_helper" ]] || receipt_trust_fail 'materialized receipt helper is not regular'
-  receipt_materialized_oid="$($receipt_env_bin -i HOME=/nonexistent PATH="$receipt_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    "$receipt_git_bin" --no-replace-objects --git-dir="$receipt_git_dir" \
-    hash-object --no-filters --stdin < "$receipt_private_helper")"
+  receipt_materialized_oid="$(receipt_trust_git hash-object --no-filters --stdin < "$receipt_private_helper")"
   [[ "$receipt_materialized_oid" == "$receipt_helper_oid" ]] || receipt_trust_fail 'receipt helper bytes do not match committed blob'
   receipt_live_entrypoint_helper="$receipt_repo_root/scripts/ubuntu/source-attestation.sh"
   [[ -f "$receipt_live_entrypoint_helper" && ! -L "$receipt_live_entrypoint_helper" && \
@@ -497,8 +557,14 @@ receipt_prelude_payload_manifest=''
 receipt_prelude_payload_hash=''
 receipt_prelude_source_commit=''
 receipt_prelude_args=("$@")
+receipt_user_home_hint="${HOME:-}"
 for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; receipt_arg_index++)); do
   case "${receipt_prelude_args[$receipt_arg_index]}" in
+    --user-home)
+      ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--user-home requires a value'
+      receipt_user_home_hint="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
+      ((receipt_arg_index++))
+      ;;
     --source-root)
       ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--source-root requires a value'
       receipt_prelude_source_root="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
@@ -533,6 +599,11 @@ for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; rece
 done
 
 receipt_repo_mode=0
+receipt_user_home_hint="$($receipt_realpath_bin -e -- "$receipt_user_home_hint" 2>/dev/null || true)"
+if [[ -d "$receipt_user_home_hint" && ! -L "$receipt_user_home_hint" ]]; then
+  attestation_git_owner_uid="$($receipt_stat_bin -c '%u' -- "$receipt_user_home_hint" 2>/dev/null || true)"
+  attestation_git_owner_gid="$($receipt_stat_bin -c '%g' -- "$receipt_user_home_hint" 2>/dev/null || true)"
+fi
 if [[ -e "$receipt_repo_root/.git" && ! -L "$receipt_repo_root/.git" ]]; then
   receipt_repo_mode=1
   receipt_trust_reject_symlink_components "$receipt_repo_root" || receipt_trust_fail 'receipt repository root contains a symlinked component'
@@ -549,7 +620,6 @@ if (( receipt_repo_mode == 1 )); then
 else
   receipt_source_snapshot=''
 fi
-
 mode='install'
 script_path="$receipt_script_path"
 script_dir="$receipt_script_dir"
@@ -697,6 +767,12 @@ fi
 
 user_home="$(/usr/bin/realpath -e -- "$user_home" 2>/dev/null || true)"
 [[ -n "$user_home" && -d "$user_home" ]] || fail 'managed user home does not exist'
+receipt_user_uid="$(/usr/bin/stat -c '%u' -- "$user_home" 2>/dev/null || true)"
+receipt_user_gid="$(/usr/bin/stat -c '%g' -- "$user_home" 2>/dev/null || true)"
+[[ "$receipt_user_uid" =~ ^[0-9]+$ && "$receipt_user_gid" =~ ^[0-9]+$ && "$receipt_user_uid" != 0 ]] || fail 'managed user home must belong to a non-root account'
+if [[ -z "$fixture_root" ]]; then
+  [[ "$(/usr/bin/id -u)" == 0 && "$(/usr/bin/stat -c '%u' -- "$receipt_setpriv_bin")" == 0 ]] || fail 'root Python probes require a root-owned setpriv boundary'
+fi
 if [[ -z "$rtk_source_root" ]]; then rtk_source_root="$user_home/src/rtk"; fi
 rtk_source_root="$(/usr/bin/realpath -e -- "$rtk_source_root" 2>/dev/null || true)"
 [[ -n "$rtk_source_root" && -d "$rtk_source_root" ]] || fail 'RTK source checkout does not exist'
@@ -1032,9 +1108,9 @@ for role in "${roles[@]}"; do
   IFS=$'\t' read -r role_version["$role"] role_version_hash["$role"] role_version_output["$role"] < <(probe_role_version "$role")
 done
 
-python_version_output="$(receipt_exec_python "${role_execution_command_path[python313]}" --version 2>&1)" || fail 'python3.13 --version failed'
+python_version_output="$(receipt_exec_python_unprivileged "${role_execution_command_path[python313]}" --version 2>&1)" || fail 'python3.13 --version failed'
 [[ "$python_version_output" == "Python $PYTHON_VERSION" ]] || fail "Python version does not match lock: $python_version_output"
-python_probe="$(receipt_exec_python "${role_execution_command_path[python313]}" -c 'import json, os, platform, sys, sysconfig; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation(), "executable": os.path.realpath(sys.executable), "prefix": os.path.realpath(sys.prefix), "base_prefix": os.path.realpath(sys.base_prefix), "stdlib": os.path.realpath(sysconfig.get_path("stdlib"))}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
+python_probe="$(receipt_exec_python_unprivileged "${role_execution_command_path[python313]}" -c 'import json, os, platform, sys, sysconfig; print(json.dumps({"version": platform.python_version(), "version_info": list(sys.version_info[:5]), "implementation": platform.python_implementation(), "executable": os.path.realpath(sys.executable), "prefix": os.path.realpath(sys.prefix), "base_prefix": os.path.realpath(sys.base_prefix), "stdlib": os.path.realpath(sysconfig.get_path("stdlib"))}, separators=(",", ":"))) ' 2>&1)" || fail 'Python identity probe failed'
 python_probe_executable="$(printf '%s' "$python_probe" | "$jq_bin" -r '.executable' 2>/dev/null || true)"
 python_probe_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.prefix' 2>/dev/null || true)"
 python_probe_base_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.base_prefix' 2>/dev/null || true)"

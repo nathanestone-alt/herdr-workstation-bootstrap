@@ -19,9 +19,19 @@ attestation_readlink_bin='/usr/bin/readlink'
 attestation_head_bin='/usr/bin/head'
 attestation_sort_bin='/usr/bin/sort'
 attestation_dirname_bin='/usr/bin/dirname'
+attestation_id_bin='/usr/bin/id'
 attestation_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
 attestation_git_dir=''
 attestation_common_git_dir=''
+attestation_git_owner_uid="${HERDR_ATTESTATION_GIT_OWNER_UID:-${HERDR_RECEIPT_GIT_OWNER_UID:-${HERDR_BOOTSTRAP_GIT_OWNER_UID:-$($attestation_id_bin -u)}}}"
+attestation_git_owner_gid="${HERDR_ATTESTATION_GIT_OWNER_GID:-${HERDR_RECEIPT_GIT_OWNER_GID:-${HERDR_BOOTSTRAP_GIT_OWNER_GID:-$($attestation_id_bin -g)}}}"
+
+if ! declare -p attestation_bound_git_paths >/dev/null 2>&1; then
+  declare -a attestation_bound_git_paths=()
+fi
+if ! declare -p attestation_bound_git_identities >/dev/null 2>&1; then
+  declare -A attestation_bound_git_identities=()
+fi
 
 if ! declare -p attestation_temporary_paths >/dev/null 2>&1; then
   declare -a attestation_temporary_paths=()
@@ -82,6 +92,60 @@ attestation_assert_canonical_git() {
     echo "Trusted Git is writable by group or other users: $attestation_git_bin" >&2
     return 1
   }
+}
+
+attestation_bind_git_path() {
+  local path="$1"
+  local owner group mode identity
+  [[ -e "$path" && ! -L "$path" ]] || return 1
+  owner="$($attestation_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+  group="$($attestation_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+  mode="$($attestation_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+  [[ "$owner" == "$attestation_git_owner_uid" && "$group" == "$attestation_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || {
+    echo "Git metadata is not owned by the invoking identity or is writable by another principal: $path" >&2
+    return 1
+  }
+  identity="$($attestation_stat_bin -Lc '%u:%g:%a:%d:%i:%F' -- "$path" 2>/dev/null || true)"
+  [[ -n "$identity" ]] || return 1
+  if [[ -z "${attestation_bound_git_identities[$path]+x}" ]]; then
+    attestation_bound_git_paths+=("$path")
+  fi
+  attestation_bound_git_identities["$path"]="$identity"
+}
+
+attestation_bind_git_layout() {
+  local path worktree_record
+  attestation_bound_git_paths=()
+  attestation_bound_git_identities=()
+  for path in "$1" "$1/.git" "$attestation_git_dir" "$attestation_common_git_dir" \
+    "$attestation_common_git_dir/objects" "$attestation_common_git_dir/refs" \
+    "$attestation_common_git_dir/config" "$attestation_git_dir/index"; do
+    attestation_bind_git_path "$path" || return 1
+  done
+  for path in "$attestation_git_dir/commondir" "$attestation_git_dir/gitdir" \
+    "$attestation_common_git_dir/worktrees" "$attestation_git_dir/HEAD" \
+    "$attestation_common_git_dir/HEAD" "$attestation_common_git_dir/packed-refs"; do
+    [[ -e "$path" ]] || continue
+    attestation_bind_git_path "$path" || return 1
+  done
+  if [[ "$attestation_git_dir" != "$attestation_common_git_dir" ]]; then
+    worktree_record="$attestation_common_git_dir/worktrees/${attestation_git_dir##*/}"
+    attestation_bind_git_path "$worktree_record" || return 1
+    attestation_bind_git_path "$worktree_record/gitdir" || return 1
+  fi
+}
+
+attestation_assert_git_lifetime() {
+  local path identity index
+  local -a current_identities=()
+  ((${#attestation_bound_git_paths[@]} > 0)) || return 1
+  mapfile -t current_identities < <("$attestation_stat_bin" -Lc '%u:%g:%a:%d:%i:%F' -- "${attestation_bound_git_paths[@]}" 2>/dev/null) || return 1
+  ((${#current_identities[@]} == ${#attestation_bound_git_paths[@]})) || return 1
+  for index in "${!attestation_bound_git_paths[@]}"; do
+    path="${attestation_bound_git_paths[$index]}"
+    identity="${current_identities[$index]}"
+    [[ "$identity" == "${attestation_bound_git_identities[$path]:-}" ]] || return 1
+  done
 }
 
 attestation_validate_git_layout() {
@@ -165,6 +229,10 @@ attestation_validate_git_layout() {
   [[ ! -e "$attestation_common_git_dir/shallow" && ! -e "$attestation_git_dir/shallow" && \
     ! -e "$attestation_common_git_dir/objects/info/alternates" && \
     ! -e "$attestation_common_git_dir/objects/info/http-alternates" ]] || return 1
+  attestation_bind_git_layout "$source_path" || {
+    echo "Git checkout metadata could not be bound to stable owner/mode identities: $source_path" >&2
+    return 1
+  }
 }
 
 attestation_git() {
@@ -174,7 +242,9 @@ attestation_git() {
   # helper's explicit deny-list.  The only config sources left are /dev/null
   # and the repository-local file, which is never used for a filter-bearing
   # operation and is checked for dangerous keys before this wrapper is used.
-  /usr/bin/env -i \
+  attestation_assert_git_lifetime || return 70
+  local status
+  if /usr/bin/env -i \
     HOME=/nonexistent \
     PATH="$attestation_trusted_path" \
     LC_ALL=C \
@@ -183,6 +253,7 @@ attestation_git() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
     "$attestation_git_bin" \
     --no-replace-objects \
     -C "$source_path" \
@@ -193,13 +264,21 @@ attestation_git() {
     -c core.hooksPath=/dev/null \
     -c core.filemode=true \
     -c core.ignoreCase=false \
-    "$@"
+    "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  attestation_assert_git_lifetime || return 70
+  return "$status"
 }
 
 attestation_git_config() {
   local source_path="$1"
   shift
-  /usr/bin/env -i \
+  attestation_assert_git_lifetime || return 70
+  local status
+  if /usr/bin/env -i \
     HOME=/nonexistent \
     PATH="$attestation_trusted_path" \
     LC_ALL=C \
@@ -208,12 +287,28 @@ attestation_git_config() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
     "$attestation_git_bin" \
     --no-replace-objects \
     -C "$source_path" \
     --git-dir="${attestation_git_dir:-.git}" \
     --work-tree=. \
-    "$@"
+    "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  attestation_assert_git_lifetime || return 70
+  return "$status"
+}
+
+attestation_git_config_optional() {
+  local output status
+  output="$(attestation_git_config "$@" 2>/dev/null)" || {
+    status=$?
+    ((status == 1)) || return "$status"
+  }
+  printf '%s\n' "$output"
 }
 
 attestation_reject_symlink_components() {
@@ -247,19 +342,20 @@ attestation_config_is_safe() {
   local dangerous
   local sparse_checkout
   local sparse_index
+  local attestation_filemode attestation_bare attestation_format_version attestation_ignorecase
   local common_git_dir="${attestation_common_git_dir:-$source_path/.git}"
-  dangerous="$(attestation_git_config "$source_path" config --local --no-includes --name-only --get-regexp \
-    '^(include|filter\.|diff\..*\.textconv$|merge\..*\.driver$|credential\.|url\..*\.insteadOf$|core\.(attributesfile|excludesfile|fsmonitor|hooksPath|worktree|alternateRefsCommand|askPass|gitProxy|sshCommand)$|extensions\.|remote\..*\.(promisor|partialclonefilter|uploadpack|receivepack)$)' 2>/dev/null || true)"
+  dangerous="$(attestation_git_config_optional "$source_path" config --local --no-includes --name-only --get-regexp \
+    '^(include|filter\.|diff\..*\.textconv$|merge\..*\.driver$|credential\.|url\..*\.insteadOf$|core\.(attributesfile|excludesfile|fsmonitor|hooksPath|worktree|alternateRefsCommand|askPass|gitProxy|sshCommand)$|extensions\.|remote\..*\.(promisor|partialclonefilter|uploadpack|receivepack)$)')"
   [[ -z "$dangerous" ]] || {
     echo "Repository-local Git configuration is not permitted for attestation: $dangerous" >&2
     return 1
   }
-  sparse_checkout="$(attestation_git_config "$source_path" config --local --no-includes --bool --get core.sparseCheckout 2>/dev/null || true)"
+  sparse_checkout="$(attestation_git_config_optional "$source_path" config --local --no-includes --bool --get core.sparseCheckout)" || return 1
   [[ "$sparse_checkout" != true ]] || {
     echo "Repository-local sparse checkout is not permitted: $source_path" >&2
     return 1
   }
-  sparse_index="$(attestation_git_config "$source_path" config --local --no-includes --bool --get index.sparse 2>/dev/null || true)"
+  sparse_index="$(attestation_git_config_optional "$source_path" config --local --no-includes --bool --get index.sparse)" || return 1
   [[ "$sparse_index" != true ]] || {
     echo "Repository-local sparse index is not permitted: $source_path" >&2
     return 1
@@ -284,19 +380,23 @@ attestation_config_is_safe() {
     echo "Git split-index storage is not permitted: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git_config "$source_path" config --local --no-includes --bool --get core.filemode 2>/dev/null || true)" != false ]] || {
+  attestation_filemode="$(attestation_git_config_optional "$source_path" config --local --no-includes --bool --get core.filemode)" || return 1
+  [[ "$attestation_filemode" != false ]] || {
     echo "Repository-local core.filemode=false is not permitted: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git_config "$source_path" config --local --no-includes --bool --get core.bare 2>/dev/null || true)" != true ]] || {
+  attestation_bare="$(attestation_git_config_optional "$source_path" config --local --no-includes --bool --get core.bare)" || return 1
+  [[ "$attestation_bare" != true ]] || {
     echo "Repository-local core.bare=true is not permitted: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git_config "$source_path" config --local --no-includes --int --get core.repositoryformatversion 2>/dev/null || true)" == 0 ]] || {
+  attestation_format_version="$(attestation_git_config_optional "$source_path" config --local --no-includes --int --get core.repositoryformatversion)" || return 1
+  [[ "$attestation_format_version" == 0 ]] || {
     echo "Unsupported Git repository format: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git_config "$source_path" config --local --no-includes --bool --get core.ignorecase 2>/dev/null || true)" != true ]] || {
+  attestation_ignorecase="$(attestation_git_config_optional "$source_path" config --local --no-includes --bool --get core.ignorecase)" || return 1
+  [[ "$attestation_ignorecase" != true ]] || {
     echo "Repository-local core.ignoreCase=true is not permitted: $source_path" >&2
     return 1
   }
@@ -418,7 +518,7 @@ attestation_create_git_snapshot() {
   local expected_url="${2:-}"
   local expected_ref="${3:-}"
   local require_live="${4:-true}"
-  local canonical_source_path git_dir common_git_dir git_toplevel actual_url actual_ref
+  local canonical_source_path git_dir common_git_dir git_toplevel git_absolute_dir git_inside_worktree git_bare git_shallow actual_url actual_ref
   local git_pointer git_pointer_path commondir_spec
   local tree_file index_file stage_file snapshot_path manifest_path
   local record meta path mode type oid digest snapshot_mode
@@ -466,30 +566,34 @@ attestation_create_git_snapshot() {
   config_file="$common_git_dir/config"
   attestation_config_is_safe "$canonical_source_path" || return 1
 
-  git_toplevel="$(attestation_git "$canonical_source_path" rev-parse --show-toplevel 2>/dev/null || true)"
+  git_toplevel="$(attestation_git "$canonical_source_path" rev-parse --show-toplevel 2>/dev/null)" || return 1
   git_toplevel="$($attestation_realpath_bin -e -- "$git_toplevel" 2>/dev/null || true)"
   [[ "$git_toplevel" == "$canonical_source_path" ]] || {
     echo "Git checkout top-level path is not canonical: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git "$canonical_source_path" rev-parse --absolute-git-dir 2>/dev/null || true)" == "$git_dir" ]] || {
+  git_absolute_dir="$(attestation_git "$canonical_source_path" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  [[ "$git_absolute_dir" == "$git_dir" ]] || {
     echo "Git checkout uses an external common Git directory: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git "$canonical_source_path" rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]] || {
+  git_inside_worktree="$(attestation_git "$canonical_source_path" rev-parse --is-inside-work-tree 2>/dev/null)" || return 1
+  [[ "$git_inside_worktree" == true ]] || {
     echo "Git checkout is not a worktree: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git "$canonical_source_path" rev-parse --is-bare-repository 2>/dev/null || true)" == false ]] || {
+  git_bare="$(attestation_git "$canonical_source_path" rev-parse --is-bare-repository 2>/dev/null)" || return 1
+  [[ "$git_bare" == false ]] || {
     echo "Git checkout is bare: $source_path" >&2
     return 1
   }
-  [[ "$(attestation_git "$canonical_source_path" rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
+  git_shallow="$(attestation_git "$canonical_source_path" rev-parse --is-shallow-repository 2>/dev/null)" || return 1
+  [[ "$git_shallow" == false ]] || {
     echo "Git checkout is shallow: $source_path" >&2
     return 1
   }
 
-  actual_url="$(attestation_git_config "$canonical_source_path" config --local --no-includes --get-all remote.origin.url 2>/dev/null || true)"
+  actual_url="$(attestation_git_config_optional "$canonical_source_path" config --local --no-includes --get-all remote.origin.url)" || return 1
   [[ "$actual_url" != *$'\n'* && "$actual_url" != *$'\r'* && "$actual_url" != *$'\t'* ]] || {
     echo "Git checkout origin contains manifest-unsafe control characters: $source_path" >&2
     return 1
@@ -499,9 +603,9 @@ attestation_create_git_snapshot() {
     return 1
   fi
   if [[ "$require_live" == true ]]; then
-    actual_ref="$(attestation_git "$canonical_source_path" rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+    actual_ref="$(attestation_git "$canonical_source_path" rev-parse --verify HEAD^{commit} 2>/dev/null)" || return 1
   else
-    actual_ref="$(attestation_git "$canonical_source_path" rev-parse --verify "$expected_ref^{commit}" 2>/dev/null || true)"
+    actual_ref="$(attestation_git "$canonical_source_path" rev-parse --verify "$expected_ref^{commit}" 2>/dev/null)" || return 1
   fi
   [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
     echo "Git checkout HEAD is not a full commit: $source_path" >&2
@@ -569,16 +673,13 @@ attestation_create_git_snapshot() {
       attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
-    "$attestation_git_bin" --no-replace-objects --git-dir="$git_dir" -c core.attributesfile=/dev/null \
-      -c core.hooksPath=/dev/null cat-file -e "$oid^{blob}" 2>/dev/null || {
+    if ! attestation_git "$canonical_source_path" cat-file -e "$oid^{blob}" 2>/dev/null; then
       echo "Committed Git blob is missing: $path" >&2
       attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
-    }
+    fi
     "$attestation_mkdir_bin" -p -- "$snapshot_path/$($attestation_dirname_bin -- "$path")"
-    if ! /usr/bin/env -i HOME=/nonexistent PATH="$attestation_trusted_path" LC_ALL=C TZ=UTC \
-      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-      "$attestation_git_bin" --no-replace-objects --git-dir="$git_dir" cat-file blob "$oid" > "$snapshot_path/$path"; then
+    if ! attestation_git "$canonical_source_path" cat-file blob "$oid" > "$snapshot_path/$path"; then
       echo "Committed Git blob cannot be materialized: $path" >&2
       attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
@@ -720,6 +821,7 @@ attestation_verify_snapshot() {
   local expected_commit="${3:-}"
   local expected_url="${4:-}"
   local line mode oid digest path full actual_mode actual_digest relative
+  local manifest_header_count=0
   attestation_reject_symlink_components "$root" || return 1
   [[ "$root" == /* && -d "$root" && ! -L "$root" ]] || return 1
   [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
@@ -738,7 +840,7 @@ attestation_verify_snapshot() {
   local manifest_url_count=0
   while IFS= read -r line; do
     case "$line" in
-      herdr-source-snapshot-v2) continue ;;
+      herdr-source-snapshot-v2) ((manifest_header_count += 1)); continue ;;
       commit=*) ((manifest_commit_count += 1)); continue ;;
       repository_url=*) ((manifest_url_count += 1)); continue ;;
       F$'\t'*) ;;
@@ -761,7 +863,7 @@ attestation_verify_snapshot() {
       verify_dirs["$current"]='1'
     done
   done < "$manifest"
-  [[ "${manifest_commit_count}" == 1 && "${manifest_url_count}" == 1 && "${#verify_sha[@]}" -gt 0 ]] || return 1
+  [[ "${manifest_header_count}" == 1 && "${manifest_commit_count}" == 1 && "${manifest_url_count}" == 1 && "${#verify_sha[@]}" -gt 0 ]] || return 1
   while IFS= read -r -d '' full; do
     relative="${full#"$root"/}"
     [[ "$relative" == .source-attestation ]] && continue

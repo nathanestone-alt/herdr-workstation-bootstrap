@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -26,6 +27,7 @@ prepare_fixture_repo() {
 
 write_fixture_commands() {
   local case_root="$1"
+  local case_mode="$2"
   local fake_bin="$case_root/bin"
   local trusted_bin="$case_root/trusted-bin"
   mkdir -p "$fake_bin" "$trusted_bin"
@@ -49,14 +51,23 @@ if [[ "$original_apt_get" == /usr/bin/apt-get || "$original_apt_get" == "${CASE_
   export HERDR_TAILSCALE_REAL_APT_GET="${CASE_ROOT:?}/trusted-bin/apt-get"
   export APT_SEAM_LOG="${CASE_ROOT:?}/trusted-apt.log"
 fi
+if [[ "${CASE_MODE:-}" == installer-replacement && "${1:-}" == /usr/bin/bash ]]; then
+  printf '%s\n' 'tampered installer' > "${4:?}"
+fi
 exec "$@"
 EOF
 
   cat > "$fake_bin/apt-get" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-case_root="${CASE_ROOT:?}"
-apt_log="${APT_SEAM_LOG:-$case_root/apt.log}"
+case_root="${CASE_ROOT:-__CASE_ROOT__}"
+case_mode="${CASE_MODE:-__CASE_MODE__}"
+expected_version="${EXPECTED_TAILSCALE_VERSION:-__EXPECTED_VERSION__}"
+apt_self="$(/usr/bin/realpath -e -- "$0" 2>/dev/null || printf '%s' "$0")"
+default_apt_log="$case_root/apt.log"
+[[ "$apt_self" == */trusted-bin/apt-get ]] && default_apt_log="$case_root/trusted-apt.log"
+apt_log="${APT_SEAM_LOG:-$default_apt_log}"
+printf 'PATH=%s\n' "${PATH:-}" >> "$case_root/privileged-path.log"
 printf 'apt-get' >> "$apt_log"
 for arg in "$@"; do printf ' %q' "$arg" >> "$apt_log"; done
 printf '\n' >> "$apt_log"
@@ -74,15 +85,21 @@ if (( has_tailscale == 1 )); then
     printf 'The following packages will be DOWNGRADED:\n  tailscale\nE: Packages were downgraded and -y was used without --allow-downgrades.\n' >&2
     exit 100
   fi
-  if [[ "${CASE_MODE:-}" == install-failure ]]; then
+  if [[ "$case_mode" == install-failure ]]; then
     printf 'simulated package installation failure\n' >&2
     exit 71
   fi
-  if [[ "${CASE_MODE:-}" != post-mismatch ]]; then
-    printf '%s\n' "${EXPECTED_TAILSCALE_VERSION:?}" > "$case_root/tailscale.version"
+  if [[ "$case_mode" != post-mismatch ]]; then
+    printf '%s\n' "$expected_version" > "$case_root/tailscale.version"
   fi
 fi
 EOF
+
+  /usr/bin/sed -i \
+    -e "s|__CASE_ROOT__|$case_root|g" \
+    -e "s|__CASE_MODE__|$case_mode|g" \
+    -e "s|__EXPECTED_VERSION__|1.102.2|g" \
+    "$fake_bin/apt-get"
 
   cp "$fake_bin/apt-get" "$trusted_bin/apt-get"
 
@@ -165,9 +182,10 @@ run_case() {
 
   mkdir -p "$case_root" "$home"
   prepare_fixture_repo "$fixture_repo" "$bootstrap_source"
-  write_fixture_commands "$case_root"
+  write_fixture_commands "$case_root" "$case_mode"
   printf '%s\n' "$initial_version" > "$case_root/tailscale.version"
-  printf '#!/bin/sh\nset -eu\nversion="${TAILSCALE_VERSION}"\nif [ "${CASE_MODE:-}" = arbitrary-installer ]; then version=9.99.9; fi\nif [ "${CASE_MODE:-}" = hostile-path ] && command -v installer-helper >/dev/null 2>&1; then installer-helper; fi\napt-get install -y "tailscale=$version" tailscale-archive-keyring\n' > "$case_root/installer.sh"
+  printf '#!/bin/sh\nset -eu\nversion="${TAILSCALE_VERSION}"\nif [ "__CASE_MODE__" = arbitrary-installer ]; then version=9.99.9; fi\nif [ "__CASE_MODE__" = hostile-path ] && command -v installer-helper >/dev/null 2>&1; then installer-helper; fi\napt-get install -y "tailscale=$version" tailscale-archive-keyring\n' > "$case_root/installer.sh"
+  /usr/bin/sed -i "s|__CASE_MODE__|$case_mode|g" "$case_root/installer.sh"
   chmod 0755 "$case_root/installer.sh"
   installer_sha256="$(/usr/bin/sha256sum -- "$case_root/installer.sh" | /usr/bin/gawk '{print $1}')"
 
@@ -186,7 +204,8 @@ run_case() {
     TAILSCALE_INSTALLER_SHA256="${EXPECTED_INSTALLER_SHA256:?}"
     bootstrap_command_path() {
       case "$1" in
-        sudo|apt-get|ps|pwsh|systemctl|tailscale) printf "%s/bin/%s\n" "${CASE_ROOT:?}" "$1" ;;
+        sudo|ps|pwsh|systemctl|tailscale) printf "%s/bin/%s\n" "${CASE_ROOT:?}" "$1" ;;
+        apt-get) printf "%s/trusted-bin/apt-get\n" "${CASE_ROOT:?}" ;;
         *) return 1 ;;
       esac
     }
@@ -201,7 +220,7 @@ run_case() {
         "$@"
     }
     bootstrap_validate_tailscale_apt_identity() {
-      [[ "$1" == "${CASE_ROOT:?}/bin/apt-get" ]]
+      [[ "$1" == "${CASE_ROOT:?}/trusted-bin/apt-get" ]]
     }
     if [[ "${CASE_MODE:-}" == invalid-lock ]]; then
       TAILSCALE_VERSION=not-a-semantic-version
@@ -286,6 +305,7 @@ run_case candidate-checksum-failure "$repo_root/scripts/ubuntu/bootstrap.sh" che
 run_case candidate-install-failure "$repo_root/scripts/ubuntu/bootstrap.sh" install-failure 1.103.0 71 no yes
 run_case candidate-post-mismatch "$repo_root/scripts/ubuntu/bootstrap.sh" post-mismatch 1.103.0 24 no yes
 run_case candidate-hostile-path "$repo_root/scripts/ubuntu/bootstrap.sh" hostile-path 1.103.0 0 yes yes
+run_case candidate-installer-replacement "$repo_root/scripts/ubuntu/bootstrap.sh" installer-replacement 1.103.0 24 no no
 
 exact_case="$test_root/candidate-exact"
 if [[ -f "$exact_case/apt.log" ]] && grep -Fq 'tailscale=' "$exact_case/apt.log"; then
@@ -302,10 +322,6 @@ if [[ -f "$hostile_case/apt.log" ]] && grep -Fq 'tailscale=' "$hostile_case/apt.
   echo 'Hostile PATH selected the caller-controlled apt-get.' >&2
   exit 1
 fi
-[[ -s "$hostile_case/trusted-apt.log" ]] || {
-  echo 'Hostile PATH did not use the hermetic trusted apt seam.' >&2
-  exit 1
-}
 grep -Fq 'PATH=' "$hostile_case/privileged-path.log" || {
   echo 'Hostile PATH case did not record the privileged PATH.' >&2
   exit 1
@@ -314,7 +330,11 @@ grep -Eq 'PATH=.*/usr/sbin:/usr/bin:/sbin:/bin$' "$hostile_case/privileged-path.
   echo 'Hostile PATH case propagated an unexpected privileged PATH.' >&2
   exit 1
 }
-grep -Fq "APT=$hostile_case/bin/apt-get" "$hostile_case/privileged-path.log" || {
+[[ ! -f "$hostile_case/apt.log" ]] || {
+  echo 'Hostile PATH case invoked the caller-controlled apt-get.' >&2
+  exit 1
+}
+[[ -s "$hostile_case/trusted-apt.log" ]] || {
   echo 'Hostile PATH case did not resolve the trusted system apt-get.' >&2
   exit 1
 }

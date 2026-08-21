@@ -3,43 +3,30 @@ set -euo pipefail
 readonly verify_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly verify_getent_bin='/usr/bin/getent'
 readonly verify_id_bin='/usr/bin/id'
+readonly verify_realpath_bin='/usr/bin/realpath'
+readonly verify_stat_bin='/usr/bin/stat'
+readonly verify_find_bin='/usr/bin/find'
+readonly verify_env_bin='/usr/bin/env'
+readonly verify_git_bin='/usr/bin/git'
 export PATH="$verify_trusted_path"
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_VERIFY_TRUSTED_LAUNCHER:-}" != 1 && \
+  "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" != 1 ]]; then
+  echo 'verify.sh must be launched through the installed trusted launcher' >&2
+  exit 24
+fi
 if [[ -z "${HOME:-}" ]]; then
   verify_launch_home="$($verify_getent_bin passwd "$($verify_id_bin -u)" 2>/dev/null | /usr/bin/gawk -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
   [[ "$verify_launch_home" == /* && "$verify_launch_home" != '/' ]] || exit 24
   export HOME="$verify_launch_home"
 fi
-if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" != 1 ]]; then
-  verify_live_script="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-  verify_repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_live_script")/../.." 2>/dev/null || true)"
-  verify_commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-  verify_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$verify_commit:scripts/ubuntu/verify.sh" 2>/dev/null || true)"
-  [[ "$verify_commit" =~ ^[0-9a-f]{40}$ && "$verify_oid" =~ ^[0-9a-f]{40}$ ]] || exit 24
-  verify_temp="$(/usr/bin/mktemp -d /tmp/herdr-verify-entrypoint.XXXXXX)"
-  trap '/usr/bin/rm -rf -- "$verify_temp"' EXIT
-  /usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$verify_commit:scripts/ubuntu/verify.sh" > "$verify_temp/verify.sh" || exit 24
-  verify_materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$verify_repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$verify_temp/verify.sh")"
-  [[ "$verify_materialized_oid" == "$verify_oid" ]] || {
-    /usr/bin/rm -rf -- "$verify_temp"
-    exit 24
-  }
-  /usr/bin/chmod 0700 -- "$verify_temp"
-  exec /usr/bin/env -i HOME="$HOME" PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-    HERDR_VERIFY_VERIFIED_ENTRYPOINT=1 HERDR_VERIFY_REPO_ROOT="$verify_repo_root" \
-    HERDR_VERIFY_ENTRYPOINT_TEMP="$verify_temp" /usr/bin/bash "$verify_temp/verify.sh" "$@"
-fi
+while IFS= read -r verify_env_name; do
+  case "$verify_env_name" in
+    GIT_*)
+      echo "verify trust prelude: caller Git environment override is not permitted: $verify_env_name" >&2
+      exit 24
+      ;;
+  esac
+done < <(compgen -e)
 if [[ "${HERDR_VERIFY_VERIFIED_ENTRYPOINT:-}" == 1 ]]; then
   repo_root="${HERDR_VERIFY_REPO_ROOT:-}"
   verify_script_path="$repo_root/scripts/ubuntu/verify.sh"
@@ -48,6 +35,109 @@ else
   verify_script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
   repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_script_path")/../..")"
 fi
+
+declare -a verify_git_bound_paths=()
+declare -A verify_git_bound_identities=()
+verify_git_owner_uid="${HERDR_VERIFY_GIT_OWNER_UID:-$($verify_id_bin -u)}"
+verify_git_owner_gid="${HERDR_VERIFY_GIT_OWNER_GID:-$($verify_id_bin -g)}"
+[[ "$verify_git_owner_uid" =~ ^[0-9]+$ && "$verify_git_owner_gid" =~ ^[0-9]+$ ]] || exit 24
+verify_bind_git_path() {
+  local path="$1" owner group mode identity
+  [[ -e "$path" && ! -L "$path" ]] || return 1
+  owner="$($verify_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+  group="$($verify_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+  mode="$($verify_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+  [[ "$owner" == "$verify_git_owner_uid" && "$group" == "$verify_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || return 1
+  identity="$($verify_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+  [[ -n "$identity" ]] || return 1
+  if [[ -z "${verify_git_bound_identities[$path]+x}" ]]; then
+    verify_git_bound_paths+=("$path")
+  fi
+  verify_git_bound_identities["$path"]="$identity"
+}
+verify_bind_optional_git_path() {
+  [[ -e "$1" ]] || return 0
+  verify_bind_git_path "$1"
+}
+verify_assert_git_lifetime() {
+  local path owner group mode identity
+  for path in "${verify_git_bound_paths[@]}"; do
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    owner="$($verify_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+    group="$($verify_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+    mode="$($verify_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+    identity="$($verify_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$verify_git_owner_uid" && "$group" == "$verify_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 && \
+      "$identity" == "${verify_git_bound_identities[$path]:-}" ]] || return 1
+  done
+}
+verify_validate_git_layout() {
+  local metadata="$repo_root/.git" pointer pointer_path commondir_spec record='' record_pointer other_record other_pointer
+  [[ -e "$metadata" && ! -L "$metadata" && ( -d "$metadata" || -f "$metadata" ) ]] || return 1
+  if [[ -d "$metadata" ]]; then
+    verify_git_dir="$metadata"
+    verify_common_git_dir="$metadata"
+  else
+    pointer="$(< "$metadata")"
+    [[ "$pointer" != *$'\n'* && "$pointer" != *$'\r'* && "$pointer" == gitdir:\ /* ]] || return 1
+    pointer_path="${pointer#gitdir: }"
+    verify_git_dir="$($verify_realpath_bin -e -- "$pointer_path" 2>/dev/null || true)"
+    [[ -n "$verify_git_dir" && "$pointer" == "gitdir: $verify_git_dir" && -d "$verify_git_dir" && ! -L "$verify_git_dir" ]] || return 1
+    [[ -f "$verify_git_dir/commondir" && ! -L "$verify_git_dir/commondir" ]] || return 1
+    commondir_spec="$(< "$verify_git_dir/commondir")"
+    [[ "$commondir_spec" == ../.. ]] || return 1
+    verify_common_git_dir="$($verify_realpath_bin -e -- "$verify_git_dir/$commondir_spec" 2>/dev/null || true)"
+    record="$verify_common_git_dir/worktrees/${verify_git_dir##*/}"
+    [[ -d "$verify_common_git_dir/worktrees" && ! -L "$verify_common_git_dir/worktrees" && \
+      "$($verify_realpath_bin -e -- "$record" 2>/dev/null || true)" == "$verify_git_dir" && \
+      -f "$verify_git_dir/gitdir" && ! -L "$verify_git_dir/gitdir" ]] || return 1
+    record_pointer="$(< "$verify_git_dir/gitdir")"
+    [[ "$record_pointer" != *$'\n'* && "$record_pointer" != *$'\r'* && \
+      "$($verify_realpath_bin -e -- "$record_pointer" 2>/dev/null || true)" == "$metadata" ]] || return 1
+    while IFS= read -r -d '' other_record; do
+      [[ "${other_record%/gitdir}" == "$verify_git_dir" ]] && continue
+      other_pointer="$(< "$other_record")"
+      [[ "$other_pointer" != *$'\n'* && "$other_pointer" != *$'\r'* && \
+        "$($verify_realpath_bin -e -- "$other_pointer" 2>/dev/null || true)" != "$metadata" ]] || return 1
+    done < <("$verify_find_bin" -P "$verify_common_git_dir/worktrees" -mindepth 2 -maxdepth 2 -type f -name gitdir -print0 2>/dev/null)
+  fi
+  [[ -d "$verify_common_git_dir" && ! -L "$verify_common_git_dir" && \
+    -d "$verify_common_git_dir/objects" && ! -L "$verify_common_git_dir/objects" && \
+    -d "$verify_common_git_dir/refs" && ! -L "$verify_common_git_dir/refs" && \
+    -f "$verify_common_git_dir/config" && ! -L "$verify_common_git_dir/config" && \
+    -f "$verify_git_dir/index" && ! -L "$verify_git_dir/index" ]] || return 1
+  verify_bind_git_path "$repo_root" || return 1
+  verify_bind_git_path "$metadata" || return 1
+  for verify_git_binding_path in "$verify_git_dir" "$verify_common_git_dir" "$verify_common_git_dir/objects" \
+    "$verify_common_git_dir/refs" "$verify_common_git_dir/config" "$verify_git_dir/index"; do
+    verify_bind_git_path "$verify_git_binding_path" || return 1
+  done
+  for verify_git_binding_path in "$verify_git_dir/commondir" "$verify_git_dir/gitdir" \
+    "$verify_common_git_dir/worktrees" "$verify_git_dir/HEAD" "$verify_common_git_dir/HEAD" \
+    "$verify_common_git_dir/packed-refs"; do
+    verify_bind_optional_git_path "$verify_git_binding_path" || return 1
+  done
+  if [[ -n "$record" ]]; then
+    verify_bind_git_path "$record" || return 1
+    verify_bind_git_path "$record/gitdir" || return 1
+  fi
+}
+verify_trust_git() {
+  local status
+  verify_assert_git_lifetime || return 70
+  if "$verify_env_bin" -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
+    "$verify_git_bin" --no-replace-objects -C "$repo_root" --git-dir="$verify_git_dir" --work-tree=. \
+    -c core.attributesfile=/dev/null -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null \
+    -c core.filemode=true -c core.ignoreCase=false "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  verify_assert_git_lifetime || return 70
+  return "$status"
+}
 
 verify_system_command_path() {
   case "$1" in
@@ -121,6 +211,7 @@ verify_resolve_command() {
 }
 
 verify_main() {
+verify_validate_git_layout || { echo 'Verification repository metadata is not stable or owner-bound.' >&2; exit 24; }
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
 [[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
 # Bind the bootstrap library to the same committed source object before any
@@ -129,31 +220,19 @@ lock_file="$repo_root/config/ubuntu-toolchain.lock"
 verify_bootstrap_temp="$(/usr/bin/mktemp -d /tmp/herdr-verify-bootstrap.XXXXXX)"
 trap '/usr/bin/rm -rf -- "$verify_bootstrap_temp"' EXIT
 verify_bootstrap_script="$verify_bootstrap_temp/bootstrap.sh"
-verify_bootstrap_commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-verify_bootstrap_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" 2>/dev/null || true)"
+verify_bootstrap_commit="$(verify_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null)" || exit 24
+verify_bootstrap_oid="$(verify_trust_git rev-parse --verify "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" 2>/dev/null)" || exit 24
 [[ "$verify_bootstrap_commit" =~ ^[0-9a-f]{40}$ && "$verify_bootstrap_oid" =~ ^[0-9a-f]{40}$ ]] || {
   /usr/bin/rm -rf -- "$verify_bootstrap_temp"
   echo 'Committed bootstrap object is unavailable.' >&2
   exit 24
 }
-/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" > "$verify_bootstrap_script" || {
+verify_trust_git show "$verify_bootstrap_commit:scripts/ubuntu/bootstrap.sh" > "$verify_bootstrap_script" || {
     /usr/bin/rm -rf -- "$verify_bootstrap_temp"
     echo 'Committed bootstrap bytes could not be materialized.' >&2
     exit 24
   }
-verify_bootstrap_materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$verify_trusted_path" LC_ALL=C TZ=UTC \
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-  /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-  -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$verify_bootstrap_script")"
+verify_bootstrap_materialized_oid="$(verify_trust_git hash-object --no-filters --stdin < "$verify_bootstrap_script")"
 [[ "$verify_bootstrap_materialized_oid" == "$verify_bootstrap_oid" ]] || {
   /usr/bin/rm -rf -- "$verify_bootstrap_temp"
   echo 'Materialized bootstrap bytes differ from the committed object.' >&2
@@ -163,6 +242,8 @@ verify_bootstrap_materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$ve
 # shellcheck disable=SC1090
 HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 \
 HERDR_BOOTSTRAP_REPO_ROOT="$repo_root" \
+HERDR_BOOTSTRAP_GIT_OWNER_UID="${HERDR_VERIFY_GIT_OWNER_UID:-$(/usr/bin/id -u)}" \
+HERDR_BOOTSTRAP_GIT_OWNER_GID="${HERDR_VERIFY_GIT_OWNER_GID:-$(/usr/bin/id -g)}" \
 HERDR_BOOTSTRAP_ENTRYPOINT_TEMP="$verify_bootstrap_temp" \
 source "$verify_bootstrap_script"
 bootstrap_register_cleanup "$verify_bootstrap_temp"

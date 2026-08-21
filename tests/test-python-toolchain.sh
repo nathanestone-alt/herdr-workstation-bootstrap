@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -10,6 +11,7 @@ trap 'rm -rf "$test_root"' EXIT
 # testing the exact current files in a disposable clean Git fixture.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
@@ -185,11 +187,15 @@ HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$bootstrap_swap_continue" \
 HOME="$bootstrap_swap_home" bash -c \
   'bootstrap_script="$1"; set --; source "$bootstrap_script"; write_py_compat' _ "$bootstrap_script" > "$bootstrap_swap_output" 2>&1 &
 bootstrap_swap_pid=$!
-for attempt in $(seq 1 200); do
+for attempt in $(seq 1 1000); do
   [[ -e "$bootstrap_swap_ready" ]] && break
   sleep 0.01
 done
-[[ -e "$bootstrap_swap_ready" ]] || { kill "$bootstrap_swap_pid" 2>/dev/null || true; exit 1; }
+[[ -e "$bootstrap_swap_ready" ]] || {
+  cat "$bootstrap_swap_output" >&2 || true
+  kill "$bootstrap_swap_pid" 2>/dev/null || true
+  exit 1
+}
 mv "$bootstrap_swap_home/.local" "$bootstrap_swap_home/.local-original"
 ln -s "$bootstrap_swap_outside" "$bootstrap_swap_home/.local"
 : > "$bootstrap_swap_continue"

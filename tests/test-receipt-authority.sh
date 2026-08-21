@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -129,7 +130,8 @@ EOF
   chmod 0755 "$receipt_hostile_path/$receipt_hostile_command"
 done
 if ! /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
-  BASH_ENV="$test_root/receipt-bash-env" "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
+  HERDR_RECEIPT_TRUSTED_LAUNCHER=1 BASH_ENV= ENV= \
+  /usr/bin/bash "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
   cat "$test_root/receipt-help-output" >&2
   exit 1
 fi
@@ -169,7 +171,8 @@ fi
 }
 
 run_authority() {
-  "$entrypoint_script" "$@" \
+  /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+    BASH_ENV= ENV= HERDR_RECEIPT_TRUSTED_LAUNCHER=1 /usr/bin/bash "$entrypoint_script" "$@" \
     --source-root "$source_root" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
@@ -182,6 +185,7 @@ run_authority_with_pause() {
   /usr/bin/env -i \
     HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
     BASH_ENV= ENV= \
+    HERDR_RECEIPT_TRUSTED_LAUNCHER=1 \
     HERDR_RECEIPT_TEST_PAUSE_PHASE="${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" \
     HERDR_RECEIPT_TEST_READY_FILE="${HERDR_RECEIPT_TEST_READY_FILE:-}" \
     HERDR_RECEIPT_TEST_CONTINUE_FILE="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}" \
@@ -214,6 +218,29 @@ run_authority --check
 [[ "$(jq -r '.python313.venv.home' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.base_prefix' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.stdlib' "$receipt_path")" == "$stdlib_root" ]] || exit 1
+
+# A root-side Python probe must not import a caller-controlled sitecustomize or
+# user site. Demonstrate the hostile control first, then exercise the exact
+# sanitized interpreter environment used by receipt_exec_python_unprivileged.
+python_import_root="$test_root/python-import-root"
+python_import_marker="$test_root/python-import-marker"
+mkdir -p "$python_import_root"
+cat > "$python_import_root/sitecustomize.py" <<EOF
+from pathlib import Path
+Path('$python_import_marker').write_text('imported')
+EOF
+/usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+  PYTHONPATH="$python_import_root" /usr/bin/python3 -c 'pass'
+[[ -f "$python_import_marker" ]] || { echo 'Python import control did not establish the hostile sitecustomize fixture.' >&2; exit 1; }
+rm -f -- "$python_import_marker"
+/usr/bin/env -i HOME=/nonexistent PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+  PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 PYTHONPATH= PYTHONHOME= PYTHONSTARTUP= PYTHONINSPECT=0 \
+  /usr/bin/python3 -c 'pass'
+[[ ! -e "$python_import_marker" ]] || { echo 'Sanitized Python probe imported caller-controlled sitecustomize.' >&2; exit 1; }
+grep -Fq 'PYTHONSAFEPATH=1' "$repo_root/scripts/ubuntu/receipt-authority.sh" || {
+  echo 'Receipt Python execution path does not enforce PYTHONSAFEPATH.' >&2
+  exit 1
+}
 
 cp "$authority_path" "$test_root/authority.good"
 cp "$receipt_path" "$test_root/receipt.good"
@@ -324,6 +351,15 @@ source "$repo_root/scripts/ubuntu/source-attestation.sh"
 attestation_create_git_snapshot "$source_root" '' ''
 unbound_source_snapshot="$attestation_snapshot_dir"
 unbound_source_manifest="$attestation_snapshot_manifest"
+duplicate_source_manifest="$test_root/duplicate-source-attestation"
+{
+  printf 'herdr-source-snapshot-v2\n'
+  cat "$unbound_source_manifest"
+} > "$duplicate_source_manifest"
+if attestation_verify_snapshot "$unbound_source_snapshot" "$duplicate_source_manifest"; then
+  echo 'Duplicate source-manifest header was accepted.' >&2
+  exit 1
+fi
 expect_failure 'unsigned source manifest' "$entrypoint_script" --check \
   --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
   --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \

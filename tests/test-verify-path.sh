@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -10,6 +11,7 @@ trap 'rm -rf "$test_root"' EXIT
 # checkout as an authority input.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
@@ -151,9 +153,39 @@ mkdir -p "$HOME/.local/state/herdr-workstation-bootstrap"
   done
 } > "$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 
-# Direct verify launches clear caller startup files and re-execute only the
-# committed verify bytes. The dirty copy is expected to fail later in its
-# environment checks, but neither dirty top-level code nor BASH_ENV may run.
+# Direct verify launches must enter the hardened verifier only under the
+# explicit launcher contract. This direct bash invocation is a fixture probe
+# for the hardened path; the normal shebang invocation below has no trust
+# marker and must stop before mutable code.
+[[ -x "$repo_root/scripts/ubuntu/verify.sh" && "$(stat -c '%a' "$repo_root/scripts/ubuntu/verify.sh")" == 755 ]] || {
+  echo 'verify.sh is not directly executable with mode 100755.' >&2
+  exit 1
+}
+direct_verify_output="$test_root/direct-verify-output"
+set +e
+/usr/bin/env -i HOME="$HOME" PATH="$managed_bin:/usr/bin:/bin" BASH_ENV= ENV= \
+  HERDR_VERIFY_TRUSTED_LAUNCHER=1 HERDR_VERIFY_GIT_OWNER_UID="$(id -u)" HERDR_VERIFY_GIT_OWNER_GID="$(id -g)" \
+  /usr/bin/bash "$repo_root/scripts/ubuntu/verify.sh" > "$direct_verify_output" 2>&1
+direct_verify_status=$?
+set -e
+(( direct_verify_status != 0 && direct_verify_status != 124 )) || {
+  cat "$direct_verify_output" >&2
+  echo 'Direct verify fixture unexpectedly completed or timed out.' >&2
+  exit 1
+}
+! grep -Fq 'must be launched through the installed trusted launcher' "$direct_verify_output" || {
+  cat "$direct_verify_output" >&2
+  echo 'Direct verify did not reach the hardened path.' >&2
+  exit 1
+}
+grep -Eq 'Host uname is unavailable|Kernel:|FAIL command|Verification failed|Toolchain lock validation failed' "$direct_verify_output" || {
+  cat "$direct_verify_output" >&2
+  echo 'Direct verify output did not prove entry into the hardened verifier.' >&2
+  exit 1
+}
+
+# The dirty copy is expected to fail at the external-launcher guard, but
+# neither dirty top-level code nor BASH_ENV may run.
 dirty_verify_root="$test_root/dirty-verify"
 cp -a -- "$source_fixture" "$dirty_verify_root"
 dirty_verify_entrypoint_marker="$test_root/dirty-verify-entrypoint"
@@ -226,6 +258,9 @@ for verify_dangerous_var in \
   RUSTFLAGS RUSTC_WRAPPER CARGO_HOME RUSTUP_HOME; do
   unset "$verify_dangerous_var"
 done
+while IFS= read -r verify_git_environment_var; do
+  unset "$verify_git_environment_var"
+done < <(compgen -e | /usr/bin/grep '^GIT_')
 # shellcheck disable=SC1091
 source "$repo_root/scripts/ubuntu/verify.sh"
 verify_system_command_path() {

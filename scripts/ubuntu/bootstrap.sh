@@ -61,59 +61,10 @@ while IFS= read -r bootstrap_env_name; do
 done < <(compgen -e)
 
 bootstrap_reexec_committed_entrypoint() {
-  [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT:-}" != 1 ]] || return 0
-  local live_script live_dir repo_root commit committed_oid temp_dir committed_script materialized_oid
-  live_script="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
-  live_dir="$(/usr/bin/dirname -- "$live_script")"
-  repo_root="$(/usr/bin/realpath -e -- "$live_dir/../.." 2>/dev/null || true)"
-  [[ -n "$live_script" && -n "$repo_root" && "$live_script" == "$repo_root/scripts/ubuntu/bootstrap.sh" && \
-    -d "$repo_root" && ! -L "$repo_root" ]] || {
-    echo 'bootstrap trust boundary: live entrypoint is not at the canonical repository path' >&2
+  if [[ "${BASH_SOURCE[0]}" == "$0" && "${HERDR_BOOTSTRAP_TRUSTED_LAUNCHER:-}" != 1 ]]; then
+    echo 'bootstrap must be launched through the installed trusted launcher' >&2
     exit 24
-  }
-  commit="$(/usr/bin/env -i HOME=/nonexistent PATH="$bootstrap_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-  committed_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$bootstrap_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null rev-parse --verify "$commit:scripts/ubuntu/bootstrap.sh" 2>/dev/null || true)"
-  [[ "$commit" =~ ^[0-9a-f]{40}$ && "$committed_oid" =~ ^[0-9a-f]{40}$ ]] || {
-    echo 'bootstrap trust boundary: committed entrypoint object is unavailable' >&2
-    exit 24
-  }
-  temp_dir="$(/usr/bin/mktemp -d /tmp/herdr-bootstrap-entrypoint.XXXXXX)" || exit 24
-  trap '/usr/bin/rm -rf -- "$temp_dir"' EXIT
-  committed_script="$temp_dir/bootstrap.sh"
-  /usr/bin/env -i HOME=/nonexistent PATH="$bootstrap_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null show "$commit:scripts/ubuntu/bootstrap.sh" > "$committed_script" || {
-      /usr/bin/rm -rf -- "$temp_dir"
-      exit 24
-    }
-  materialized_oid="$(/usr/bin/env -i HOME=/nonexistent PATH="$bootstrap_trusted_path" LC_ALL=C TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-    /usr/bin/git --no-replace-objects -C "$repo_root" -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null -c core.hooksPath=/dev/null hash-object --no-filters --stdin < "$committed_script")"
-  [[ "$materialized_oid" == "$committed_oid" ]] || {
-    /usr/bin/rm -rf -- "$temp_dir"
-    exit 24
-  }
-  /usr/bin/chmod 0700 -- "$temp_dir"
-  exec /usr/bin/env -i \
-    HOME="${HOME:-/nonexistent}" \
-    PATH="$bootstrap_trusted_path" \
-    LC_ALL=C \
-    TZ=UTC \
-    HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT=1 \
-    HERDR_BOOTSTRAP_REPO_ROOT="$repo_root" \
-    HERDR_BOOTSTRAP_ENTRYPOINT_TEMP="$temp_dir" \
-    HERDR_BOOTSTRAP_TEST_PHASE="${HERDR_BOOTSTRAP_TEST_PHASE:-}" \
-    HERDR_BOOTSTRAP_TEST_READY_FILE="${HERDR_BOOTSTRAP_TEST_READY_FILE:-}" \
-    HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="${HERDR_BOOTSTRAP_TEST_CONTINUE_FILE:-}" \
-    /usr/bin/bash "$committed_script" "$@"
+  fi
 }
 bootstrap_reexec_committed_entrypoint "$@"
 if [[ "${HERDR_BOOTSTRAP_ENTRYPOINT_TEMP:-}" == /tmp/* ]]; then
@@ -406,8 +357,60 @@ for bootstrap_git_metadata_root in "$bootstrap_git_dir" "$bootstrap_common_git_d
   }
 done
 
+declare -a bootstrap_git_bound_paths=()
+declare -A bootstrap_git_bound_identities=()
+bootstrap_git_owner_uid="${HERDR_BOOTSTRAP_GIT_OWNER_UID:-$($bootstrap_id_bin -u)}"
+bootstrap_git_owner_gid="${HERDR_BOOTSTRAP_GIT_OWNER_GID:-$($bootstrap_id_bin -g)}"
+[[ "$bootstrap_git_owner_uid" =~ ^[0-9]+$ && "$bootstrap_git_owner_gid" =~ ^[0-9]+$ ]] || bootstrap_trust_fail 'bootstrap Git owner binding is not numeric'
+bootstrap_bind_git_path() {
+  local path="$1" owner group mode identity
+  [[ -e "$path" && ! -L "$path" ]] || return 1
+  owner="$($bootstrap_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+  mode="$($bootstrap_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+  group="$($bootstrap_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+  [[ "$owner" == "$bootstrap_git_owner_uid" && "$group" == "$bootstrap_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || return 1
+  identity="$($bootstrap_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+  [[ -n "$identity" ]] || return 1
+  if [[ -z "${bootstrap_git_bound_identities[$path]+x}" ]]; then
+    bootstrap_git_bound_paths+=("$path")
+  fi
+  bootstrap_git_bound_identities["$path"]="$identity"
+}
+bootstrap_bind_optional_git_path() {
+  [[ -e "$1" ]] || return 0
+  bootstrap_bind_git_path "$1"
+}
+for bootstrap_git_binding_path in "$bootstrap_repo_root" "$bootstrap_git_metadata" "$bootstrap_git_dir" \
+  "$bootstrap_common_git_dir" "$bootstrap_common_git_dir/objects" "$bootstrap_common_git_dir/refs" \
+  "$bootstrap_common_git_dir/config" "$bootstrap_git_dir/index"; do
+  bootstrap_bind_git_path "$bootstrap_git_binding_path" || bootstrap_trust_fail 'bootstrap Git topology owner or mode is unsafe'
+done
+for bootstrap_git_binding_path in "$bootstrap_git_dir/commondir" "$bootstrap_git_dir/gitdir" \
+  "$bootstrap_common_git_dir/worktrees" "$bootstrap_git_dir/HEAD" "$bootstrap_common_git_dir/HEAD" \
+  "$bootstrap_common_git_dir/packed-refs"; do
+  bootstrap_bind_optional_git_path "$bootstrap_git_binding_path" || bootstrap_trust_fail 'bootstrap Git pointer or ref identity is unsafe'
+done
+if [[ -n "${bootstrap_worktree_record:-}" ]]; then
+  bootstrap_bind_git_path "$bootstrap_worktree_record" || bootstrap_trust_fail 'bootstrap Git worktree record identity is unsafe'
+  bootstrap_bind_git_path "$bootstrap_worktree_record/gitdir" || bootstrap_trust_fail 'bootstrap Git worktree pointer identity is unsafe'
+fi
+bootstrap_trust_assert_git_lifetime() {
+  local path owner group mode identity
+  for path in "${bootstrap_git_bound_paths[@]}"; do
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    owner="$($bootstrap_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+    mode="$($bootstrap_stat_bin -c '%a' -- "$path" 2>/dev/null || true)"
+    identity="$($bootstrap_stat_bin -Lc '%d:%i:%u:%g:%a:%F' -- "$path" 2>/dev/null || true)"
+    group="$($bootstrap_stat_bin -c '%g' -- "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$bootstrap_git_owner_uid" && "$group" == "$bootstrap_git_owner_gid" && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 && \
+      "$identity" == "${bootstrap_git_bound_identities[$path]:-}" ]] || return 1
+  done
+}
+
 bootstrap_trust_git() {
-  "$bootstrap_env_bin" -i \
+  local bootstrap_git_status
+  bootstrap_trust_assert_git_lifetime || return 70
+  if "$bootstrap_env_bin" -i \
     HOME=/nonexistent \
     PATH="$bootstrap_trusted_path" \
     LC_ALL=C \
@@ -416,6 +419,7 @@ bootstrap_trust_git() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
     "$bootstrap_git_bin" --no-replace-objects \
     -C "$bootstrap_repo_root" --git-dir="$bootstrap_git_dir" --work-tree=. \
     -c core.attributesfile=/dev/null \
@@ -423,37 +427,63 @@ bootstrap_trust_git() {
     -c core.hooksPath=/dev/null \
     -c core.filemode=true \
     -c core.ignoreCase=false \
-    "$@"
+    "$@"; then
+    bootstrap_git_status=0
+  else
+    bootstrap_git_status=$?
+  fi
+  bootstrap_trust_assert_git_lifetime || return 70
+  return "$bootstrap_git_status"
 }
 
-bootstrap_dangerous_config="$(bootstrap_trust_git config --local --no-includes --name-only --get-regexp \
+bootstrap_trust_git_optional() {
+  local output status
+  output="$(bootstrap_trust_git "$@" 2>/dev/null)" || {
+    status=$?
+    ((status == 1)) || return "$status"
+  }
+  printf '%s\n' "$output"
+}
+
+bootstrap_dangerous_config="$(bootstrap_trust_git_optional config --local --no-includes --name-only --get-regexp \
   '^(include|filter\.|diff\..*\.textconv$|merge\..*\.driver$|credential\.|url\..*\.insteadOf$|core\.(attributesfile|excludesfile|fsmonitor|hooksPath|worktree|alternateRefsCommand|askPass|gitProxy|sshCommand)$|extensions\.|remote\..*\.(promisor|partialclonefilter|uploadpack|receivepack)$)' \
-  2>/dev/null || true)"
+  )"
 [[ -z "$bootstrap_dangerous_config" ]] || bootstrap_trust_fail 'repository-local Git configuration is unsafe'
-[[ "$(bootstrap_trust_git config --local --no-includes --bool --get core.sparseCheckout 2>/dev/null || true)" != true && \
-  "$(bootstrap_trust_git config --local --no-includes --bool --get index.sparse 2>/dev/null || true)" != true && \
+bootstrap_sparse_checkout="$(bootstrap_trust_git_optional config --local --no-includes --bool --get core.sparseCheckout)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading sparse-checkout configuration'
+bootstrap_sparse_index="$(bootstrap_trust_git_optional config --local --no-includes --bool --get index.sparse)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading sparse-index configuration'
+[[ "$bootstrap_sparse_checkout" != true && \
+  "$bootstrap_sparse_index" != true && \
   ! -e "$bootstrap_common_git_dir/info/sparse-checkout" && \
   ! -e "$bootstrap_git_dir/info/sparse-checkout" ]] || {
   bootstrap_trust_fail 'bootstrap repository sparse checkout metadata is unsafe'
 }
-[[ "$(bootstrap_trust_git config --local --no-includes --bool --get core.filemode 2>/dev/null || true)" != false && \
-  "$(bootstrap_trust_git config --local --no-includes --bool --get core.bare 2>/dev/null || true)" != true && \
-  "$(bootstrap_trust_git config --local --no-includes --int --get core.repositoryformatversion 2>/dev/null || true)" == 0 && \
-  "$(bootstrap_trust_git config --local --no-includes --bool --get core.ignorecase 2>/dev/null || true)" != true ]] || {
+bootstrap_filemode="$(bootstrap_trust_git_optional config --local --no-includes --bool --get core.filemode)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading filemode configuration'
+bootstrap_bare="$(bootstrap_trust_git_optional config --local --no-includes --bool --get core.bare)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading bare configuration'
+bootstrap_format_version="$(bootstrap_trust_git_optional config --local --no-includes --int --get core.repositoryformatversion)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading repository format configuration'
+bootstrap_ignorecase="$(bootstrap_trust_git_optional config --local --no-includes --bool --get core.ignorecase)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading case configuration'
+[[ "$bootstrap_filemode" != false && \
+  "$bootstrap_bare" != true && \
+  "$bootstrap_format_version" == 0 && \
+  "$bootstrap_ignorecase" != true ]] || {
   bootstrap_trust_fail 'bootstrap repository format or mode configuration is unsafe'
 }
-[[ "$(bootstrap_trust_git rev-parse --show-toplevel 2>/dev/null || true)" == "$bootstrap_repo_root" && \
-  "$(bootstrap_trust_git rev-parse --absolute-git-dir 2>/dev/null || true)" == "$bootstrap_git_dir" && \
-  "$(bootstrap_trust_git rev-parse --is-inside-work-tree 2>/dev/null || true)" == true && \
-  "$(bootstrap_trust_git rev-parse --is-bare-repository 2>/dev/null || true)" == false && \
-  "$(bootstrap_trust_git rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
+bootstrap_git_top_level="$(bootstrap_trust_git rev-parse --show-toplevel 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading the worktree root'
+bootstrap_git_absolute_dir="$(bootstrap_trust_git rev-parse --absolute-git-dir 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading the Git directory'
+bootstrap_git_inside_worktree="$(bootstrap_trust_git rev-parse --is-inside-work-tree 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading worktree state'
+bootstrap_git_bare="$(bootstrap_trust_git rev-parse --is-bare-repository 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading bare state'
+bootstrap_git_shallow="$(bootstrap_trust_git rev-parse --is-shallow-repository 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading shallow state'
+[[ "$bootstrap_git_top_level" == "$bootstrap_repo_root" && \
+  "$bootstrap_git_absolute_dir" == "$bootstrap_git_dir" && \
+  "$bootstrap_git_inside_worktree" == true && \
+  "$bootstrap_git_bare" == false && \
+  "$bootstrap_git_shallow" == false ]] || {
   bootstrap_trust_fail 'bootstrap repository topology is not a local full worktree'
 }
 
-bootstrap_commit="$(bootstrap_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+bootstrap_commit="$(bootstrap_trust_git rev-parse --verify HEAD^{commit} 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading HEAD'
 [[ "$bootstrap_commit" =~ ^[0-9a-f]{40}$ ]] || bootstrap_trust_fail 'bootstrap HEAD is not a full committed object'
 bootstrap_trust_git cat-file -e "$bootstrap_commit^{commit}" || bootstrap_trust_fail 'bootstrap HEAD object is unavailable'
-bootstrap_helper_tree="$(bootstrap_trust_git ls-tree "$bootstrap_commit" -- scripts/ubuntu/source-attestation.sh 2>/dev/null || true)"
+bootstrap_helper_tree="$(bootstrap_trust_git ls-tree "$bootstrap_commit" -- scripts/ubuntu/source-attestation.sh 2>/dev/null)" || bootstrap_trust_fail 'bootstrap Git lifetime failed while reading the committed helper tree'
 [[ "$bootstrap_helper_tree" != *$'\n'* ]] || bootstrap_trust_fail 'bootstrap helper tree lookup was ambiguous'
 IFS=$'\t' read -r bootstrap_helper_meta bootstrap_helper_path <<< "$bootstrap_helper_tree"
 read -r bootstrap_helper_mode bootstrap_helper_type bootstrap_helper_oid <<< "$bootstrap_helper_meta"
@@ -475,10 +505,7 @@ bootstrap_trust_git cat-file blob "$bootstrap_helper_oid" > "$bootstrap_private_
 bootstrap_helper_mode_value=0644
 [[ "$bootstrap_helper_mode" == 100755 ]] && bootstrap_helper_mode_value=0755
 "$bootstrap_chmod_bin" "$bootstrap_helper_mode_value" -- "$bootstrap_private_helper"
-bootstrap_materialized_oid="$($bootstrap_env_bin -i HOME=/nonexistent PATH="$bootstrap_trusted_path" \
-  LC_ALL=C TZ=UTC GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
-  "$bootstrap_git_bin" --no-replace-objects --git-dir="$bootstrap_git_dir" \
-  hash-object --no-filters --stdin < "$bootstrap_private_helper")"
+bootstrap_materialized_oid="$(bootstrap_trust_git hash-object --no-filters --stdin < "$bootstrap_private_helper")"
 [[ "$bootstrap_materialized_oid" == "$bootstrap_helper_oid" ]] || {
   bootstrap_trust_fail 'materialized helper bytes do not match the committed blob'
 }
@@ -566,6 +593,7 @@ trusted_git_command() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_CONFIG_COUNT=0 \
+    GIT_OPTIONAL_LOCKS=0 \
     /usr/bin/git --no-replace-objects \
     -c core.attributesfile=/dev/null \
     -c core.excludesfile=/dev/null \
@@ -599,18 +627,10 @@ install_rtk_snapshot() {
   local cargo_mode cargo_stage_dir cargo_stage cargo_stage_mode cargo_stage_hash
   local rustc_path rustc_real rustc_mode rustc_hash_before rustc_hash_after rustc_identity_before rustc_identity_after
   local cargo_target_dir cargo_status cargo_fd cargo_stage_fd rustc_fd cargo_owner_pid
-  local cargo_fd_id rustc_fd_id cargo_live_id rustc_live_id
+  local cargo_fd_id cargo_stage_fd_id cargo_stage_fd_hash cargo_stage_live_id cargo_stage_live_hash rustc_fd_id cargo_live_id rustc_live_id
   local cargo_exec_path rustc_exec_path
   cargo_real="$(attestation_canonical_cargo "$HOME")" || {
     echo 'Canonical Cargo executable is unavailable under the managed Cargo root.' >&2
-    return 1
-  }
-  cargo_identity_before="$(/usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
-  cargo_mode="$(/usr/bin/stat -c '%a' -- "$cargo_real" 2>/dev/null || true)"
-  cargo_hash_before="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_real" | /usr/bin/gawk '{print $1}')"
-  [[ "$cargo_identity_before" =~ ^[0-9]+:[0-9]+$ && "$cargo_mode" =~ ^[0-7]+$ && \
-    $((8#$cargo_mode & 022)) == 0 && "$cargo_hash_before" =~ ^[0-9a-f]{64}$ ]] || {
-    echo 'Canonical Cargo executable identity or mode is invalid.' >&2
     return 1
   }
   cargo_fd=200
@@ -618,8 +638,13 @@ install_rtk_snapshot() {
   exec 200<"$cargo_real" || { echo 'Could not open Cargo as a stable descriptor.' >&2; return 1; }
   cargo_owner_pid="$BASHPID"
   cargo_fd_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "/proc/$cargo_owner_pid/fd/$cargo_fd" 2>/dev/null || true)"
+  cargo_mode="$(bootstrap_exec_system /usr/bin/stat -c '%a' -- "/proc/$cargo_owner_pid/fd/$cargo_fd" 2>/dev/null || true)"
+  cargo_hash_before="$(bootstrap_exec_system /usr/bin/sha256sum -- "/proc/$cargo_owner_pid/fd/$cargo_fd" | /usr/bin/gawk '{print $1}')"
+  cargo_identity_before="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
   cargo_live_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
-  [[ "$cargo_fd_id" == "$cargo_identity_before" && "$cargo_live_id" == "$cargo_identity_before" ]] || {
+  [[ "$cargo_fd_id" =~ ^[0-9]+:[0-9]+$ && "$cargo_mode" =~ ^[0-7]+$ && \
+    $((8#$cargo_mode & 022)) == 0 && "$cargo_hash_before" =~ ^[0-9a-f]{64}$ && \
+    "$cargo_live_id" == "$cargo_fd_id" ]] || {
     close_fence_fd "$cargo_fd"
     echo 'Cargo descriptor identity changed before staging.' >&2
     return 1
@@ -641,6 +666,14 @@ install_rtk_snapshot() {
   eval "exec ${cargo_stage_fd}<&-" 2>/dev/null || true
   exec 201<"$cargo_stage" || { close_fence_fd "$cargo_fd"; return 1; }
   cargo_exec_path="/proc/$cargo_owner_pid/fd/$cargo_stage_fd"
+  cargo_stage_fd_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_exec_path" 2>/dev/null || true)"
+  cargo_stage_fd_hash="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_exec_path" | /usr/bin/gawk '{print $1}')"
+  [[ "$cargo_stage_fd_id" =~ ^[0-9]+:[0-9]+$ && "$cargo_stage_fd_hash" == "$cargo_stage_hash" ]] || {
+    close_fence_fd "$cargo_stage_fd"
+    close_fence_fd "$cargo_fd"
+    echo 'Cargo execution descriptor does not match the staged bytes.' >&2
+    return 1
+  }
   cargo_identity_after="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
   cargo_hash_after="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_real" | /usr/bin/gawk '{print $1}')"
   [[ "$cargo_identity_after" == "$cargo_identity_before" && "$cargo_hash_after" == "$cargo_hash_before" ]] || {
@@ -683,8 +716,17 @@ install_rtk_snapshot() {
   cargo_target_dir="$(/usr/bin/mktemp -d /tmp/herdr-cargo-target.XXXXXX)"
   bootstrap_register_cleanup "$cargo_target_dir"
   bootstrap_test_pause before-cargo-exec
-  # Cargo and rustc execute through descriptors opened before the pause.  The
-  # staged pathname is never used as an execution authority.
+  cargo_stage_live_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_stage" 2>/dev/null || true)"
+  cargo_stage_live_hash="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_stage" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
+  [[ "$cargo_stage_live_id" == "$cargo_stage_fd_id" && "$cargo_stage_live_hash" == "$cargo_stage_fd_hash" ]] || {
+    close_fence_fd "$rustc_fd"
+    close_fence_fd "$cargo_stage_fd"
+    close_fence_fd "$cargo_fd"
+    echo 'Cargo staging path changed after its stable descriptor was opened.' >&2
+    return 1
+  }
+  # Cargo and rustc execute through descriptors opened and hashed before the
+  # pause.  No pathname is used as an execution authority.
   if CARGO_TARGET_DIR="$cargo_target_dir" RUSTC="$rustc_exec_path" \
     bootstrap_exec_cargo "$cargo_exec_path" install --path "$rtk_snapshot_path" --locked --force; then
     cargo_status=0
@@ -1395,7 +1437,7 @@ install_locked_tailscale() (
   local installed_tailscale
   local tailscale_temp_dir
   local installer
-  local apt_get_shim
+  local root_stage_dir
   local trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
   local tailscale_bin sudo_bin shell_bin apt_get_bin
   local real_apt_get
@@ -1414,46 +1456,69 @@ install_locked_tailscale() (
   bootstrap_register_cleanup "$tailscale_temp_dir"
   trap '/usr/bin/rm -rf -- "$tailscale_temp_dir"' EXIT
   installer="$tailscale_temp_dir/install.sh"
-  apt_get_shim="$tailscale_temp_dir/apt-get"
   real_apt_get="$(/usr/bin/realpath -e -- "$apt_get_bin" 2>/dev/null || true)"
   bootstrap_validate_tailscale_apt_identity "$real_apt_get"
 
   download_verified "$TAILSCALE_INSTALLER_URL" "$TAILSCALE_INSTALLER_SHA256" "$installer"
-  cat > "$apt_get_shim" <<'EOF'
+  root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-tailscale-root.XXXXXX)"
+  if bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
+    "$installer" "$root_stage_dir" "$TAILSCALE_INSTALLER_SHA256" "$TAILSCALE_VERSION" "$real_apt_get" <<'HERDR_TAILSCALE_ROOT'
+set -euo pipefail
+installer_path="$1"
+stage_dir="$2"
+expected_sha="$3"
+locked_version="$4"
+real_apt_get="$5"
+expected_owner="$(/usr/bin/id -u)"
+expected_group="$(/usr/bin/id -g)"
+[[ -d "$stage_dir" && ! -L "$stage_dir" ]] || exit 24
+[[ "$(/usr/bin/stat -c '%u' -- "$stage_dir")" == "$expected_owner" && \
+  "$(/usr/bin/stat -c '%g' -- "$stage_dir")" == "$expected_group" && \
+  "$(/usr/bin/stat -c '%a' -- "$stage_dir")" =~ ^[0-7]+$ && \
+  $((8#$(/usr/bin/stat -c '%a' -- "$stage_dir") & 022)) == 0 ]] || exit 24
+[[ -f "$installer_path" && ! -L "$installer_path" ]] || exit 24
+exec {installer_fd}<"$installer_path"
+installer_fd_path="/proc/$BASHPID/fd/$installer_fd"
+installer_id="$(/usr/bin/stat -Lc '%d:%i' -- "$installer_fd_path")"
+installer_path_id="$(/usr/bin/stat -Lc '%d:%i' -- "$installer_path")"
+installer_hash="$(/usr/bin/sha256sum -- "$installer_fd_path" | /usr/bin/gawk '{print $1}')"
+[[ "$installer_id" == "$installer_path_id" && "$installer_hash" == "$expected_sha" ]] || exit 24
+trap '/usr/bin/rm -rf -- "$stage_dir"' EXIT
+/usr/bin/cp -- "$installer_fd_path" "$stage_dir/install.sh"
+/usr/bin/chmod 0755 -- "$stage_dir/install.sh"
+cat >"$stage_dir/apt-get" <<'HERDR_TAILSCALE_SHIM'
 #!/usr/bin/bash
 set -euo pipefail
-
 real_apt_get="${HERDR_TAILSCALE_REAL_APT_GET:?}"
 locked_version="${TAILSCALE_VERSION:?}"
 args=("$@")
 has_tailscale_package=0
 for arg in "${args[@]}"; do
-  case "$arg" in
-    tailscale|tailscale=*) has_tailscale_package=1 ;;
-  esac
+  case "$arg" in tailscale|tailscale=*) has_tailscale_package=1 ;; esac
 done
-
 if (( has_tailscale_package == 1 )); then
-  if [[ "${#args[@]}" -eq 4 &&
-        "${args[0]}" == 'install' &&
-        "${args[1]}" == '-y' &&
-        "${args[2]}" == "tailscale=$locked_version" &&
-        "${args[3]}" == 'tailscale-archive-keyring' ]]; then
+  if [[ "${#args[@]}" -eq 4 && "${args[0]}" == install && "${args[1]}" == -y && \
+        "${args[2]}" == "tailscale=$locked_version" && "${args[3]}" == tailscale-archive-keyring ]]; then
     exec "$real_apt_get" install --allow-downgrades -y "${args[2]}" "${args[3]}"
   fi
   echo 'Unexpected or unlocked Tailscale apt-get invocation.' >&2
   exit 24
 fi
-
 exec "$real_apt_get" "${args[@]}"
-EOF
-  /usr/bin/chmod 0755 -- "$apt_get_shim"
-
-  if bootstrap_exec_system "$sudo_bin" /usr/bin/env \
-    PATH="$tailscale_temp_dir:$trusted_path" \
-    HERDR_TAILSCALE_REAL_APT_GET="$real_apt_get" \
-    TAILSCALE_VERSION="$TAILSCALE_VERSION" \
-    "$shell_bin" "$installer"; then
+HERDR_TAILSCALE_SHIM
+/usr/bin/chmod 0755 -- "$stage_dir/apt-get"
+for object in "$stage_dir/install.sh" "$stage_dir/apt-get"; do
+  [[ -f "$object" && ! -L "$object" && "$(/usr/bin/stat -c '%u' -- "$object")" == "$expected_owner" && \
+    "$(/usr/bin/stat -c '%g' -- "$object")" == "$expected_group" && \
+    $((8#$(/usr/bin/stat -c '%a' -- "$object") & 022)) == 0 ]] || exit 24
+done
+[[ "$(/usr/bin/sha256sum -- "$stage_dir/install.sh" | /usr/bin/gawk '{print $1}')" == "$installer_hash" ]] || exit 24
+[[ "$(/usr/bin/stat -Lc '%d:%i' -- "$installer_path")" == "$installer_id" && \
+  "$(/usr/bin/sha256sum -- "$installer_path" | /usr/bin/gawk '{print $1}')" == "$expected_sha" ]] || exit 24
+/usr/bin/env -i PATH="$stage_dir:/usr/sbin:/usr/bin:/sbin:/bin" HERDR_TAILSCALE_REAL_APT_GET="$real_apt_get" TAILSCALE_VERSION="$locked_version" \
+  /usr/bin/dash "$installer_fd_path"
+HERDR_TAILSCALE_ROOT
+  then
     installer_status=0
   else
     installer_status=$?
@@ -1467,6 +1532,55 @@ EOF
     exit 24
   }
 )
+
+bootstrap_install_locked_deb() {
+  local package_path="$1"
+  local expected_sha="$2"
+  local sudo_bin="$3"
+  local apt_get_bin="$4"
+  local root_stage_dir
+  root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-deb-root.XXXXXX)"
+  bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
+    "$package_path" "$root_stage_dir" "$expected_sha" "$apt_get_bin" \
+    "${CASE_ROOT:-}" "${APT_SEAM_LOG:-}" <<'HERDR_DEB_ROOT'
+set -euo pipefail
+package_path="$1"
+stage_dir="$2"
+expected_sha="$3"
+apt_get_bin="$4"
+case_root="$5"
+apt_seam_log="$6"
+expected_owner="$(/usr/bin/id -u)"
+expected_group="$(/usr/bin/id -g)"
+[[ -d "$stage_dir" && ! -L "$stage_dir" &&
+  "$(/usr/bin/stat -c '%u' -- "$stage_dir")" == "$expected_owner" &&
+  "$(/usr/bin/stat -c '%g' -- "$stage_dir")" == "$expected_group" &&
+  $((8#$(/usr/bin/stat -c '%a' -- "$stage_dir") & 022)) == 0 ]] || exit 24
+[[ -f "$package_path" && ! -L "$package_path" ]] || exit 24
+exec {package_fd}<"$package_path"
+package_fd_path="/proc/$BASHPID/fd/$package_fd"
+package_id="$(/usr/bin/stat -Lc '%d:%i' -- "$package_fd_path")"
+package_path_id="$(/usr/bin/stat -Lc '%d:%i' -- "$package_path")"
+package_hash="$(/usr/bin/sha256sum -- "$package_fd_path" | /usr/bin/gawk '{print $1}')"
+[[ "$package_id" == "$package_path_id" && "$package_hash" == "$expected_sha" ]] || exit 24
+trap '/usr/bin/rm -rf -- "$stage_dir"' EXIT
+/usr/bin/cp -- "$package_fd_path" "$stage_dir/package.deb"
+/usr/bin/chmod 0644 -- "$stage_dir/package.deb"
+[[ -f "$stage_dir/package.deb" && ! -L "$stage_dir/package.deb" &&
+  "$(/usr/bin/stat -c '%u' -- "$stage_dir/package.deb")" == "$expected_owner" &&
+  "$(/usr/bin/stat -c '%g' -- "$stage_dir/package.deb")" == "$expected_group" &&
+  "$(/usr/bin/sha256sum -- "$stage_dir/package.deb" | /usr/bin/gawk '{print $1}')" == "$package_hash" ]] || exit 24
+[[ "$(/usr/bin/stat -Lc '%d:%i' -- "$package_path")" == "$package_id" &&
+  "$(/usr/bin/sha256sum -- "$package_path" | /usr/bin/gawk '{print $1}')" == "$expected_sha" ]] || exit 24
+if [[ -n "$case_root" ]]; then
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin CASE_ROOT="$case_root" APT_SEAM_LOG="$apt_seam_log" \
+    "$apt_get_bin" install -y "$stage_dir/package.deb"
+else
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
+    "$apt_get_bin" install -y "$stage_dir/package.deb"
+fi
+HERDR_DEB_ROOT
+}
 
 install_python_toolchain() {
   local state_fd
@@ -1755,7 +1869,7 @@ install_base() {
     package="$(/usr/bin/mktemp --suffix=.deb)"
     bootstrap_register_cleanup "$package"
     download_verified "$POWERSHELL_URL" "$POWERSHELL_SHA256" "$package"
-    "$sudo_bin" DEBIAN_FRONTEND=noninteractive "$apt_get_bin" install -y "$package"
+    bootstrap_install_locked_deb "$package" "$POWERSHELL_SHA256" "$sudo_bin" "$apt_get_bin"
     /usr/bin/rm -f -- "$package"
   fi
   [[ "$("$pwsh_bin" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')" == "$POWERSHELL_VERSION" ]] || {
@@ -1833,10 +1947,9 @@ install_tools() {
     "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
     /usr/bin/rm -rf -- "$rustup_temp_dir"
   fi
-  if [[ -f "$HOME/.cargo/env" ]]; then
-    # shellcheck disable=SC1091
-    source "$HOME/.cargo/env"
-  fi
+  # Never source executable shell code from the user's Cargo installation.
+  # Rustup's canonical binaries are invoked by absolute path below, and the
+  # managed Cargo roots are validated independently of user startup files.
   validate_cargo_roots || exit 24
   [[ -x "$rustup_path" ]] && attestation_canonical_cargo "$HOME" >/dev/null || {
     echo 'The locked rustup is present but the canonical ~/.cargo toolchain identities are not both available.' >&2

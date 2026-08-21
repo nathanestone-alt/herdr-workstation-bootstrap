@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -10,6 +11,7 @@ trap 'rm -rf "$test_root"' EXIT
 # invoked from a mutable developer worktree as well as from CI.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
@@ -66,8 +68,9 @@ set -e
   exit 1
 }
 
-if ! env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" BASH_ENV="$bash_env_file" \
-  "$source_fixture/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
+if ! env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" BASH_ENV= ENV= \
+  HERDR_BOOTSTRAP_TRUSTED_LAUNCHER=1 \
+  /usr/bin/bash "$source_fixture/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
   > "$test_root/hostile-bootstrap-output" 2>&1; then
   cat "$test_root/hostile-bootstrap-output" >&2
   exit 1

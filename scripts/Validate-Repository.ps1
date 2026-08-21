@@ -54,6 +54,7 @@ if ($bashCandidates) {
         'tests\test-python-toolchain.sh',
         'tests\test-receipt-authority.sh',
         'tests\test-tailscale-downgrade.sh',
+        'tests\test-trusted-launcher.sh',
         'tests\test-install-payload.sh'
     )) {
         if (-not $IsLinux) {
@@ -157,6 +158,10 @@ $requiredFiles = @(
     'scripts\ubuntu\configure-excel-share.sh',
     'scripts\ubuntu\receipt-authority.sh',
     'scripts\ubuntu\source-attestation.sh',
+    'scripts\ubuntu\trusted-launcher.sh',
+    'scripts\ubuntu\install-trusted-launcher.sh',
+    'config\bootstrap-policy.example',
+    'docs\bootstrap-trust-anchor.md',
     'tests\test-bootstrap-profile.sh',
     'tests\test-bootstrap-fencing.sh',
     'tests\test-configure-excel-share-inputs.sh',
@@ -176,6 +181,7 @@ $requiredFiles = @(
     'tests\test-python-toolchain.sh',
     'tests\test-receipt-authority.sh',
     'tests\test-tailscale-downgrade.sh',
+    'tests\test-trusted-launcher.sh',
     'tests\test-install-payload.sh',
     'legacy\WSL2-FALLBACK.md'
 )
@@ -296,12 +302,14 @@ $contentAssertions = @(
     @{ Path = 'HERDR_WORKSTATION_DEPENDENCY_SETUP_PLAN.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'HERDR_WINDOWS_REVIEW_CONFIG', 'SSH to `herdr-win`'); Forbidden = @('do not create `C:\HerdrExchange` before the guarded share step', 'C:\HerdrReviewJobs') },
     @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
     @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('#!/usr/bin/env -S -i BASH_ENV=', 'config/ubuntu-toolchain.lock', 'UV_VERSION', 'attestation_create_git_snapshot', 'bootstrap_private_helper', 'bootstrap_trust_fail', 'trusted_git_command', 'attestation_canonical_cargo', 'before-cargo-exec', 'install_receipt_from_snapshots', 'install_python_toolchain', 'write_py_compat', 'download_verified', 'bootstrap_exec_system', 'bootstrap_exec_python', 'bootstrap_exec_node', 'bootstrap_exec_cargo', 'HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT', '/usr/bin/curl', '/usr/bin/sha256sum', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', '$HOME/.cargo/bin/$executable', 'cargo_install_root', '--prefix "$node_anchor"', '$node_anchor/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt', 'py_3.13_probe'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable', 'HERDR_BOOTSTRAP_TEST_MODE', 'HERDR_BOOTSTRAP_TEST_SUDO', 'HERDR_BOOTSTRAP_TEST_APT_GET', 'HERDR_BOOTSTRAP_TEST_SYSTEMCTL', 'HERDR_BOOTSTRAP_TEST_TAILSCALE') },
-    @{ Path = 'scripts\ubuntu\receipt-authority.sh'; Required = @('#!/usr/bin/env -S -i BASH_ENV=', 'receipt_materialize_helper_from_git', 'receipt_materialize_helper_from_payload', 'receipt_private_helper', 'receipt_trust_fail', 'receipt_canonical_git_storage_path', 'receipt_stage_executable', 'receipt_assert_source_identity', 'receipt_cleanup', '--payload-manifest-sha256', '--source-commit'); Forbidden = @('HERDR_BOOTSTRAP_TEST_MODE', 'HERDR_BOOTSTRAP_TEST_SUDO', 'HERDR_BOOTSTRAP_TEST_APT_GET') },
-    @{ Path = 'scripts\ubuntu\source-attestation.sh'; Required = @('#!/usr/bin/bash', 'attestation_register_temporary_path', 'attestation_cleanup_temporary_paths', 'attestation_snapshot_abort', 'attestation_validate_git_layout', 'attestation_verify_payload_manifest', 'attestation_canonical_cargo'); Forbidden = @() },
+    @{ Path = 'scripts\ubuntu\receipt-authority.sh'; Required = @('#!/usr/bin/env -S -i BASH_ENV=', 'receipt_materialize_helper_from_git', 'receipt_materialize_helper_from_payload', 'receipt_private_helper', 'receipt_trust_fail', 'receipt_canonical_git_storage_path', 'receipt_stage_executable', 'receipt_assert_source_identity', 'receipt_cleanup', 'receipt_exec_python_unprivileged', 'PYTHONSAFEPATH=1', 'receipt_bind_git_layout', 'receipt_assert_git_lifetime', '--payload-manifest-sha256', '--source-commit'); Forbidden = @('HERDR_BOOTSTRAP_TEST_MODE', 'HERDR_BOOTSTRAP_TEST_SUDO', 'HERDR_BOOTSTRAP_TEST_APT_GET') },
+    @{ Path = 'scripts\ubuntu\source-attestation.sh'; Required = @('#!/usr/bin/bash', 'attestation_register_temporary_path', 'attestation_cleanup_temporary_paths', 'attestation_snapshot_abort', 'attestation_validate_git_layout', 'attestation_bind_git_layout', 'attestation_assert_git_lifetime', 'attestation_verify_payload_manifest', 'attestation_canonical_cargo'); Forbidden = @() },
+    @{ Path = 'scripts\ubuntu\trusted-launcher.sh'; Required = @('herdr-bootstrap-policy-v1', 'canonical_origin', 'policy_lifetime', 'GIT_OPTIONAL_LOCKS=0', 'protocol.file.allow=always', 'hash-object', 'HERDR_BOOTSTRAP_VERIFIED_ENTRYPOINT', '/usr/bin/setpriv'); Forbidden = @('git -C "$PWD"', 'source "$HOME') },
+    @{ Path = 'scripts\ubuntu\install-trusted-launcher.sh'; Required = @('one-time', '--run-as-user', 'installer_validate_git_layout', 'atomic', 'bootstrap-policy.conf', 'herdr-bootstrap-policy-v1', 'mv_bin -T'); Forbidden = @('curl -fsSL', 'sudo sh') },
     @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry', 'Mount point must be an absolute path', 'protected system path', 'direct /srv/herdr-* child', 'Refusing to change it', '$mount_point_exists', 'Windows host contains unsupported characters', 'SMB share name contains unsupported characters'); Forbidden = @() },
     @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'ForwardAgent no', 'ForwardX11 no', 'ForwardX11Trusted no', 'ControlMaster no', 'ControlPath none', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
     @{ Path = 'scripts\ubuntu\verify-vps-access.sh'; Required = @('OpenSSH could not resolve alias', 'VPS access was not attempted', '$1=""', 'effective IdentityFile'); Forbidden = @('ssh -G "$alias_name" 2>/dev/null') },
-    @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'validate_toolchain_lock', 'verify_main', 'verify_resolve_command', 'verify_system_command_path', 'verify_bootstrap_materialized_oid', 'export PATH="$verify_trusted_path"', 'python3.13', '--list', 'toolchain-manifest.txt', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE', 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin') },
+    @{ Path = 'scripts\ubuntu\verify.sh'; Required = @('PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc', 'validate_toolchain_lock', 'verify_main', 'verify_resolve_command', 'verify_system_command_path', 'verify_bootstrap_materialized_oid', 'verify_validate_git_layout', 'verify_assert_git_lifetime', 'HERDR_VERIFY_TRUSTED_LAUNCHER', 'export PATH="$verify_trusted_path"', 'python3.13', '--list', 'toolchain-manifest.txt', 'PASS login command'); Forbidden = @('HERDR_VERIFY_TEST_MODE', 'HERDR_TEST_LOGIN_PROFILE', 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin') },
     @{ Path = 'scripts\ubuntu\install-payload.sh'; Required = @('config/payload-manifest.sha256', 'ensure_source_clean', 'validate_payload_manifest', 'verify_installed_payload', 'payload-runtime-receipt.txt', 'previous destinations were restored', 'regression_test_count'); Forbidden = @('cp -a "$payload"') }
 )
 foreach ($assertion in $contentAssertions) {

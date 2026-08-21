@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
@@ -11,6 +12,7 @@ trap 'rm -rf "$test_root"' EXIT
 # unrelated edits.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q

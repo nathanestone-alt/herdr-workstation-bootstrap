@@ -80,8 +80,13 @@ mkdir -p ~/code
 cd ~/code
 git clone https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git
 cd herdr-workstation-bootstrap
-./scripts/ubuntu/bootstrap.sh --phase base
-./scripts/ubuntu/bootstrap.sh --phase tools
+sudo ./scripts/ubuntu/install-trusted-launcher.sh \
+  --source-root "$PWD" \
+  --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
+  --commit "$(git rev-parse --verify HEAD^{commit})" \
+  --run-as-user "$USER"
+sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --phase base
+sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --phase tools
 ~~~
 
 This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
