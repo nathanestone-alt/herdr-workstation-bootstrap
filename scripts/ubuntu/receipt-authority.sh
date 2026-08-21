@@ -192,7 +192,7 @@ probe_role_version() {
   local path="${role_path[$role]}"
   local output first
   output="$(PATH="$trusted_path" "$path" --version 2>&1)" || fail "$role --version failed"
-  [[ -n "$output" && "$output" != *$'\0'* ]] || fail "$role --version output is empty or invalid"
+  [[ -n "$output" ]] || fail "$role --version output is empty"
   first="${output%%$'\n'*}"
   case "$role" in
     bash) [[ "$first" == GNU\ bash,* ]] || fail "unexpected bash version output: $first" ;;
