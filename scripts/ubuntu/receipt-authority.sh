@@ -78,7 +78,7 @@ user_home="$(realpath -e -- "$user_home" 2>/dev/null || true)"
 if [[ -z "$fixture_root" ]]; then
   # shellcheck disable=SC1091
   source /etc/os-release
-  [[ "\${ID:-}" == 'ubuntu' ]] || fail 'receipt authority requires an Ubuntu host'
+  [[ "${ID:-}" == 'ubuntu' ]] || fail 'receipt authority requires an Ubuntu host'
 fi
 
 reject_symlink_components() {
