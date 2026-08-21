@@ -20,8 +20,8 @@ make_tool() {
   local output="$2"
   cat > "$path" <<EOF
 #!/usr/bin/env bash
-if [[ "${1:-}" == '--version' ]]; then
-  printf '%s\\n' '$output'
+if [[ "\${1:-}" == '--version' ]]; then
+  printf '%s\n' '$output'
 else
   exit 2
 fi
