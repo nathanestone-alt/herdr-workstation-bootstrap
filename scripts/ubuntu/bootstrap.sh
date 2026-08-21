@@ -11,7 +11,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+live_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+live_source_attestation="$live_repo_root/scripts/ubuntu/source-attestation.sh"
+[[ -f "$live_source_attestation" && ! -L "$live_source_attestation" ]] || {
+  echo "Missing source-attestation helper: $live_source_attestation" >&2
+  exit 24
+}
+# The helper is used once to construct a snapshot of the exact committed
+# source.  It compares the entire live checkout by bytes, modes, and path set
+# before any lock value or authority input is sourced.
+# shellcheck disable=SC1090
+source "$live_source_attestation"
+attestation_create_git_snapshot "$live_repo_root" '' '' || {
+  echo 'Bootstrap source checkout failed exact committed-blob attestation.' >&2
+  exit 24
+}
+bootstrap_source_snapshot="$attestation_snapshot_dir"
+# Re-source the helper from the already-attested snapshot.  All subsequent
+# source-derived inputs, including the lock, come from this snapshot.
+# shellcheck disable=SC1090
+source "$bootstrap_source_snapshot/scripts/ubuntu/source-attestation.sh"
+attestation_snapshot_dir="$bootstrap_source_snapshot"
+attestation_snapshot_manifest="$bootstrap_source_snapshot/.source-attestation"
+repo_root="$bootstrap_source_snapshot"
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
 state_dir="${HOME}/.local/state/herdr-workstation-bootstrap"
 bin_dir="${HOME}/.local/bin"
@@ -58,190 +80,34 @@ validate_cargo_roots() {
   export CARGO_INSTALL_ROOT="$expected_root"
 }
 
+trusted_git_command() {
+  /usr/bin/env -i \
+    HOME="$HOME" \
+    PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+    LC_ALL=C \
+    TZ=UTC \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_COUNT=0 \
+    /usr/bin/git --no-replace-objects \
+    -c core.attributesfile=/dev/null \
+    -c core.excludesfile=/dev/null \
+    -c core.hooksPath=/dev/null \
+    -c core.filemode=true \
+    "$@"
+}
+
 validate_rtk_source_checkout() {
-  (
-    local source_path="${1:-}"
-    local expected_url="${2:-}"
-    local expected_ref="${3:-}"
-    local actual_url
-    local actual_ref
-    local canonical_source_path
-    local git_toplevel
-    local git_dir
-    local sparse_checkout
-    local sparse_index
-    local partial_clone
-    local nested_git
-    local git_metadata_entry
-    local unsupported_entry
-    local temporary_index=''
-    local untracked_file=''
-    local empty_directories_file=''
-    local tree_file=''
-
-    cleanup_rtk_attestation() {
-      [[ -z "$temporary_index" ]] || rm -f -- "$temporary_index" || true
-      [[ -z "$untracked_file" ]] || rm -f -- "$untracked_file" || true
-      [[ -z "$empty_directories_file" ]] || rm -f -- "$empty_directories_file" || true
-      [[ -z "$tree_file" ]] || rm -f -- "$tree_file" || true
-    }
-    trap cleanup_rtk_attestation EXIT
-
-    [[ -n "$source_path" ]] || {
-      echo 'RTK source checkout path is empty.' >&2
-      exit 1
-    }
-    [[ -d "$source_path/.git" && ! -L "$source_path" && ! -L "$source_path/.git" ]] || {
-      echo "RTK source checkout is missing or unsafe: $source_path" >&2
-      exit 1
-    }
-
-    git_at_rtk() {
-      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
-        -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-        git -C "$source_path" "$@"
-    }
-    git_at_rtk_index() {
-      local index_path="$1"
-      shift
-      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
-        -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="$index_path" \
-        git -C "$source_path" "$@"
-    }
-
-    canonical_source_path="$(realpath -e -- "$source_path" 2>/dev/null || true)"
-    [[ -n "$canonical_source_path" && -d "$canonical_source_path" ]] || {
-      echo "RTK source checkout cannot be canonically resolved: $source_path" >&2
-      exit 1
-    }
-    git_toplevel="$(git_at_rtk rev-parse --show-toplevel 2>/dev/null || true)"
-    git_toplevel="$(realpath -e -- "$git_toplevel" 2>/dev/null || true)"
-    [[ "$git_toplevel" == "$canonical_source_path" ]] || {
-      echo "RTK source checkout Git root is not canonical: $source_path" >&2
-      exit 1
-    }
-    git_dir="$(git_at_rtk rev-parse --absolute-git-dir 2>/dev/null || true)"
-    git_dir="$(realpath -e -- "$git_dir" 2>/dev/null || true)"
-    [[ "$git_dir" == "$canonical_source_path/.git" ]] || {
-      echo "RTK source checkout Git metadata is not local to the checkout: $source_path" >&2
-      exit 1
-    }
-    git_metadata_entry="$(find -P "$git_dir" -mindepth 1 -type l -print -quit 2>/dev/null || true)"
-    [[ -z "$git_metadata_entry" ]] || {
-      echo "RTK source checkout Git metadata contains a symlink: $git_metadata_entry" >&2
-      exit 1
-    }
-    [[ ! -e "$git_dir/objects/info/alternates" ]] || {
-      echo "RTK source checkout uses an external Git object store: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]] || {
-      echo "RTK source checkout is not a worktree: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-bare-repository 2>/dev/null || true)" == false ]] || {
-      echo "RTK source checkout is bare: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
-      echo "RTK source checkout is shallow or incomplete: $source_path" >&2
-      exit 1
-    }
-    sparse_checkout="$(git_at_rtk config --bool --get core.sparseCheckout 2>/dev/null || true)"
-    [[ "$sparse_checkout" != true ]] || {
-      echo "RTK source checkout uses sparse checkout: $source_path" >&2
-      exit 1
-    }
-    sparse_index="$(git_at_rtk config --bool --get index.sparse 2>/dev/null || true)"
-    [[ "$sparse_index" != true ]] || {
-      echo "RTK source checkout uses a sparse index: $source_path" >&2
-      exit 1
-    }
-    partial_clone="$(git_at_rtk config --get extensions.partialClone 2>/dev/null || true)"
-    [[ -z "$partial_clone" ]] || {
-      echo "RTK source checkout is a partial clone: $source_path" >&2
-      exit 1
-    }
-    partial_clone="$(git_at_rtk config --get-regexp '^remote\..*\.(promisor|partialclonefilter)$' 2>/dev/null || true)"
-    [[ -z "$partial_clone" ]] || {
-      echo "RTK source checkout has partial-clone metadata: $source_path" >&2
-      exit 1
-    }
-    nested_git="$(find -P "$canonical_source_path" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
-    [[ -z "$nested_git" ]] || {
-      echo "RTK source checkout contains an unexpected nested Git repository: $nested_git" >&2
-      exit 1
-    }
-    if ! unsupported_entry="$(find -P "$canonical_source_path" -mindepth 1 \
-      \( -path "$canonical_source_path/.git" -o -path "$canonical_source_path/.git/*" \) -prune -o \
-      \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit 2>/dev/null)"; then
-      echo "RTK source checkout filesystem walk failed: $source_path" >&2
-      exit 1
-    fi
-    [[ -z "$unsupported_entry" ]] || {
-      echo "RTK source checkout contains an unsupported filesystem entry: $unsupported_entry" >&2
-      exit 1
-    }
-
-    actual_url="$(git_at_rtk remote get-url --all origin 2>/dev/null || true)"
-    if [[ -n "$expected_url" && "$actual_url" != "$expected_url" ]]; then
-      echo "RTK source checkout origin differs from the lock: $actual_url" >&2
-      exit 1
-    fi
-    actual_ref="$(git_at_rtk rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-    [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
-      echo "RTK source checkout HEAD is not a full commit: $source_path" >&2
-      exit 1
-    }
-    if [[ -n "$expected_ref" && "$actual_ref" != "$expected_ref" ]]; then
-      echo "RTK source checkout does not match the locked commit: $actual_ref" >&2
-      exit 1
-    fi
-
-    tree_file="$(mktemp)"
-    if ! git_at_rtk ls-tree --full-tree -r "$actual_ref" > "$tree_file"; then
-      echo "RTK source checkout tree cannot be completely read: $source_path" >&2
-      exit 1
-    fi
-    if awk '$1 == "160000" { found=1 } END { exit(found ? 0 : 1) }' "$tree_file"; then
-      echo "RTK source checkout contains an unexpected submodule: $source_path" >&2
-      exit 1
-    fi
-
-    if ! git_at_rtk diff --cached --quiet --no-ext-diff --no-textconv "$actual_ref" --; then
-      echo "RTK source checkout has staged or unmerged changes: $source_path" >&2
-      exit 1
-    fi
-    temporary_index="$(mktemp)"
-    rm -f -- "$temporary_index"
-    if ! git_at_rtk_index "$temporary_index" read-tree "$actual_ref"; then
-      echo "RTK source checkout cannot create an independent index: $source_path" >&2
-      exit 1
-    fi
-    if ! git_at_rtk_index "$temporary_index" diff --quiet --no-ext-diff --no-textconv --ignore-submodules=none --; then
-      echo "RTK source checkout content differs from locked HEAD: $source_path" >&2
-      exit 1
-    fi
-
-    untracked_file="$(mktemp)"
-    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --no-empty-directory -z > "$untracked_file"; then
-      echo "RTK source checkout untracked-path attestation failed: $source_path" >&2
-      exit 1
-    fi
-    [[ ! -s "$untracked_file" ]] || {
-      echo "RTK source checkout has ordinary or ignored untracked paths: $source_path" >&2
-      exit 1
-    }
-    empty_directories_file="$(mktemp)"
-    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --directory --empty-directory -z > "$empty_directories_file"; then
-      echo "RTK source checkout untracked-directory attestation failed: $source_path" >&2
-      exit 1
-    fi
-    [[ ! -s "$empty_directories_file" ]] || {
-      echo "RTK source checkout has untracked directories: $source_path" >&2
-      exit 1
-    }
-  )
+  local source_path="${1:-}"
+  local expected_url="${2:-}"
+  local expected_ref="${3:-}"
+  attestation_create_git_snapshot "$source_path" "$expected_url" "$expected_ref" || return 1
+  rtk_snapshot_path="$attestation_snapshot_dir"
+  rtk_snapshot_manifest="$attestation_snapshot_manifest"
+  rtk_snapshot_commit="$attestation_snapshot_commit"
+  rtk_snapshot_url="$attestation_snapshot_url"
+  rtk_snapshot_manifest_sha256="$attestation_snapshot_manifest_sha256"
 }
 
 install_rtk_from_source() {
@@ -249,7 +115,93 @@ install_rtk_from_source() {
   local expected_url="$2"
   local expected_ref="$3"
   validate_rtk_source_checkout "$source_path" "$expected_url" "$expected_ref" || return 1
-  cargo install --path "$source_path" --locked --force
+  install_rtk_snapshot
+}
+
+install_rtk_snapshot() {
+  local cargo_path cargo_real cargo_real_after cargo_hash_before cargo_hash_after
+  local cargo_target_dir cargo_status
+  cargo_path="$(attestation_canonical_cargo "$HOME")" || {
+    echo 'Canonical Cargo executable is unavailable under the managed Cargo root.' >&2
+    return 1
+  }
+  cargo_real="$(/usr/bin/realpath -e -- "$cargo_path" 2>/dev/null || true)"
+  cargo_hash_before="$(/usr/bin/sha256sum -- "$cargo_real" | /usr/bin/awk '{print $1}')"
+  cargo_target_dir="$(/usr/bin/mktemp -d /tmp/herdr-cargo-target.XXXXXX)"
+  # Keep every compiler/tool lookup at the build seam canonical.  Cargo and
+  # rustc are passed by exact path; PATH contains only trusted system tools so
+  # a user-controlled cargo-bin entry cannot become a Git or helper command.
+  if /usr/bin/env -i \
+    HOME="$HOME" \
+    PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+    LC_ALL=C \
+    TZ=UTC \
+    CARGO_HOME="$HOME/.cargo" \
+    CARGO_INSTALL_ROOT="$HOME/.cargo" \
+    CARGO_TARGET_DIR="$cargo_target_dir" \
+    RUSTC="$HOME/.cargo/bin/rustc" \
+    "$cargo_path" install --path "$rtk_snapshot_path" --locked --force; then
+    cargo_status=0
+  else
+    cargo_status=$?
+  fi
+  /usr/bin/rm -rf -- "$cargo_target_dir"
+  (( cargo_status == 0 )) || return "$cargo_status"
+  cargo_real_after="$(/usr/bin/realpath -e -- "$cargo_path" 2>/dev/null || true)"
+  cargo_hash_after="$(/usr/bin/sha256sum -- "$cargo_real_after" | /usr/bin/awk '{print $1}')"
+  [[ "$cargo_real_after" == "$cargo_real" && "$cargo_hash_after" == "$cargo_hash_before" ]] || {
+    echo 'Canonical Cargo executable changed across the build seam.' >&2
+    return 1
+  }
+}
+
+install_receipt_from_snapshots() {
+  local payload_root payload_manifest expected_payload_sha expected_source_helper_sha
+  payload_root="$(mktemp -d /tmp/herdr-receipt-payload.XXXXXX)"
+  chmod 0700 -- "$payload_root"
+  mkdir -p -- "$payload_root/source" "$payload_root/rtk"
+  cp -a -- "$bootstrap_source_snapshot/." "$payload_root/source/"
+  cp -a -- "$rtk_snapshot_path/." "$payload_root/rtk/"
+  payload_manifest="$payload_root/.payload-manifest"
+  expected_source_helper_sha="$(attestation_snapshot_file_digest \
+    "$bootstrap_source_snapshot/.source-attestation" scripts/ubuntu/source-attestation.sh)"
+  attestation_build_payload_manifest "$payload_root" "$payload_manifest" || {
+    rm -rf -- "$payload_root"
+    return 1
+  }
+  expected_payload_sha="$(attestation_hash_file "$payload_manifest")"
+
+  /usr/bin/tar -C "$payload_root" -cf - . | /usr/bin/sudo -- /usr/bin/bash -c '
+    set -euo pipefail
+    expected_payload_sha="$1"
+    expected_source_helper_sha="$2"
+    managed_user_home="$3"
+    stage="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-payload.XXXXXX)"
+    cleanup_root_payload() { /usr/bin/rm -rf -- "$stage"; }
+    trap cleanup_root_payload EXIT
+    /usr/bin/tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions
+    /usr/bin/chown -R --no-dereference 0:0 -- "$stage"
+    [[ -f "$stage/.payload-manifest" && ! -L "$stage/.payload-manifest" ]] || exit 24
+    [[ "$(/usr/bin/sha256sum -- "$stage/.payload-manifest" | /usr/bin/awk "{print \$1}")" == "$expected_payload_sha" ]] || exit 24
+    [[ "$(/usr/bin/sha256sum -- "$stage/source/scripts/ubuntu/source-attestation.sh" | /usr/bin/awk "{print \$1}")" == "$expected_source_helper_sha" ]] || exit 24
+    # The helper exact committed bytes are checked before it is sourced.  It
+    # then proves every other extracted file before the authority script is
+    # loaded, so root never executes a mutable payload input.
+    # shellcheck disable=SC1091
+    source "$stage/source/scripts/ubuntu/source-attestation.sh"
+    attestation_reject_git_environment
+    attestation_verify_payload_manifest "$stage" "$stage/.payload-manifest" "$expected_payload_sha"
+    exec /usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
+      --install \
+      --source-root "$stage/source" \
+      --source-manifest "$stage/source/.source-attestation" \
+      --rtk-source-root "$stage/rtk" \
+      --rtk-source-manifest "$stage/rtk/.source-attestation" \
+      --payload-root "$stage" \
+      --payload-manifest "$stage/.payload-manifest" \
+      --user-home "$managed_user_home"
+  ' -- "$expected_payload_sha" "$expected_source_helper_sha" "$HOME"
+  rm -rf -- "$payload_root"
 }
 
 validate_user_home() {
@@ -591,6 +543,9 @@ fence_remove_managed_link() {
   local parent
   local expected_real
   local actual_real
+  local quarantine_dir
+  local quarantine_path
+  local detached_real
   local owns_fd=0
   if [[ -n "$expected_fd" ]]; then
     fence_open_parent "$target_path" fd anchor parent "$expected_fd"
@@ -612,20 +567,41 @@ fence_remove_managed_link() {
       echo "Refusing to remove an unmanaged alias: $target_path" >&2
       exit 24
     }
+    quarantine_dir="$(mktemp -d "$parent/.herdr-rtk-remove.XXXXXX")" || {
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Could not create the managed alias quarantine: $target_path" >&2
+      exit 24
+    }
+    chmod 0700 -- "$quarantine_dir"
+    quarantine_path="$quarantine_dir/${target_path##*/}"
     bootstrap_test_pause "$phase"
     fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
-    [[ -L "$anchor" ]] || {
-      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
-      echo "Managed alias changed to a non-symlink: $target_path" >&2
+    # Detach the name with one atomic no-replace rename.  The object moved to
+    # quarantine is then the object whose identity is checked; the target
+    # pathname is never checked and later unlinked.  If a replacement won the
+    # race, restore that exact replacement when the target name is still free,
+    # otherwise leave it quarantined and fail closed without removing it.
+    mv -n -T -- "$anchor" "$quarantine_path" || {
+      echo "Managed alias could not be atomically detached: $target_path" >&2
       exit 24
     }
-    actual_real="$(realpath -e -- "$target_path" 2>/dev/null || true)"
-    [[ "$actual_real" == "$expected_real" ]] || {
-      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
-      echo "Managed alias changed before removal: $target_path" >&2
+    [[ ! -e "$anchor" && ! -L "$anchor" && -L "$quarantine_path" ]] || {
+      echo "Managed alias detach did not produce the expected state: $target_path" >&2
       exit 24
     }
-    rm -f -- "$anchor"
+    detached_real="$(realpath -e -- "$quarantine_path" 2>/dev/null || true)"
+    if [[ "$detached_real" != "$expected_real" ]]; then
+      if [[ ! -e "$anchor" && ! -L "$anchor" ]]; then
+        mv -n -T -- "$quarantine_path" "$anchor" || true
+      fi
+      if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
+      echo "Managed alias replacement won the removal race: $target_path" >&2
+      exit 24
+    fi
+    # Only the already-detached, identity-verified managed link is removed.
+    # A replacement at the public alias path is never a target of this rm.
+    rm -f -- "$quarantine_path"
+    rmdir -- "$quarantine_dir" 2>/dev/null || true
   fi
   fence_require_parent "$parent" "$fd" "managed alias parent for $target_path"
   if (( owns_fd == 1 )); then close_fence_fd "$fd"; fi
@@ -1101,7 +1077,7 @@ install_base() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     apt-transport-https build-essential ca-certificates cifs-utils curl git git-lfs gh gnupg jq mosh \
     openssh-client openssh-server pkg-config ripgrep rsync unzip zip
-  git lfs install
+  PATH='/usr/sbin:/usr/bin:/sbin:/bin' /usr/bin/git lfs install
 
   if [[ "$(ps -p 1 -o comm=)" != "systemd" ]]; then
     echo 'PID 1 is not systemd. This bootstrap expects a normal Ubuntu VM boot.' >&2
@@ -1173,7 +1149,11 @@ install_tools() {
     exit 21
   fi
 
-  installed_rustup="$(rustup --version 2>/dev/null | awk 'NR == 1 { print $1 " " $2 }' || true)"
+  rustup_path="$HOME/.cargo/bin/rustup"
+  installed_rustup=''
+  if [[ -x "$rustup_path" ]]; then
+    installed_rustup="$("$rustup_path" --version 2>/dev/null | awk 'NR == 1 { print $1 " " $2 }' || true)"
+  fi
   if [[ "$installed_rustup" != "rustup $RUSTUP_VERSION" ]]; then
     rustup_temp_dir="$(mktemp -d)"
     # rustup-init dispatches by argv[0], so its executable basename must remain exact.
@@ -1188,17 +1168,17 @@ install_tools() {
     source "$HOME/.cargo/env"
   fi
   validate_cargo_roots || exit 24
-  command -v rustup >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 || {
-    echo 'The locked rustup is present but rustup/cargo are not both discoverable. Use the default ~/.cargo layout or set CARGO_HOME before retrying.' >&2
+  [[ -x "$rustup_path" ]] && attestation_canonical_cargo "$HOME" >/dev/null || {
+    echo 'The locked rustup is present but the canonical ~/.cargo toolchain identities are not both available.' >&2
     exit 24
   }
-  rustup set auto-self-update disable
-  [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
+  "$rustup_path" set auto-self-update disable
+  [[ "$("$rustup_path" --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
     echo "rustup version does not match lock after reinstall ($RUSTUP_VERSION)." >&2; exit 24;
   }
-  rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-  rustup default "$RUST_TOOLCHAIN"
-  [[ "$(rustup --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
+  "$rustup_path" toolchain install "$RUST_TOOLCHAIN" --profile minimal
+  "$rustup_path" default "$RUST_TOOLCHAIN"
+  [[ "$("$rustup_path" --version | awk 'NR == 1 { print $1 " " $2 }')" == "rustup $RUSTUP_VERSION" ]] || {
     echo "rustup version changed after toolchain installation ($RUSTUP_VERSION)." >&2; exit 24;
   }
 
@@ -1208,20 +1188,29 @@ install_tools() {
     exit 24
   }
   if [[ ! -d "$src_anchor/rtk/.git" ]]; then
-    git clone "$RTK_REPO_URL" "$src_anchor/rtk"
+    trusted_git_command clone --no-checkout --no-tags -- "$RTK_REPO_URL" "$HOME/src/rtk"
   else
-    validate_rtk_source_checkout "$src_anchor/rtk" || exit 24
+    validate_rtk_source_checkout "$HOME/src/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
   fi
   fence_require_directory "$HOME/src" "$src_fd" 'source directory'
-  git -C "$src_anchor/rtk" remote set-url origin "$RTK_REPO_URL"
-  git -C "$src_anchor/rtk" fetch --force origin "$RTK_REF"
-  git -C "$src_anchor/rtk" checkout --detach "$RTK_REF"
-  [[ "$(git -C "$src_anchor/rtk" rev-parse HEAD)" == "$RTK_REF" ]] || {
-    echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
+  trusted_git_command -C "$HOME/src/rtk" fetch --force --no-tags "$RTK_REPO_URL" "$RTK_REF"
+  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
+  attestation_create_git_snapshot "$HOME/src/rtk" "$RTK_REPO_URL" "$RTK_REF" false || {
+    echo 'RTK locked commit could not be materialized without a worktree checkout.' >&2
+    exit 24
   }
-  install_rtk_from_source "$src_anchor/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
+  rtk_snapshot_path="$attestation_snapshot_dir"
+  rtk_snapshot_manifest="$attestation_snapshot_manifest"
+  rtk_snapshot_commit="$attestation_snapshot_commit"
+  rtk_snapshot_url="$attestation_snapshot_url"
+  rtk_snapshot_manifest_sha256="$attestation_snapshot_manifest_sha256"
+  install_rtk_snapshot || exit 24
   for executable in rustup cargo rustc; do
-    executable_path="$(command -v "$executable")"
+    executable_path="$HOME/.cargo/bin/$executable"
+    [[ -x "$executable_path" ]] || {
+      echo "Canonical Cargo toolchain executable is missing: $executable_path" >&2
+      exit 24
+    }
     fence_replace_link "$executable_path" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
   [[ -x "$cargo_install_root/bin/rtk" ]] || {
@@ -1298,8 +1287,7 @@ install_tools() {
   [[ "$(bun --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
   [[ "$(herdr --version | awk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
 
-  sudo -- "$repo_root/scripts/ubuntu/receipt-authority.sh" \
-    --install --source-root "$repo_root" --user-home "$HOME"
+  install_receipt_from_snapshots
 
   manifest="$state_dir/toolchain-manifest.txt"
   manifest_tmp="$(mktemp "$state_anchor/.toolchain-manifest.XXXXXX")"

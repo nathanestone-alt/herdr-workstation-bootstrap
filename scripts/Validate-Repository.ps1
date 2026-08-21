@@ -46,6 +46,7 @@ if ($bashCandidates) {
     }
     foreach ($relativeTest in @(
         'tests\test-bootstrap-profile.sh',
+        'tests\test-bootstrap-fencing.sh',
         'tests\test-configure-excel-share-inputs.sh',
         'tests\test-configure-vps-client.sh',
         'tests\test-verify-vps-access.sh',
@@ -154,7 +155,9 @@ $requiredFiles = @(
     'scripts\windows\Test-HerdrExchangeBoundary.ps1',
     'scripts\ubuntu\configure-excel-share.sh',
     'scripts\ubuntu\receipt-authority.sh',
+    'scripts\ubuntu\source-attestation.sh',
     'tests\test-bootstrap-profile.sh',
+    'tests\test-bootstrap-fencing.sh',
     'tests\test-configure-excel-share-inputs.sh',
     'tests\test-configure-vps-client.sh',
     'tests\test-verify-vps-access.sh',
@@ -290,7 +293,7 @@ $contentAssertions = @(
     @{ Path = 'MANUAL-START.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'HERDR_WINDOWS_REVIEW_CONFIG'); Forbidden = @('disposable workbook in `C:\HerdrExchange`', 'C:\HerdrReviewJobs') },
     @{ Path = 'HERDR_WORKSTATION_DEPENDENCY_SETUP_PLAN.md'; Required = @('disposable workbook in `%USERPROFILE%\Documents`', 'HERDR_WINDOWS_REVIEW_CONFIG', 'SSH to `herdr-win`'); Forbidden = @('do not create `C:\HerdrExchange` before the guarded share step', 'C:\HerdrReviewJobs') },
     @{ Path = 'scripts\windows\New-HerdrUbuntuVM.ps1'; Required = @('-InstallationComplete', 'Win32_ComputerSystem', 'HostProcessorReserve', 'HostMemoryReserveBytes', 'Orphan VHD', 'Get-VMSnapshot', '$existing.Path', 'residual configuration', 'Get-VHD -Path', 'New-VHD -Path', 'Remove-Item -LiteralPath $vhdPath', 'must be Off'); Forbidden = @('no changes were made') },
-    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'UV_VERSION', 'PYTHON_VERSION', 'validate_toolchain_lock', 'install_python_toolchain', 'write_py_compat', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', 'command -v "$executable"', 'cargo_install_root', '--prefix "$node_anchor"', '$node_anchor/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt', 'py_3.13_probe'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
+    @{ Path = 'scripts\ubuntu\bootstrap.sh'; Required = @('config/ubuntu-toolchain.lock', 'UV_VERSION', 'PYTHON_VERSION', 'attestation_create_git_snapshot', 'trusted_git_command', 'attestation_canonical_cargo', 'install_receipt_from_snapshots', 'install_python_toolchain', 'write_py_compat', 'download_verified', 'converge_profile_hook', 'HERDR_PROFILE_CHAIN_ACTIVE', '$HOME/.bash_login', '$HOME/.cargo/bin/$executable', 'cargo_install_root', '--prefix "$node_anchor"', '$node_anchor/lib/node_modules/$package_dir', '@openai/codex@$CODEX_VERSION', '@anthropic-ai/claude-code@$CLAUDE_VERSION', 'toolchain-manifest.txt', 'py_3.13_probe'); Forbidden = @('curl -fsSL https://chatgpt.com/codex/install.sh | sh', 'curl -fsSL https://claude.ai/install.sh | bash', 'fnm install 24', 'rustup default stable') },
     @{ Path = 'scripts\ubuntu\configure-excel-share.sh'; Required = @('--owner', '--reassign-owner', 'nosharesock', 'Credential and live mount were not changed', 'replacement credential is installed', '# BEGIN herdr-bootstrap excel-share', 'unmanaged /etc/fstab entry', 'Mount point must be an absolute path', 'protected system path', 'direct /srv/herdr-* child', 'Refusing to change it', '$mount_point_exists', 'Windows host contains unsupported characters', 'SMB share name contains unsupported characters'); Forbidden = @() },
     @{ Path = 'scripts\ubuntu\configure-vps-client.sh'; Required = @('--host-key-fingerprint', 'recorded_fingerprints', 'ssh-keygen -R', 'ssh -G -F "$validation_config"', 'HERDR_SYSTEM_SSH_CONFIG', 'Include "%s"', 'IdentityFile "%s"', 'unsupported SSH configuration metacharacters', 'validate_managed_block_shape', 'validate_effective_alias', 'the client configuration was not changed', 'managed_blocks_dir', 'effective_identity_files', 'ClearAllForwardings yes', 'ForwardAgent no', 'ForwardX11 no', 'ForwardX11Trusted no', 'ControlMaster no', 'ControlPath none', 'GlobalKnownHostsFile none', 'ProxyCommand none', 'Host *', 'StrictHostKeyChecking yes', 'cmp -s', 'Host-key mismatch'); Forbidden = @('ssh -G -F "$replacement"', 'already exists in $config; no change made') },
     @{ Path = 'scripts\ubuntu\verify-vps-access.sh'; Required = @('OpenSSH could not resolve alias', 'VPS access was not attempted', '$1=""', 'effective IdentityFile'); Forbidden = @('ssh -G "$alias_name" 2>/dev/null') },

@@ -4,13 +4,27 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
+
+# The bootstrap source is now an attested committed snapshot.  Keep this
+# function-only regression runnable from a mutable developer checkout by
+# testing the exact current files in a disposable clean Git fixture.
+source_fixture="$test_root/source"
+cp -a -- "$repo_root/." "$source_fixture/"
+rm -rf -- "$source_fixture/.git"
+git -C "$source_fixture" init -q
+git -C "$source_fixture" config user.email fixture@example.invalid
+git -C "$source_fixture" config user.name fixture
+git -C "$source_fixture" add -f .
+git -C "$source_fixture" commit -qm 'clean Python toolchain fixture'
+repo_root="$source_fixture"
+bootstrap_script="$source_fixture/scripts/ubuntu/bootstrap.sh"
 export HOME="$test_root/home"
 mkdir -p "$HOME/.local/bin"
 
 # Source only: none of the download, apt, rust, Node or runtime convergence
 # phases may run in this test.
 # shellcheck disable=SC1091
-source "$repo_root/scripts/ubuntu/bootstrap.sh"
+source "$bootstrap_script"
 validate_toolchain_lock
 
 saved_uv_sha="$UV_SHA256"
@@ -98,7 +112,7 @@ expect_bootstrap_path_blocked() {
   local output="$test_root/bootstrap-$case_name.out"
   set +e
   HOME="$home" bash -c 'bootstrap_script="$1"; requested_phase="$2"; set --; source "$bootstrap_script"; if [[ "$requested_phase" == install-tools ]]; then install_tools; else install_python_toolchain; fi' \
-    _ "$repo_root/scripts/ubuntu/bootstrap.sh" "$phase" > "$output" 2>&1
+    _ "$bootstrap_script" "$phase" > "$output" 2>&1
   local status=$?
   set -e
   [[ "$status" -ne 0 ]] || { echo "$case_name unexpectedly passed." >&2; exit 1; }
@@ -168,7 +182,7 @@ HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-py-publish \
 HERDR_BOOTSTRAP_TEST_READY_FILE="$bootstrap_swap_ready" \
 HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$bootstrap_swap_continue" \
 HOME="$bootstrap_swap_home" bash -c \
-  'bootstrap_script="$1"; set --; source "$bootstrap_script"; write_py_compat' _ "$repo_root/scripts/ubuntu/bootstrap.sh" > "$bootstrap_swap_output" 2>&1 &
+  'bootstrap_script="$1"; set --; source "$bootstrap_script"; write_py_compat' _ "$bootstrap_script" > "$bootstrap_swap_output" 2>&1 &
 bootstrap_swap_pid=$!
 for attempt in $(seq 1 200); do
   [[ -e "$bootstrap_swap_ready" ]] && break

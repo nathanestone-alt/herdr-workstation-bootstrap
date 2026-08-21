@@ -3,12 +3,20 @@ set -euo pipefail
 
 mode='install'
 script_path="$(realpath -e -- "${BASH_SOURCE[0]}")"
-repo_root="$(cd -- "$(dirname -- "$script_path")/../.." && pwd -P)"
+script_dir="$(dirname -- "$script_path")"
+# shellcheck disable=SC1091
+source "$script_dir/source-attestation.sh"
+attestation_reject_git_environment || exit 24
+repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
 source_root="$repo_root"
 user_home="${HOME:-}"
 authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 receipt_path='/etc/stmodel/issue-961/receipt.json'
 rtk_source_root=''
+source_manifest=''
+rtk_source_manifest=''
+payload_root=''
+payload_manifest_arg=''
 fixture_root=''
 default_authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 default_receipt_path='/etc/stmodel/issue-961/receipt.json'
@@ -27,6 +35,10 @@ Options:
   --authority-path PATH    Authority envelope path (production default is /etc/stmodel/issue-961/receipt-authority.json).
   --receipt-path PATH      Receipt body path (production default is /etc/stmodel/issue-961/receipt.json).
   --rtk-source-root PATH   Canonical RTK source checkout (default is USER_HOME/src/rtk).
+  --source-manifest PATH   Exact committed source snapshot manifest.
+  --rtk-source-manifest PATH Exact committed RTK snapshot manifest.
+  --payload-root PATH      Root of the root-owned verified payload staging tree.
+  --payload-manifest PATH  Verified payload manifest within PAYLOAD_ROOT.
   --fixture-root PATH      Test-only role root; requires non-production output paths.
 EOF
 }
@@ -40,6 +52,10 @@ while [[ $# -gt 0 ]]; do
     --authority-path) [[ $# -ge 2 ]] || { usage; exit 2; }; authority_path="$2"; shift 2 ;;
     --receipt-path) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_path="$2"; shift 2 ;;
     --rtk-source-root) [[ $# -ge 2 ]] || { usage; exit 2; }; rtk_source_root="$2"; shift 2 ;;
+    --source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; source_manifest="$2"; shift 2 ;;
+    --rtk-source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; rtk_source_manifest="$2"; shift 2 ;;
+    --payload-root) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_root="$2"; shift 2 ;;
+    --payload-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_manifest_arg="$2"; shift 2 ;;
     --fixture-root) [[ $# -ge 2 ]] || { usage; exit 2; }; fixture_root="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -51,8 +67,23 @@ fail() {
   exit 24
 }
 
+receipt_test_pause() {
+  local phase="$1"
+  local ready_file="${HERDR_RECEIPT_TEST_READY_FILE:-}"
+  local continue_file="${HERDR_RECEIPT_TEST_CONTINUE_FILE:-}"
+  [[ "${HERDR_RECEIPT_TEST_PAUSE_PHASE:-}" == "$phase" ]] || return 0
+  [[ -n "$ready_file" && -n "$continue_file" ]] || fail "receipt test pause is missing synchronization files: $phase"
+  : > "$ready_file"
+  while [[ ! -e "$continue_file" ]]; do sleep 0.01; done
+}
+
 [[ "$mode" == install || "$mode" == check ]] || fail "unsupported mode '$mode'"
-[[ "$source_root" == /* && "$user_home" == /* && "$authority_path" == /* && "$receipt_path" == /* && ( -z "$rtk_source_root" || "$rtk_source_root" == /* ) ]] || {
+[[ "$source_root" == /* && "$user_home" == /* && "$authority_path" == /* && "$receipt_path" == /* \
+  && ( -z "$rtk_source_root" || "$rtk_source_root" == /* ) \
+  && ( -z "$source_manifest" || "$source_manifest" == /* ) \
+  && ( -z "$rtk_source_manifest" || "$rtk_source_manifest" == /* ) \
+  && ( -z "$payload_root" || "$payload_root" == /* ) \
+  && ( -z "$payload_manifest_arg" || "$payload_manifest_arg" == /* ) ]] || {
   fail 'source, home, authority, and receipt paths must be absolute'
 }
 
@@ -71,10 +102,41 @@ fi
 
 jq_bin='/usr/bin/jq'
 [[ -x "$jq_bin" ]] || fail 'jq is required at /usr/bin/jq'
-[[ -x /usr/bin/git && -x /usr/bin/sha256sum && -x /usr/bin/realpath ]] || fail 'required host utilities are missing'
+attestation_assert_canonical_git || fail 'canonical /usr/bin/git is unavailable'
+[[ -x /usr/bin/sha256sum && -x /usr/bin/realpath ]] || fail 'required host utilities are missing'
 
 source_root="$(realpath -e -- "$source_root" 2>/dev/null || true)"
 [[ -n "$source_root" && -d "$source_root" ]] || fail 'source root does not exist'
+if [[ -n "$source_manifest" ]]; then
+  source_manifest="$(realpath -e -- "$source_manifest" 2>/dev/null || true)"
+  [[ "$source_manifest" == "$source_root/.source-attestation" ]] || fail 'source manifest is not bound to the source snapshot'
+  attestation_verify_snapshot "$source_root" "$source_manifest" || fail 'source snapshot manifest is invalid'
+else
+  attestation_create_git_snapshot "$source_root" '' '' || fail 'source Git checkout failed hardened source attestation'
+  source_root="$attestation_snapshot_dir"
+  source_manifest="$attestation_snapshot_manifest"
+fi
+source_commit="$attestation_snapshot_commit"
+[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source snapshot commit is not a full commit'
+source_script_path="$source_root/scripts/ubuntu/receipt-authority.sh"
+source_helper_path="$source_root/scripts/ubuntu/source-attestation.sh"
+[[ -f "$source_script_path" && ! -L "$source_script_path" ]] || fail 'source snapshot authority script is missing'
+[[ -f "$source_helper_path" && ! -L "$source_helper_path" ]] || fail 'source snapshot attestation helper is missing'
+expected_script_sha256="$(attestation_snapshot_file_digest "$source_manifest" scripts/ubuntu/receipt-authority.sh)" || fail 'source snapshot authority script is not manifested'
+expected_helper_sha256="$(attestation_snapshot_file_digest "$source_manifest" scripts/ubuntu/source-attestation.sh)" || fail 'source snapshot helper is not manifested'
+[[ "$(attestation_hash_file "$script_path")" == "$expected_script_sha256" ]] || fail 'invoked receipt authority bytes differ from the source snapshot'
+[[ "$(attestation_hash_file "$script_dir/source-attestation.sh")" == "$expected_helper_sha256" ]] || fail 'invoked source-attestation helper differs from the source snapshot'
+[[ "$(attestation_hash_file "$source_script_path")" == "$expected_script_sha256" ]] || fail 'source snapshot authority script hash is inconsistent'
+[[ "$(attestation_hash_file "$source_helper_path")" == "$expected_helper_sha256" ]] || fail 'source snapshot helper hash is inconsistent'
+
+if [[ -n "$payload_root" || -n "$payload_manifest_arg" ]]; then
+  [[ -n "$payload_root" && -n "$payload_manifest_arg" ]] || fail 'payload root and manifest must be supplied together'
+  payload_root="$(realpath -e -- "$payload_root" 2>/dev/null || true)"
+  payload_manifest_arg="$(realpath -e -- "$payload_manifest_arg" 2>/dev/null || true)"
+  [[ "$payload_manifest_arg" == "$payload_root/.payload-manifest" ]] || fail 'payload manifest is not bound to the payload root'
+  attestation_verify_payload_manifest "$payload_root" "$payload_manifest_arg" || fail 'payload manifest is invalid'
+fi
+
 user_home="$(realpath -e -- "$user_home" 2>/dev/null || true)"
 [[ -n "$user_home" && -d "$user_home" ]] || fail 'managed user home does not exist'
 if [[ -z "$rtk_source_root" ]]; then rtk_source_root="$user_home/src/rtk"; fi
@@ -103,189 +165,23 @@ reject_symlink_components() {
 }
 
 validate_rtk_source_checkout() {
-  (
-    local source_path="${1:-}"
-    local expected_url="${2:-}"
-    local expected_ref="${3:-}"
-    local actual_url
-    local actual_ref
-    local canonical_source_path
-    local git_toplevel
-    local git_dir
-    local sparse_checkout
-    local sparse_index
-    local partial_clone
-    local nested_git
-    local git_metadata_entry
-    local unsupported_entry
-    local temporary_index=''
-    local untracked_file=''
-    local empty_directories_file=''
-    local tree_file=''
-
-    cleanup_rtk_attestation() {
-      [[ -z "$temporary_index" ]] || rm -f -- "$temporary_index" || true
-      [[ -z "$untracked_file" ]] || rm -f -- "$untracked_file" || true
-      [[ -z "$empty_directories_file" ]] || rm -f -- "$empty_directories_file" || true
-      [[ -z "$tree_file" ]] || rm -f -- "$tree_file" || true
-    }
-    trap cleanup_rtk_attestation EXIT
-
-    [[ -n "$source_path" ]] || {
-      echo 'RTK source checkout path is empty.' >&2
-      exit 1
-    }
-    [[ -d "$source_path/.git" && ! -L "$source_path" && ! -L "$source_path/.git" ]] || {
-      echo "RTK source checkout is missing or unsafe: $source_path" >&2
-      exit 1
-    }
-
-    git_at_rtk() {
-      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
-        -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-        /usr/bin/git -C "$source_path" "$@"
-    }
-    git_at_rtk_index() {
-      local index_path="$1"
-      shift
-      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
-        -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="$index_path" \
-        /usr/bin/git -C "$source_path" "$@"
-    }
-
-    canonical_source_path="$(realpath -e -- "$source_path" 2>/dev/null || true)"
-    [[ -n "$canonical_source_path" && -d "$canonical_source_path" ]] || {
-      echo "RTK source checkout cannot be canonically resolved: $source_path" >&2
-      exit 1
-    }
-    git_toplevel="$(git_at_rtk rev-parse --show-toplevel 2>/dev/null || true)"
-    git_toplevel="$(realpath -e -- "$git_toplevel" 2>/dev/null || true)"
-    [[ "$git_toplevel" == "$canonical_source_path" ]] || {
-      echo "RTK source checkout Git root is not canonical: $source_path" >&2
-      exit 1
-    }
-    git_dir="$(git_at_rtk rev-parse --absolute-git-dir 2>/dev/null || true)"
-    git_dir="$(realpath -e -- "$git_dir" 2>/dev/null || true)"
-    [[ "$git_dir" == "$canonical_source_path/.git" ]] || {
-      echo "RTK source checkout Git metadata is not local to the checkout: $source_path" >&2
-      exit 1
-    }
-    git_metadata_entry="$(find -P "$git_dir" -mindepth 1 -type l -print -quit 2>/dev/null || true)"
-    [[ -z "$git_metadata_entry" ]] || {
-      echo "RTK source checkout Git metadata contains a symlink: $git_metadata_entry" >&2
-      exit 1
-    }
-    [[ ! -e "$git_dir/objects/info/alternates" ]] || {
-      echo "RTK source checkout uses an external Git object store: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]] || {
-      echo "RTK source checkout is not a worktree: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-bare-repository 2>/dev/null || true)" == false ]] || {
-      echo "RTK source checkout is bare: $source_path" >&2
-      exit 1
-    }
-    [[ "$(git_at_rtk rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
-      echo "RTK source checkout is shallow or incomplete: $source_path" >&2
-      exit 1
-    }
-    sparse_checkout="$(git_at_rtk config --bool --get core.sparseCheckout 2>/dev/null || true)"
-    [[ "$sparse_checkout" != true ]] || {
-      echo "RTK source checkout uses sparse checkout: $source_path" >&2
-      exit 1
-    }
-    sparse_index="$(git_at_rtk config --bool --get index.sparse 2>/dev/null || true)"
-    [[ "$sparse_index" != true ]] || {
-      echo "RTK source checkout uses a sparse index: $source_path" >&2
-      exit 1
-    }
-    partial_clone="$(git_at_rtk config --get extensions.partialClone 2>/dev/null || true)"
-    [[ -z "$partial_clone" ]] || {
-      echo "RTK source checkout is a partial clone: $source_path" >&2
-      exit 1
-    }
-    partial_clone="$(git_at_rtk config --get-regexp '^remote\..*\.(promisor|partialclonefilter)$' 2>/dev/null || true)"
-    [[ -z "$partial_clone" ]] || {
-      echo "RTK source checkout has partial-clone metadata: $source_path" >&2
-      exit 1
-    }
-    nested_git="$(find -P "$canonical_source_path" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
-    [[ -z "$nested_git" ]] || {
-      echo "RTK source checkout contains an unexpected nested Git repository: $nested_git" >&2
-      exit 1
-    }
-    if ! unsupported_entry="$(find -P "$canonical_source_path" -mindepth 1 \
-      \( -path "$canonical_source_path/.git" -o -path "$canonical_source_path/.git/*" \) -prune -o \
-      \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit 2>/dev/null)"; then
-      echo "RTK source checkout filesystem walk failed: $source_path" >&2
-      exit 1
-    fi
-    [[ -z "$unsupported_entry" ]] || {
-      echo "RTK source checkout contains an unsupported filesystem entry: $unsupported_entry" >&2
-      exit 1
-    }
-
-    actual_url="$(git_at_rtk remote get-url --all origin 2>/dev/null || true)"
-    if [[ -n "$expected_url" && "$actual_url" != "$expected_url" ]]; then
-      echo "RTK source checkout origin differs from the lock: $actual_url" >&2
-      exit 1
-    fi
-    actual_ref="$(git_at_rtk rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-    [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
-      echo "RTK source checkout HEAD is not a full commit: $source_path" >&2
-      exit 1
-    }
-    if [[ -n "$expected_ref" && "$actual_ref" != "$expected_ref" ]]; then
-      echo "RTK source checkout does not match the locked commit: $actual_ref" >&2
-      exit 1
-    fi
-
-    tree_file="$(mktemp)"
-    if ! git_at_rtk ls-tree --full-tree -r "$actual_ref" > "$tree_file"; then
-      echo "RTK source checkout tree cannot be completely read: $source_path" >&2
-      exit 1
-    fi
-    if awk '$1 == "160000" { found=1 } END { exit(found ? 0 : 1) }' "$tree_file"; then
-      echo "RTK source checkout contains an unexpected submodule: $source_path" >&2
-      exit 1
-    fi
-
-    if ! git_at_rtk diff --cached --quiet --no-ext-diff --no-textconv "$actual_ref" --; then
-      echo "RTK source checkout has staged or unmerged changes: $source_path" >&2
-      exit 1
-    fi
-    temporary_index="$(mktemp)"
-    rm -f -- "$temporary_index"
-    if ! git_at_rtk_index "$temporary_index" read-tree "$actual_ref"; then
-      echo "RTK source checkout cannot create an independent index: $source_path" >&2
-      exit 1
-    fi
-    if ! git_at_rtk_index "$temporary_index" diff --quiet --no-ext-diff --no-textconv --ignore-submodules=none --; then
-      echo "RTK source checkout content differs from locked HEAD: $source_path" >&2
-      exit 1
-    fi
-
-    untracked_file="$(mktemp)"
-    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --no-empty-directory -z > "$untracked_file"; then
-      echo "RTK source checkout untracked-path attestation failed: $source_path" >&2
-      exit 1
-    fi
-    [[ ! -s "$untracked_file" ]] || {
-      echo "RTK source checkout has ordinary or ignored untracked paths: $source_path" >&2
-      exit 1
-    }
-    empty_directories_file="$(mktemp)"
-    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --directory --empty-directory -z > "$empty_directories_file"; then
-      echo "RTK source checkout untracked-directory attestation failed: $source_path" >&2
-      exit 1
-    fi
-    [[ ! -s "$empty_directories_file" ]] || {
-      echo "RTK source checkout has untracked directories: $source_path" >&2
-      exit 1
-    }
-  )
+  local source_path="${1:-}"
+  local expected_url="${2:-}"
+  local expected_ref="${3:-}"
+  if [[ -n "$rtk_source_manifest" ]]; then
+    rtk_source_manifest="$(realpath -e -- "$rtk_source_manifest" 2>/dev/null || true)"
+    [[ "$rtk_source_manifest" == "$source_path/.source-attestation" ]] || fail 'RTK source manifest is not bound to the RTK snapshot'
+    attestation_verify_snapshot "$source_path" "$rtk_source_manifest" "$expected_ref" "$expected_url" || fail 'RTK source snapshot manifest is invalid'
+  else
+    attestation_create_git_snapshot "$source_path" "$expected_url" "$expected_ref" || return 1
+    source_path="$attestation_snapshot_dir"
+    rtk_source_manifest="$attestation_snapshot_manifest"
+  fi
+  rtk_snapshot_path="$source_path"
+  rtk_snapshot_manifest="$rtk_source_manifest"
+  rtk_snapshot_commit="$attestation_snapshot_commit"
+  rtk_snapshot_url="$attestation_snapshot_url"
+  rtk_snapshot_manifest_sha256="$(attestation_hash_file "$rtk_snapshot_manifest")" || return 1
 }
 
 reject_symlink_components "$user_home" || fail "managed user home contains a symlink: $user_home"
@@ -303,23 +199,17 @@ source "$lock_file"
 [[ "${RTK_REPO_URL:-}" =~ ^https://[^[:space:]]+$ ]] || fail 'RTK_REPO_URL is not a valid locked HTTPS URL'
 [[ "${RTK_REF:-}" =~ ^[0-9a-f]{40}$ ]] || fail 'RTK_REF is not a full locked commit'
 
-repo_commit="$(/usr/bin/git -C "$source_root" rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
-[[ "$repo_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source HEAD is not a full commit'
-if ! /usr/bin/git -C "$source_root" diff --quiet; then fail 'source worktree has unstaged changes'; fi
-if ! /usr/bin/git -C "$source_root" diff --cached --quiet; then fail 'source worktree has staged changes'; fi
-[[ -z "$(/usr/bin/git -C "$source_root" status --porcelain --untracked-files=all)" ]] || fail 'source worktree has untracked changes'
+repo_commit="$source_commit"
+[[ "$repo_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source snapshot commit is not a full commit'
 
 payload_manifest_sha256="$(/usr/bin/sha256sum "$payload_manifest" | awk '{print $1}')"
 allowlist_sha256="$(/usr/bin/sha256sum "$allowlist_file" | awk '{print $1}')"
-script_sha256="$(/usr/bin/sha256sum "$script_path" | awk '{print $1}')"
-source_script_path="$source_root/scripts/ubuntu/receipt-authority.sh"
-reject_symlink_components "$source_script_path" || fail 'source-root receipt authority script contains a symlink'
-[[ -f "$source_script_path" && ! -L "$source_script_path" ]] || fail 'source-root receipt authority script is missing or not regular'
-[[ "$(/usr/bin/sha256sum "$source_script_path" | awk '{print $1}')" == "$script_sha256" ]] || fail 'source-root receipt authority script does not match the invoked script'
+script_sha256="$expected_script_sha256"
 
 validate_rtk_source_checkout "$rtk_source_root" "$RTK_REPO_URL" "$RTK_REF" || fail 'RTK source checkout failed hardened source attestation'
-rtk_source_url="$(/usr/bin/git -C "$rtk_source_root" remote get-url --all origin 2>/dev/null || true)"
-rtk_source_commit="$(/usr/bin/git -C "$rtk_source_root" rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+receipt_test_pause after-rtk-snapshot
+rtk_source_url="$rtk_snapshot_url"
+rtk_source_commit="$rtk_snapshot_commit"
 rtk_source_clean=true
 
 declare -A role_registry role_names role_argv role_implementation
@@ -537,8 +427,9 @@ for role in "${roles[@]}"; do
       --arg source_commit_sha "$rtk_source_commit" \
       --arg repository_url "$rtk_source_url" \
       --arg locked_ref "$RTK_REF" \
+      --arg snapshot_manifest_sha256 "$rtk_snapshot_manifest_sha256" \
       --argjson clean "$rtk_source_clean" \
-      'with_entries(.value.source_commit_sha = $source_commit_sha | .value.source_attestation += {repository_url:$repository_url, locked_ref:$locked_ref, source_commit_sha:$source_commit_sha, clean:$clean})')"
+      'with_entries(.value.source_commit_sha = $source_commit_sha | .value.source_attestation += {repository_url:$repository_url, locked_ref:$locked_ref, source_commit_sha:$source_commit_sha, snapshot_manifest_sha256:$snapshot_manifest_sha256, clean:$clean})')"
   fi
   printf '%s\n' "$role_json" >> "$role_fragments"
 done
@@ -548,9 +439,10 @@ rtk_source_json="$("$jq_bin" -cSn \
   --arg repository_url "$rtk_source_url" \
   --arg locked_ref "$RTK_REF" \
   --arg commit_sha "$rtk_source_commit" \
-  --arg checkout_path "$rtk_source_root" \
+  --arg checkout_path "snapshot://$rtk_snapshot_commit/$rtk_snapshot_manifest_sha256" \
+  --arg snapshot_manifest_sha256 "$rtk_snapshot_manifest_sha256" \
   --argjson clean "$rtk_source_clean" \
-  '{repository_url:$repository_url, locked_ref:$locked_ref, commit_sha:$commit_sha, checkout_path:$checkout_path, clean:$clean}')"
+  '{repository_url:$repository_url, locked_ref:$locked_ref, commit_sha:$commit_sha, checkout_path:$checkout_path, snapshot_manifest_sha256:$snapshot_manifest_sha256, clean:$clean}')"
 
 issued_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 expires_at_utc="$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"

@@ -4,12 +4,27 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
+
+# The bootstrap source is itself attested before its functions are exposed.
+# Run this function-only suite from a disposable clean fixture so it can be
+# invoked from a mutable developer worktree as well as from CI.
+source_fixture="$test_root/source"
+cp -a -- "$repo_root/." "$source_fixture/"
+rm -rf -- "$source_fixture/.git"
+git -C "$source_fixture" init -q
+git -C "$source_fixture" config user.email fixture@example.invalid
+git -C "$source_fixture" config user.name fixture
+git -C "$source_fixture" add -f .
+git -C "$source_fixture" commit -qm 'clean bootstrap fencing fixture'
+bootstrap_script="$source_fixture/scripts/ubuntu/bootstrap.sh"
+attestation_helper="$source_fixture/scripts/ubuntu/source-attestation.sh"
+repo_root="$source_fixture"
 export HOME="$test_root/home"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/lib/herdr-workstation" "$HOME/.config/herdr-workstation" "$HOME/.cargo/bin"
 
 # Source only: the real base/tools phases must not run in this regression.
 # shellcheck disable=SC1091
-source "$repo_root/scripts/ubuntu/bootstrap.sh"
+source "$bootstrap_script"
 
 # Cargo roots are validated before any Cargo operation can run.
 mkdir -p "$HOME/.cargo"
@@ -34,18 +49,125 @@ git -C "$rtk_source" init -q
 git -C "$rtk_source" config user.email fixture@example.invalid
 git -C "$rtk_source" config user.name fixture
 printf 'locked source\n' > "$rtk_source/README"
+chmod 0644 "$rtk_source/README"
 git -C "$rtk_source" add README
 git -C "$rtk_source" commit -qm 'fixture source'
 rtk_source_commit="$(git -C "$rtk_source" rev-parse HEAD)"
 git -C "$rtk_source" remote add origin https://example.invalid/rtk.git
 validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
 
-cargo_install_marker="$test_root/cargo-install-reached"
-cargo() {
-  : > "$cargo_install_marker"
+# Git configuration, environment, and PATH are all hostile inputs to the
+# attestation seam. They must fail closed before any filter or forged Git is
+# reached.
+filter_marker="$test_root/filter-marker"
+git -C "$rtk_source" config filter.attacker.clean "printf FILTER-RAN > '$filter_marker'"
+printf '*.txt filter=attacker\n' > "$rtk_source/.gitattributes"
+if attestation_create_git_snapshot "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  echo 'Repository-local clean filter configuration was accepted.' >&2
+  exit 1
+fi
+[[ ! -e "$filter_marker" ]] || { echo 'Repository-local clean filter executed.' >&2; exit 1; }
+git -C "$rtk_source" config --unset-all filter.attacker.clean
+rm -- "$rtk_source/.gitattributes"
+
+if (export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.filemode GIT_CONFIG_VALUE_0=false; \
+  attestation_create_git_snapshot "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"); then
+  echo 'GIT_CONFIG_COUNT override was accepted.' >&2
+  exit 1
+fi
+if (export GIT_COMMON_DIR="$test_root/external-common"; \
+  attestation_create_git_snapshot "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"); then
+  echo 'GIT_COMMON_DIR override was accepted.' >&2
+  exit 1
+fi
+
+# No temporary index is created by the attestor.  A pathname that would point
+# at the caller index is rejected as an environment override, and the caller
+# index remains byte-for-byte and flag-for-flag unchanged.
+caller_index_sha_before="$(sha256sum "$rtk_source/.git/index" | awk '{print $1}')"
+caller_index_flags_before="$(git -C "$rtk_source" ls-files -v)"
+temporary_index="$test_root/replaced-index"
+ln -s "$rtk_source/.git/index" "$temporary_index"
+if (export GIT_INDEX_FILE="$temporary_index"; \
+  attestation_create_git_snapshot "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"); then
+  echo 'Temporary-index symlink replacement was accepted.' >&2
+  exit 1
+fi
+caller_index_sha_after="$(sha256sum "$rtk_source/.git/index" | awk '{print $1}')"
+caller_index_flags_after="$(git -C "$rtk_source" ls-files -v)"
+[[ "$caller_index_sha_after" == "$caller_index_sha_before" && \
+   "$caller_index_flags_after" == "$caller_index_flags_before" ]] || {
+  echo 'Temporary-index probe changed the caller index.' >&2
+  exit 1
 }
+
+fake_git_bin="$test_root/fake-git-bin"
+mkdir -p "$fake_git_bin"
+cat > "$fake_git_bin/git" <<EOF
+#!/usr/bin/env bash
+: > "$test_root/path-git-reached"
+exit 99
+EOF
+chmod 0755 "$fake_git_bin/git"
+PATH="$fake_git_bin:/usr/bin:/bin" /usr/bin/bash -c \
+  'source "$1"; attestation_create_git_snapshot "$2" https://example.invalid/rtk.git "$3"' \
+  _ "$attestation_helper" "$rtk_source" "$rtk_source_commit"
+[[ ! -e "$test_root/path-git-reached" ]] || { echo 'PATH-resolved Git was used during attestation.' >&2; exit 1; }
+
+git -C "$rtk_source" config core.filemode false
+chmod 0755 "$rtk_source/README"
+if attestation_create_git_snapshot "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  echo 'Executable-mode tamper hidden by core.filemode=false.' >&2
+  exit 1
+fi
+chmod 0644 "$rtk_source/README"
+git -C "$rtk_source" config --unset core.filemode
+
+cargo_install_marker="$test_root/cargo-install-reached"
+cat > "$HOME/.cargo/bin/cargo" <<EOF
+#!/usr/bin/env bash
+: > "$cargo_install_marker"
+EOF
+chmod 0755 "$HOME/.cargo/bin/cargo"
 install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
 [[ -f "$cargo_install_marker" ]] || { echo 'Clean RTK source did not reach the Cargo seam.' >&2; exit 1; }
+
+# Cargo receives only the immutable committed-blob snapshot. The fake Cargo
+# mutates the live checkout at invocation; the observed source must remain the
+# locked bytes and the install must still complete.
+cargo_snapshot_observed="$test_root/cargo-snapshot-observed"
+path_cargo_marker="$test_root/path-cargo-reached"
+cat > "$HOME/.cargo/bin/cargo" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+snapshot_path=''
+while [[ \$# -gt 0 ]]; do
+  if [[ \$1 == --path ]]; then snapshot_path=\$2; shift 2; else shift; fi
+done
+cat "\$snapshot_path/README" > "$cargo_snapshot_observed"
+printf 'validation-to-cargo race\n' > "$rtk_source/README"
+: > "$cargo_install_marker"
+EOF
+chmod 0755 "$HOME/.cargo/bin/cargo"
+PATH="$fake_git_bin:$HOME/.local/fake-cargo:/usr/bin:/bin" install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+[[ "$(< "$cargo_snapshot_observed")" == 'locked source' ]] || {
+  echo 'Cargo consumed the live checkout instead of the committed snapshot.' >&2
+  exit 1
+}
+[[ "$(< "$rtk_source/README")" == 'validation-to-cargo race' ]] || exit 1
+printf 'locked source\n' > "$rtk_source/README"
+chmod 0644 "$rtk_source/README"
+mkdir -p "$HOME/.local/fake-cargo"
+cat > "$HOME/.local/fake-cargo/cargo" <<EOF
+#!/usr/bin/env bash
+: > "$path_cargo_marker"
+exit 99
+EOF
+chmod 0755 "$HOME/.local/fake-cargo/cargo"
+if PATH="$fake_git_bin:$HOME/.local/fake-cargo:/usr/bin:/bin" install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
+  :
+fi
+[[ ! -e "$path_cargo_marker" ]] || { echo 'PATH-resolved Cargo was used.' >&2; exit 1; }
 
 expect_rtk_install_rejected() {
   local label="$1"
@@ -104,6 +226,131 @@ skip_flag_after="$(git -C "$rtk_source" ls-files -v -- README)"
 }
 git -C "$rtk_source" update-index --no-skip-worktree README
 git -C "$rtk_source" checkout -- README
+
+# Unsupported checkout layouts are rejected before the Cargo seam.  These
+# fixtures cover filesystem-only inputs as well as Git metadata/layout modes
+# that ordinary status or ignore-aware predicates can miss.
+mkdir "$rtk_source/empty-directory"
+expect_rtk_install_rejected 'Empty directory in RTK source'
+rmdir "$rtk_source/empty-directory"
+
+ln -s README "$rtk_source/symlink-input"
+expect_rtk_install_rejected 'Symlink in RTK source'
+rm -- "$rtk_source/symlink-input"
+
+mkfifo "$rtk_source/fifo-input"
+expect_rtk_install_rejected 'FIFO in RTK source'
+rm -- "$rtk_source/fifo-input"
+
+mkdir "$rtk_source/nested-repository"
+git -C "$rtk_source/nested-repository" init -q
+expect_rtk_install_rejected 'Nested repository in RTK source'
+rm -rf -- "$rtk_source/nested-repository"
+
+git -C "$rtk_source" config core.sparseCheckout true
+expect_rtk_install_rejected 'Sparse checkout metadata'
+git -C "$rtk_source" config --unset core.sparseCheckout
+git -C "$rtk_source" config index.sparse true
+expect_rtk_install_rejected 'Sparse index metadata'
+git -C "$rtk_source" config --unset index.sparse
+
+: > "$rtk_source/.git/shallow"
+expect_rtk_install_rejected 'Shallow repository metadata'
+rm -- "$rtk_source/.git/shallow"
+
+printf '%s\n' "$test_root/external-objects" > "$rtk_source/.git/objects/info/alternates"
+expect_rtk_install_rejected 'External Git alternates'
+rm -- "$rtk_source/.git/objects/info/alternates"
+
+git -C "$rtk_source" config remote.origin.promisor true
+expect_rtk_install_rejected 'Partial clone promisor configuration'
+git -C "$rtk_source" config --unset remote.origin.promisor
+git -C "$rtk_source" config extensions.partialClone origin
+expect_rtk_install_rejected 'Partial clone extension'
+git -C "$rtk_source" config --unset extensions.partialClone
+
+# A committed submodule is rejected from the tree before any worktree or
+# Cargo operation can observe it.
+submodule_child="$test_root/submodule-child"
+submodule_source="$test_root/submodule-source"
+mkdir -p "$submodule_child" "$submodule_source"
+git -C "$submodule_child" init -q
+git -C "$submodule_child" config user.email fixture@example.invalid
+git -C "$submodule_child" config user.name fixture
+printf 'submodule\n' > "$submodule_child/README"
+git -C "$submodule_child" add README
+git -C "$submodule_child" commit -qm 'submodule fixture'
+git -C "$submodule_source" init -q
+git -C "$submodule_source" config user.email fixture@example.invalid
+git -C "$submodule_source" config user.name fixture
+printf 'parent\n' > "$submodule_source/README"
+git -C "$submodule_source" add README
+git -C "$submodule_source" commit -qm 'submodule parent fixture'
+git -C "$submodule_source" remote add origin https://example.invalid/rtk.git
+git -C "$submodule_source" -c protocol.file.allow=always submodule add -q "$submodule_child" nested-submodule
+git -C "$submodule_source" commit -qm 'add submodule fixture'
+submodule_commit="$(git -C "$submodule_source" rev-parse HEAD)"
+rm -f -- "$cargo_install_marker"
+if install_rtk_from_source "$submodule_source" https://example.invalid/rtk.git "$submodule_commit"; then
+  echo 'Committed submodule was accepted.' >&2
+  exit 1
+fi
+[[ ! -e "$cargo_install_marker" ]] || { echo 'Submodule fixture reached the Cargo seam.' >&2; exit 1; }
+
+# An unmerged index must be rejected even when HEAD and the expected commit
+# are otherwise correct.
+conflict_source="$test_root/unmerged-source"
+mkdir -p "$conflict_source"
+git -C "$conflict_source" init -q
+git -C "$conflict_source" config user.email fixture@example.invalid
+git -C "$conflict_source" config user.name fixture
+printf 'base\n' > "$conflict_source/README"
+git -C "$conflict_source" add README
+git -C "$conflict_source" commit -qm 'unmerged base fixture'
+git -C "$conflict_source" remote add origin https://example.invalid/rtk.git
+conflict_base="$(git -C "$conflict_source" rev-parse HEAD)"
+git -C "$conflict_source" checkout -qb conflict-left
+printf 'left\n' > "$conflict_source/README"
+git -C "$conflict_source" commit -qam 'left conflict fixture'
+git -C "$conflict_source" checkout -qb conflict-right "$conflict_base"
+printf 'right\n' > "$conflict_source/README"
+git -C "$conflict_source" commit -qam 'right conflict fixture'
+conflict_commit="$(git -C "$conflict_source" rev-parse HEAD)"
+set +e
+git -C "$conflict_source" merge conflict-left >/dev/null 2>&1
+merge_status=$?
+set -e
+(( merge_status != 0 )) || { echo 'Unmerged fixture did not produce a conflict.' >&2; exit 1; }
+rm -f -- "$cargo_install_marker"
+if install_rtk_from_source "$conflict_source" https://example.invalid/rtk.git "$conflict_commit"; then
+  echo 'Unmerged index was accepted.' >&2
+  exit 1
+fi
+[[ ! -e "$cargo_install_marker" ]] || { echo 'Unmerged fixture reached the Cargo seam.' >&2; exit 1; }
+git -C "$conflict_source" merge --abort
+
+# A tree that names an unavailable blob is rejected before the builder can
+# consume a partially available object database.
+missing_source="$test_root/missing-object-source"
+mkdir -p "$missing_source"
+git -C "$missing_source" init -q
+git -C "$missing_source" config user.email fixture@example.invalid
+git -C "$missing_source" config user.name fixture
+printf 'missing object\n' > "$missing_source/README"
+git -C "$missing_source" add README
+git -C "$missing_source" commit -qm 'missing object fixture'
+git -C "$missing_source" remote add origin https://example.invalid/rtk.git
+missing_commit="$(git -C "$missing_source" rev-parse HEAD)"
+missing_oid="$(git -C "$missing_source" rev-parse "$missing_commit:README")"
+missing_object="$missing_source/.git/objects/${missing_oid:0:2}/${missing_oid:2}"
+[[ -f "$missing_object" ]] || { echo 'Missing-object fixture was not loose.' >&2; exit 1; }
+rm -- "$missing_object"
+rm -f -- "$cargo_install_marker"
+if install_rtk_from_source "$missing_source" https://example.invalid/rtk.git "$missing_commit"; then
+  echo 'Missing Git object was accepted.' >&2
+  exit 1
+fi
+[[ ! -e "$cargo_install_marker" ]] || { echo 'Missing-object fixture reached the Cargo seam.' >&2; exit 1; }
 
 # These callers intentionally use the generic fd/anchor/parent names that
 # collided with fence_open_parent's dynamic-scope locals on the starting

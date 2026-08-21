@@ -76,6 +76,7 @@ git -C "$rtk_source_root" init -q
 git -C "$rtk_source_root" config user.email fixture@example.invalid
 git -C "$rtk_source_root" config user.name fixture
 printf 'locked RTK source\n' > "$rtk_source_root/README"
+chmod 0644 "$rtk_source_root/README"
 git -C "$rtk_source_root" add README
 git -C "$rtk_source_root" commit -qm 'fixture RTK source'
 rtk_commit="$(git -C "$rtk_source_root" rev-parse HEAD)"
@@ -83,9 +84,14 @@ git -C "$rtk_source_root" remote add origin "$RTK_REPO_URL"
 
 mkdir -p "$source_root/config" "$source_root/scripts/ubuntu"
 cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$source_root/scripts/ubuntu/receipt-authority.sh"
+cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$source_root/scripts/ubuntu/source-attestation.sh"
 cp "$repo_root/config/receipt-authority-role-allowlist.txt" "$source_root/config/receipt-authority-role-allowlist.txt"
 cp "$repo_root/config/payload-manifest.sha256" "$source_root/config/payload-manifest.sha256"
 cp "$repo_root/config/ubuntu-toolchain.lock" "$source_root/config/ubuntu-toolchain.lock"
+chmod 0644 \
+  "$source_root/config/receipt-authority-role-allowlist.txt" \
+  "$source_root/config/payload-manifest.sha256" \
+  "$source_root/config/ubuntu-toolchain.lock"
 sed -i "s/^RTK_REF=.*/RTK_REF=$rtk_commit/" "$source_root/config/ubuntu-toolchain.lock"
 git -C "$source_root" init -q
 git -C "$source_root" config user.email fixture@example.invalid
@@ -127,6 +133,72 @@ run_authority --check
 cp "$authority_path" "$test_root/authority.good"
 cp "$receipt_path" "$test_root/receipt.good"
 
+# Root-side source proof rejects ignored and assume-unchanged modifications
+# without consulting ordinary status or mutating the caller index.
+printf 'ignored-source\n' >> "$source_root/.git/info/exclude"
+printf 'ignored source input\n' > "$source_root/ignored-source-input"
+expect_failure 'ignored bootstrap source-root input' run_authority --check
+rm -- "$source_root/ignored-source-input"
+git -C "$source_root" update-index --assume-unchanged scripts/ubuntu/receipt-authority.sh
+source_flag_before="$(git -C "$source_root" ls-files -v -- scripts/ubuntu/receipt-authority.sh)"
+printf '# source-root assume-unchanged tamper\n' >> "$source_root/scripts/ubuntu/receipt-authority.sh"
+expect_failure 'assume-unchanged bootstrap source-root script' run_authority --check
+source_flag_after="$(git -C "$source_root" ls-files -v -- scripts/ubuntu/receipt-authority.sh)"
+[[ "$source_flag_after" == "$source_flag_before" ]] || {
+  echo 'Bootstrap source-root assume-unchanged flag was mutated.' >&2
+  exit 1
+}
+git -C "$source_root" update-index --no-assume-unchanged scripts/ubuntu/receipt-authority.sh
+git -C "$source_root" checkout -- scripts/ubuntu/receipt-authority.sh
+chmod 0755 "$source_root/scripts/ubuntu/receipt-authority.sh"
+
+# A repository-local filter and a forged Git environment must be rejected
+# before any clean/smudge command can execute.
+source_filter_marker="$test_root/source-filter-marker"
+git -C "$source_root" config filter.attacker.clean "printf SOURCE-FILTER-RAN > '$source_filter_marker'"
+printf '*.txt filter=attacker\n' > "$source_root/.gitattributes"
+expect_failure 'source-root repository filter' run_authority --check
+[[ ! -e "$source_filter_marker" ]] || { echo 'Source-root filter executed.' >&2; exit 1; }
+git -C "$source_root" config --unset-all filter.attacker.clean
+rm -- "$source_root/.gitattributes"
+if (export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.filemode GIT_CONFIG_VALUE_0=false; run_authority --check >/dev/null 2>&1); then
+  echo 'Receipt authority accepted GIT_CONFIG_COUNT override.' >&2
+  exit 1
+fi
+if (export GIT_COMMON_DIR="$test_root/external-common"; run_authority --check >/dev/null 2>&1); then
+  echo 'Receipt authority accepted GIT_COMMON_DIR override.' >&2
+  exit 1
+fi
+
+# The receipt is built from the same stable RTK snapshot after the live
+# checkout is changed at the validation-to-receipt seam.
+receipt_race_ready="$test_root/receipt-race-ready"
+receipt_race_continue="$test_root/receipt-race-continue"
+(
+  export HERDR_RECEIPT_TEST_PAUSE_PHASE=after-rtk-snapshot
+  export HERDR_RECEIPT_TEST_READY_FILE="$receipt_race_ready"
+  export HERDR_RECEIPT_TEST_CONTINUE_FILE="$receipt_race_continue"
+  run_authority --install
+) > "$test_root/receipt-race-output" 2>&1 &
+receipt_race_pid=$!
+while [[ ! -e "$receipt_race_ready" ]]; do sleep 0.01; done
+printf 'receipt validation race\n' > "$rtk_source_root/README"
+: > "$receipt_race_continue"
+wait "$receipt_race_pid"
+[[ "$(jq -r '.clean' "$receipt_path")" == true ]] || exit 1
+[[ "$(jq -r '.rtk_source.checkout_path' "$receipt_path")" != "$rtk_source_root" ]] || {
+  echo 'Receipt retained the mutable RTK checkout path.' >&2
+  exit 1
+}
+printf 'locked RTK source\n' > "$rtk_source_root/README"
+chmod 0644 "$rtk_source_root/README"
+
+# The race run intentionally produced a new content-bound receipt pair.  Make
+# that pair the baseline for the remaining reconciliation probes.
+run_authority --check
+cp "$authority_path" "$test_root/authority.good"
+cp "$receipt_path" "$test_root/receipt.good"
+
 jq '.receipt_sha256 = ("0" * 64)' "$authority_path" > "$test_root/authority.tampered"
 mv -- "$test_root/authority.tampered" "$authority_path"
 expect_failure 'tampered authority hash' run_authority --check
@@ -141,11 +213,13 @@ cp "$test_root/rtk.good" "$fixture_home/.cargo/bin/rtk"
 printf 'tampered\n' >> "$rtk_source_root/README"
 expect_failure 'dirty RTK source checkout' run_authority --check
 git -C "$rtk_source_root" checkout -- README
+chmod 0644 "$rtk_source_root/README"
 printf 'staged tamper\n' >> "$rtk_source_root/README"
 git -C "$rtk_source_root" add README
 expect_failure 'staged RTK source checkout' run_authority --check
 git -C "$rtk_source_root" reset -q HEAD -- README
 git -C "$rtk_source_root" checkout -- README
+chmod 0644 "$rtk_source_root/README"
 printf 'untracked tamper\n' > "$rtk_source_root/untracked"
 expect_failure 'untracked RTK source checkout' run_authority --check
 rm -- "$rtk_source_root/untracked"
@@ -170,6 +244,7 @@ assume_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
 }
 git -C "$rtk_source_root" update-index --no-assume-unchanged README
 git -C "$rtk_source_root" checkout -- README
+chmod 0644 "$rtk_source_root/README"
 
 git -C "$rtk_source_root" update-index --skip-worktree README
 skip_flag_before="$(git -C "$rtk_source_root" ls-files -v -- README)"
@@ -182,6 +257,7 @@ skip_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
 }
 git -C "$rtk_source_root" update-index --no-skip-worktree README
 git -C "$rtk_source_root" checkout -- README
+chmod 0644 "$rtk_source_root/README"
 run_authority --check
 [[ "$(jq -r '.clean' "$receipt_path")" == true ]] || exit 1
 

@@ -4,6 +4,19 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
+
+# verify.sh sources the attested bootstrap functions, so run it from a
+# disposable clean source fixture rather than treating the mutable test
+# checkout as an authority input.
+source_fixture="$test_root/source"
+cp -a -- "$repo_root/." "$source_fixture/"
+rm -rf -- "$source_fixture/.git"
+git -C "$source_fixture" init -q
+git -C "$source_fixture" config user.email fixture@example.invalid
+git -C "$source_fixture" config user.name fixture
+git -C "$source_fixture" add -f .
+git -C "$source_fixture" commit -qm 'clean verify fixture'
+repo_root="$source_fixture"
 export HOME="$test_root/home"
 # shellcheck disable=SC1091
 source "$repo_root/config/ubuntu-toolchain.lock"

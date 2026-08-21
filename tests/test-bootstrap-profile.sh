@@ -4,6 +4,20 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
+
+# Bootstrap now attests the complete committed source before exposing its
+# sourced functions.  Exercise the profile seam from a disposable clean
+# source fixture so this test remains runnable from a developer worktree with
+# unrelated edits.
+source_fixture="$test_root/source"
+cp -a -- "$repo_root/." "$source_fixture/"
+rm -rf -- "$source_fixture/.git"
+git -C "$source_fixture" init -q
+git -C "$source_fixture" config user.email fixture@example.invalid
+git -C "$source_fixture" config user.name fixture
+git -C "$source_fixture" add -f .
+git -C "$source_fixture" commit -qm 'clean profile fixture'
+repo_root="$source_fixture"
 export HOME="$test_root/home"
 mkdir -p "$HOME/.config/herdr-workstation"
 printf 'export PATH="$HOME/.local/bin:$PATH"\n' > "$HOME/.config/herdr-workstation/profile.sh"
