@@ -39,26 +39,71 @@ git -C "$rtk_source" commit -qm 'fixture source'
 rtk_source_commit="$(git -C "$rtk_source" rev-parse HEAD)"
 git -C "$rtk_source" remote add origin https://example.invalid/rtk.git
 validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+
+cargo_install_marker="$test_root/cargo-install-reached"
+cargo() {
+  : > "$cargo_install_marker"
+}
+install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+[[ -f "$cargo_install_marker" ]] || { echo 'Clean RTK source did not reach the Cargo seam.' >&2; exit 1; }
+
+expect_rtk_install_rejected() {
+  local label="$1"
+  rm -f -- "$cargo_install_marker"
+  if install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit" >/dev/null 2>&1; then
+    echo "$label was accepted before the Cargo seam." >&2
+    exit 1
+  fi
+  [[ ! -e "$cargo_install_marker" ]] || {
+    echo "$label reached the Cargo seam." >&2
+    exit 1
+  }
+}
+
 printf 'dirty\n' >> "$rtk_source/README"
-if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
-  echo 'Dirty RTK source was accepted.' >&2
-  exit 1
-fi
+expect_rtk_install_rejected 'Dirty RTK source'
 git -C "$rtk_source" checkout -- README
 printf 'staged\n' >> "$rtk_source/README"
 git -C "$rtk_source" add README
-if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
-  echo 'Staged RTK source was accepted.' >&2
-  exit 1
-fi
+expect_rtk_install_rejected 'Staged RTK source'
 git -C "$rtk_source" reset -q HEAD -- README
 git -C "$rtk_source" checkout -- README
 printf 'untracked\n' > "$rtk_source/untracked"
-if validate_rtk_source_checkout "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"; then
-  echo 'Untracked RTK source was accepted.' >&2
-  exit 1
-fi
+expect_rtk_install_rejected 'Untracked RTK source'
 rm -- "$rtk_source/untracked"
+
+printf 'ignored-input\n' >> "$rtk_source/.git/info/exclude"
+printf 'ignored build input\n' > "$rtk_source/ignored-input"
+[[ -z "$(git -C "$rtk_source" status --porcelain --untracked-files=all)" ]] || {
+  echo 'Ignored RTK fixture is not hidden from ordinary status.' >&2
+  exit 1
+}
+expect_rtk_install_rejected 'Ignored untracked RTK source'
+rm -- "$rtk_source/ignored-input"
+
+git -C "$rtk_source" update-index --assume-unchanged README
+assume_flag_before="$(git -C "$rtk_source" ls-files -v -- README)"
+printf 'assume-unchanged attacker\n' > "$rtk_source/README"
+expect_rtk_install_rejected 'Assume-unchanged RTK source'
+assume_flag_after="$(git -C "$rtk_source" ls-files -v -- README)"
+[[ "$assume_flag_after" == "$assume_flag_before" ]] || {
+  echo 'RTK assume-unchanged index flag was mutated.' >&2
+  exit 1
+}
+git -C "$rtk_source" update-index --no-assume-unchanged README
+git -C "$rtk_source" checkout -- README
+
+git -C "$rtk_source" update-index --skip-worktree README
+skip_flag_before="$(git -C "$rtk_source" ls-files -v -- README)"
+printf 'skip-worktree attacker\n' > "$rtk_source/README"
+expect_rtk_install_rejected 'Skip-worktree RTK source'
+skip_flag_after="$(git -C "$rtk_source" ls-files -v -- README)"
+[[ "$skip_flag_after" == "$skip_flag_before" ]] || {
+  echo 'RTK skip-worktree index flag was mutated.' >&2
+  exit 1
+}
+git -C "$rtk_source" update-index --no-skip-worktree README
+git -C "$rtk_source" checkout -- README
 
 # These callers intentionally use the generic fd/anchor/parent names that
 # collided with fence_open_parent's dynamic-scope locals on the starting

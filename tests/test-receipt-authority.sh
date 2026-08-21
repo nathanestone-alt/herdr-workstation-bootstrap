@@ -131,6 +131,7 @@ jq '.receipt_sha256 = ("0" * 64)' "$authority_path" > "$test_root/authority.tamp
 mv -- "$test_root/authority.tampered" "$authority_path"
 expect_failure 'tampered authority hash' run_authority --check
 cp "$test_root/authority.good" "$authority_path"
+chmod 0644 "$authority_path"
 
 cp "$fixture_home/.cargo/bin/rtk" "$test_root/rtk.good"
 printf 'tampered\n' >> "$fixture_home/.cargo/bin/rtk"
@@ -148,6 +149,41 @@ git -C "$rtk_source_root" checkout -- README
 printf 'untracked tamper\n' > "$rtk_source_root/untracked"
 expect_failure 'untracked RTK source checkout' run_authority --check
 rm -- "$rtk_source_root/untracked"
+
+printf 'ignored-input\n' >> "$rtk_source_root/.git/info/exclude"
+printf 'ignored RTK build input\n' > "$rtk_source_root/ignored-input"
+[[ -z "$(git -C "$rtk_source_root" status --porcelain --untracked-files=all)" ]] || {
+  echo 'Ignored RTK fixture is not hidden from ordinary status.' >&2
+  exit 1
+}
+expect_failure 'ignored untracked RTK source checkout' run_authority --check
+rm -- "$rtk_source_root/ignored-input"
+
+git -C "$rtk_source_root" update-index --assume-unchanged README
+assume_flag_before="$(git -C "$rtk_source_root" ls-files -v -- README)"
+printf 'assume-unchanged tamper\n' > "$rtk_source_root/README"
+expect_failure 'assume-unchanged RTK source checkout' run_authority --check
+assume_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
+[[ "$assume_flag_after" == "$assume_flag_before" ]] || {
+  echo 'RTK assume-unchanged index flag was mutated.' >&2
+  exit 1
+}
+git -C "$rtk_source_root" update-index --no-assume-unchanged README
+git -C "$rtk_source_root" checkout -- README
+
+git -C "$rtk_source_root" update-index --skip-worktree README
+skip_flag_before="$(git -C "$rtk_source_root" ls-files -v -- README)"
+printf 'skip-worktree tamper\n' > "$rtk_source_root/README"
+expect_failure 'skip-worktree RTK source checkout' run_authority --check
+skip_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
+[[ "$skip_flag_after" == "$skip_flag_before" ]] || {
+  echo 'RTK skip-worktree index flag was mutated.' >&2
+  exit 1
+}
+git -C "$rtk_source_root" update-index --no-skip-worktree README
+git -C "$rtk_source_root" checkout -- README
+run_authority --check
+[[ "$(jq -r '.clean' "$receipt_path")" == true ]] || exit 1
 
 git -C "$rtk_source_root" remote set-url origin https://example.invalid/rtk.git
 expect_failure 'RTK source URL mismatch' run_authority --check

@@ -59,41 +59,197 @@ validate_cargo_roots() {
 }
 
 validate_rtk_source_checkout() {
+  (
+    local source_path="${1:-}"
+    local expected_url="${2:-}"
+    local expected_ref="${3:-}"
+    local actual_url
+    local actual_ref
+    local canonical_source_path
+    local git_toplevel
+    local git_dir
+    local sparse_checkout
+    local sparse_index
+    local partial_clone
+    local nested_git
+    local git_metadata_entry
+    local unsupported_entry
+    local temporary_index=''
+    local untracked_file=''
+    local empty_directories_file=''
+    local tree_file=''
+
+    cleanup_rtk_attestation() {
+      [[ -z "$temporary_index" ]] || rm -f -- "$temporary_index" || true
+      [[ -z "$untracked_file" ]] || rm -f -- "$untracked_file" || true
+      [[ -z "$empty_directories_file" ]] || rm -f -- "$empty_directories_file" || true
+      [[ -z "$tree_file" ]] || rm -f -- "$tree_file" || true
+    }
+    trap cleanup_rtk_attestation EXIT
+
+    [[ -n "$source_path" ]] || {
+      echo 'RTK source checkout path is empty.' >&2
+      exit 1
+    }
+    [[ -d "$source_path/.git" && ! -L "$source_path" && ! -L "$source_path/.git" ]] || {
+      echo "RTK source checkout is missing or unsafe: $source_path" >&2
+      exit 1
+    }
+
+    git_at_rtk() {
+      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        git -C "$source_path" "$@"
+    }
+    git_at_rtk_index() {
+      local index_path="$1"
+      shift
+      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE="$index_path" \
+        git -C "$source_path" "$@"
+    }
+
+    canonical_source_path="$(realpath -e -- "$source_path" 2>/dev/null || true)"
+    [[ -n "$canonical_source_path" && -d "$canonical_source_path" ]] || {
+      echo "RTK source checkout cannot be canonically resolved: $source_path" >&2
+      exit 1
+    }
+    git_toplevel="$(git_at_rtk rev-parse --show-toplevel 2>/dev/null || true)"
+    git_toplevel="$(realpath -e -- "$git_toplevel" 2>/dev/null || true)"
+    [[ "$git_toplevel" == "$canonical_source_path" ]] || {
+      echo "RTK source checkout Git root is not canonical: $source_path" >&2
+      exit 1
+    }
+    git_dir="$(git_at_rtk rev-parse --absolute-git-dir 2>/dev/null || true)"
+    git_dir="$(realpath -e -- "$git_dir" 2>/dev/null || true)"
+    [[ "$git_dir" == "$canonical_source_path/.git" ]] || {
+      echo "RTK source checkout Git metadata is not local to the checkout: $source_path" >&2
+      exit 1
+    }
+    git_metadata_entry="$(find -P "$git_dir" -mindepth 1 -type l -print -quit 2>/dev/null || true)"
+    [[ -z "$git_metadata_entry" ]] || {
+      echo "RTK source checkout Git metadata contains a symlink: $git_metadata_entry" >&2
+      exit 1
+    }
+    [[ ! -e "$git_dir/objects/info/alternates" ]] || {
+      echo "RTK source checkout uses an external Git object store: $source_path" >&2
+      exit 1
+    }
+    [[ "$(git_at_rtk rev-parse --is-inside-work-tree 2>/dev/null || true)" == true ]] || {
+      echo "RTK source checkout is not a worktree: $source_path" >&2
+      exit 1
+    }
+    [[ "$(git_at_rtk rev-parse --is-bare-repository 2>/dev/null || true)" == false ]] || {
+      echo "RTK source checkout is bare: $source_path" >&2
+      exit 1
+    }
+    [[ "$(git_at_rtk rev-parse --is-shallow-repository 2>/dev/null || true)" == false ]] || {
+      echo "RTK source checkout is shallow or incomplete: $source_path" >&2
+      exit 1
+    }
+    sparse_checkout="$(git_at_rtk config --bool --get core.sparseCheckout 2>/dev/null || true)"
+    [[ "$sparse_checkout" != true ]] || {
+      echo "RTK source checkout uses sparse checkout: $source_path" >&2
+      exit 1
+    }
+    sparse_index="$(git_at_rtk config --bool --get index.sparse 2>/dev/null || true)"
+    [[ "$sparse_index" != true ]] || {
+      echo "RTK source checkout uses a sparse index: $source_path" >&2
+      exit 1
+    }
+    partial_clone="$(git_at_rtk config --get extensions.partialClone 2>/dev/null || true)"
+    [[ -z "$partial_clone" ]] || {
+      echo "RTK source checkout is a partial clone: $source_path" >&2
+      exit 1
+    }
+    partial_clone="$(git_at_rtk config --get-regexp '^remote\..*\.(promisor|partialclonefilter)$' 2>/dev/null || true)"
+    [[ -z "$partial_clone" ]] || {
+      echo "RTK source checkout has partial-clone metadata: $source_path" >&2
+      exit 1
+    }
+    nested_git="$(find -P "$canonical_source_path" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
+    [[ -z "$nested_git" ]] || {
+      echo "RTK source checkout contains an unexpected nested Git repository: $nested_git" >&2
+      exit 1
+    }
+    if ! unsupported_entry="$(find -P "$canonical_source_path" -mindepth 1 \
+      \( -path "$canonical_source_path/.git" -o -path "$canonical_source_path/.git/*" \) -prune -o \
+      \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit 2>/dev/null)"; then
+      echo "RTK source checkout filesystem walk failed: $source_path" >&2
+      exit 1
+    fi
+    [[ -z "$unsupported_entry" ]] || {
+      echo "RTK source checkout contains an unsupported filesystem entry: $unsupported_entry" >&2
+      exit 1
+    }
+
+    actual_url="$(git_at_rtk remote get-url --all origin 2>/dev/null || true)"
+    if [[ -n "$expected_url" && "$actual_url" != "$expected_url" ]]; then
+      echo "RTK source checkout origin differs from the lock: $actual_url" >&2
+      exit 1
+    fi
+    actual_ref="$(git_at_rtk rev-parse --verify HEAD^{commit} 2>/dev/null || true)"
+    [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
+      echo "RTK source checkout HEAD is not a full commit: $source_path" >&2
+      exit 1
+    }
+    if [[ -n "$expected_ref" && "$actual_ref" != "$expected_ref" ]]; then
+      echo "RTK source checkout does not match the locked commit: $actual_ref" >&2
+      exit 1
+    fi
+
+    tree_file="$(mktemp)"
+    if ! git_at_rtk ls-tree --full-tree -r "$actual_ref" > "$tree_file"; then
+      echo "RTK source checkout tree cannot be completely read: $source_path" >&2
+      exit 1
+    fi
+    if awk '$1 == "160000" { found=1 } END { exit(found ? 0 : 1) }' "$tree_file"; then
+      echo "RTK source checkout contains an unexpected submodule: $source_path" >&2
+      exit 1
+    fi
+
+    if ! git_at_rtk diff --cached --quiet --no-ext-diff --no-textconv "$actual_ref" --; then
+      echo "RTK source checkout has staged or unmerged changes: $source_path" >&2
+      exit 1
+    fi
+    temporary_index="$(mktemp)"
+    rm -f -- "$temporary_index"
+    if ! git_at_rtk_index "$temporary_index" read-tree "$actual_ref"; then
+      echo "RTK source checkout cannot create an independent index: $source_path" >&2
+      exit 1
+    fi
+    if ! git_at_rtk_index "$temporary_index" diff --quiet --no-ext-diff --no-textconv --ignore-submodules=none --; then
+      echo "RTK source checkout content differs from locked HEAD: $source_path" >&2
+      exit 1
+    fi
+
+    untracked_file="$(mktemp)"
+    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --no-empty-directory -z > "$untracked_file"; then
+      echo "RTK source checkout untracked-path attestation failed: $source_path" >&2
+      exit 1
+    fi
+    [[ ! -s "$untracked_file" ]] || {
+      echo "RTK source checkout has ordinary or ignored untracked paths: $source_path" >&2
+      exit 1
+    }
+    empty_directories_file="$(mktemp)"
+    if ! git_at_rtk_index "$temporary_index" ls-files --others --exclude-per-directory=/dev/null --directory --empty-directory -z > "$empty_directories_file"; then
+      echo "RTK source checkout untracked-directory attestation failed: $source_path" >&2
+      exit 1
+    fi
+    [[ ! -s "$empty_directories_file" ]] || {
+      echo "RTK source checkout has untracked directories: $source_path" >&2
+      exit 1
+    }
+  )
+}
+
+install_rtk_from_source() {
   local source_path="$1"
-  local expected_url="${2:-}"
-  local expected_ref="${3:-}"
-  local actual_url
-  local actual_ref
-  [[ -d "$source_path/.git" && ! -L "$source_path" ]] || {
-    echo "RTK source checkout is missing or unsafe: $source_path" >&2
-    return 1
-  }
-  if ! git -C "$source_path" diff --quiet; then
-    echo "RTK source checkout has unstaged changes: $source_path" >&2
-    return 1
-  fi
-  if ! git -C "$source_path" diff --cached --quiet; then
-    echo "RTK source checkout has staged changes: $source_path" >&2
-    return 1
-  fi
-  if [[ -n "$(git -C "$source_path" status --porcelain --untracked-files=all)" ]]; then
-    echo "RTK source checkout has untracked changes: $source_path" >&2
-    return 1
-  fi
-  actual_url="$(git -C "$source_path" remote get-url origin 2>/dev/null || true)"
-  if [[ -n "$expected_url" && "$actual_url" != "$expected_url" ]]; then
-    echo "RTK source checkout origin differs from the lock: $actual_url" >&2
-    return 1
-  fi
-  actual_ref="$(git -C "$source_path" rev-parse HEAD 2>/dev/null || true)"
-  [[ "$actual_ref" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "RTK source checkout HEAD is not a full commit: $source_path" >&2
-    return 1
-  }
-  if [[ -n "$expected_ref" && "$actual_ref" != "$expected_ref" ]]; then
-    echo "RTK source checkout does not match the locked commit: $actual_ref" >&2
-    return 1
-  fi
+  local expected_url="$2"
+  local expected_ref="$3"
+  validate_rtk_source_checkout "$source_path" "$expected_url" "$expected_ref" || return 1
+  cargo install --path "$source_path" --locked --force
 }
 
 validate_user_home() {
@@ -1063,8 +1219,7 @@ install_tools() {
   [[ "$(git -C "$src_anchor/rtk" rev-parse HEAD)" == "$RTK_REF" ]] || {
     echo 'RTK checkout does not match the locked commit.' >&2; exit 24;
   }
-  validate_rtk_source_checkout "$src_anchor/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
-  cargo install --path "$src_anchor/rtk" --locked --force
+  install_rtk_from_source "$src_anchor/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
   for executable in rustup cargo rustc; do
     executable_path="$(command -v "$executable")"
     fence_replace_link "$executable_path" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
