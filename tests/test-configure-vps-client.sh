@@ -69,6 +69,12 @@ fi
 EOF
 chmod +x "$fake_bin/ssh-keyscan" "$fake_bin/ssh-keygen" "$fake_bin/install"
 export PATH="$fake_bin:$PATH"
+# Keep the fixture independent of host/container ownership on /etc/ssh/ssh_config.
+# Later probes still replace this with explicit hostile system configuration.
+system_ssh_config_fixture="$test_root/system-ssh-config-default"
+: > "$system_ssh_config_fixture"
+chmod 0644 "$system_ssh_config_fixture"
+export HERDR_SYSTEM_SSH_CONFIG="$system_ssh_config_fixture"
 
 fingerprint='SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 script="$repo_root/scripts/ubuntu/configure-vps-client.sh"

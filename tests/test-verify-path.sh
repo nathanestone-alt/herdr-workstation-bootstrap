@@ -10,6 +10,7 @@ trap 'rm -rf "$test_root"' EXIT
 # checkout as an authority input.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+/usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
 git -C "$source_fixture" config user.email fixture@example.invalid
@@ -245,7 +246,7 @@ expect_unmanaged_managed_path_failure() {
   local command_name="$1"
   local managed_path="$HOME/.local/bin/$command_name"
   local managed_backup="$test_root/managed-$command_name"
-  local unmanaged_bin="$test_root/unmanaged-$command_name"
+  local unmanaged_bin="$HOME/.cargo/bin"
   local unmanaged_path="$unmanaged_bin/$command_name"
   local output="$test_root/verify-output-unmanaged-$command_name.txt"
   mkdir -p "$unmanaged_bin"

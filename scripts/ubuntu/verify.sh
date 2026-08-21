@@ -1,19 +1,52 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -euo pipefail
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+readonly verify_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH="$verify_trusted_path"
+verify_script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
+repo_root="$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "$verify_script_path")/../..")"
 
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
 [[ -f "$lock_file" ]] || { echo "Missing toolchain lock: $lock_file" >&2; exit 22; }
 # shellcheck disable=SC1091
 source "$repo_root/scripts/ubuntu/bootstrap.sh"
+# Keep the process PATH system-only.  Managed user tools are resolved below
+# through explicitly validated absolute paths instead of a global user-writable
+# PATH prefix.
+export PATH="$verify_trusted_path"
+hash -r
 validate_toolchain_lock || { echo 'Toolchain lock validation failed.' >&2; exit 22; }
+
+verify_home_real="$(/usr/bin/realpath -e -- "$HOME" 2>/dev/null || true)"
+verify_resolve_command() {
+  local name="$1"
+  local candidate
+  local resolved
+  for candidate in "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name"; do
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      resolved="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
+      [[ -n "$verify_home_real" && -f "$resolved" && -x "$resolved" ]] || return 1
+      if path_is_under "$resolved" "$HOME/.local/bin" || path_is_under "$resolved" "$HOME/.cargo" || path_is_under "$resolved" "$HOME/.local/lib/node-v$NODE_VERSION-linux-x64"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      return 1
+    fi
+  done
+ candidate="$(PATH="$verify_trusted_path" command -v "$name" 2>/dev/null || true)"
+ [[ "$candidate" == /* ]] || return 1
+ resolved="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
+  [[ -f "$resolved" && -x "$resolved" ]] || return 1
+  path_is_under "$resolved" /usr/bin || path_is_under "$resolved" /usr/sbin || \
+    path_is_under "$resolved" /bin || path_is_under "$resolved" /sbin || return 1
+  printf '%s\n' "$candidate"
+}
 
 failures=0
 check_command() {
   local name="$1"
-  if command -v "$name" >/dev/null 2>&1; then
-    printf 'PASS command %-10s %s\n' "$name" "$(command -v "$name")"
+  local command_path
+  if command_path="$(verify_resolve_command "$name" 2>/dev/null)"; then
+    printf 'PASS command %-10s %s\n' "$name" "$command_path"
   else
     printf 'FAIL command %-10s missing\n' "$name"
     failures=$((failures + 1))
@@ -38,8 +71,9 @@ check_exact_version() {
   local name="$1"
   local expected="$2"
   local actual
-  if ! command -v "$name" >/dev/null 2>&1; then return; fi
-  if actual="$("$name" --version 2>&1)" && [[ "$actual" == "$expected" ]]; then
+  local command_path
+  if ! command_path="$(verify_resolve_command "$name" 2>/dev/null)"; then return; fi
+  if actual="$("$command_path" --version 2>&1)" && [[ "$actual" == "$expected" ]]; then
     printf 'PASS exact version %-10s %s\n' "$name" "$actual"
   else
     printf 'FAIL exact version %-10s expected %s (got %s)\n' "$name" "$expected" "${actual:-unavailable}"
@@ -50,24 +84,21 @@ check_exact_version() {
 check_exact_version uv "uv $UV_VERSION ($UV_PLATFORM)"
 check_exact_version python3.13 "Python $PYTHON_VERSION"
 
-if command -v uv >/dev/null 2>&1; then
-  uv_path="$(command -v uv)"
+if uv_path="$(verify_resolve_command uv 2>/dev/null)"; then
   [[ "$uv_path" == "$HOME/.local/bin/uv" ]] || { echo "FAIL uv is not managed: $uv_path"; failures=$((failures + 1)); }
 fi
-if command -v python3.13 >/dev/null 2>&1; then
-  python_path="$(command -v python3.13)"
+if python_path="$(verify_resolve_command python3.13 2>/dev/null)"; then
   [[ "$python_path" == "$HOME/.local/bin/python3.13" ]] || { echo "FAIL python3.13 is not managed: $python_path"; failures=$((failures + 1)); }
 fi
-if command -v py >/dev/null 2>&1; then
-  py_path="$(command -v py)"
+if py_path="$(verify_resolve_command py 2>/dev/null)"; then
   [[ "$py_path" == "$HOME/.local/bin/py" ]] || { echo "FAIL py is not managed: $py_path"; failures=$((failures + 1)); }
-  if py_probe="$(py -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")' 2>&1)" && [[ "$py_probe" == "$PYTHON_VERSION|x86_64|linux" ]]; then
+  if py_probe="$("$py_path" -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")' 2>&1)" && [[ "$py_probe" == "$PYTHON_VERSION|x86_64|linux" ]]; then
     echo "PASS py -3.13 selects $py_probe"
   else
     echo "FAIL py -3.13 selected '${py_probe:-unavailable}'"
     failures=$((failures + 1))
   fi
-  if py --list >/dev/null 2>&1; then
+  if "$py_path" --list >/dev/null 2>&1; then
     echo 'FAIL py accepted unsupported --list option'
     failures=$((failures + 1))
   else
@@ -81,13 +112,13 @@ if command -v py >/dev/null 2>&1; then
   fi
 fi
 
-home_real="$(realpath -e -- "$HOME" 2>/dev/null || true)"
+home_real="$verify_home_real"
 check_managed_command_target() {
   local name="$1"
   local expected_path="$2"
   local actual_path
   local resolved_path
-  if ! actual_path="$(command -v "$name" 2>/dev/null)"; then
+  if ! actual_path="$(verify_resolve_command "$name" 2>/dev/null)"; then
     echo "FAIL managed target $name missing (expected $expected_path)"
     failures=$((failures + 1))
     return 1
@@ -97,7 +128,7 @@ check_managed_command_target() {
     failures=$((failures + 1))
     return 1
   fi
-  resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
+  resolved_path="$(/usr/bin/realpath -e -- "$expected_path" 2>/dev/null || true)"
   if path_is_under "$resolved_path" "$home_real"; then
     echo "PASS managed target $name $resolved_path"
   else
@@ -114,7 +145,7 @@ check_managed_node_command_target() {
   if ! check_managed_command_target "$name" "$expected_path"; then
     return 0
   fi
-  resolved_path="$(realpath -e -- "$expected_path" 2>/dev/null || true)"
+  resolved_path="$(/usr/bin/realpath -e -- "$expected_path" 2>/dev/null || true)"
   if path_is_under "$resolved_path" "$node_root"; then
     echo "PASS locked Node target $name $resolved_path"
   else
@@ -133,13 +164,22 @@ for managed_tool in node npm codex claude bun; do
 done
 
 toolchain_receipt="$HOME/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
-lock_sha256="$(sha256sum "$lock_file" | awk '{print $1}')"
+lock_sha256="$(/usr/bin/sha256sum -- "$lock_file" | /usr/bin/gawk '{print $1}')"
 
 record_receipt_command() {
   local key="$1"
   shift
+  local command_name="$1"
+  shift
+  local command_path
   local output
-  if ! output="$("$@" 2>&1)"; then
+  command_path="$(verify_resolve_command "$command_name" 2>/dev/null || true)"
+  if [[ -z "$command_path" ]]; then
+    echo "FAIL receipt runtime probe $key"
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  if ! output="$("$command_path" "$@" 2>&1)"; then
     echo "FAIL receipt runtime probe $key"
     receipt_failures=$((receipt_failures + 1))
     return 1
@@ -155,8 +195,17 @@ record_receipt_command() {
 record_receipt_first_line() {
   local key="$1"
   shift
+  local command_name="$1"
+  shift
+  local command_path
   local output
-  if ! output="$("$@" 2>&1)"; then
+  command_path="$(verify_resolve_command "$command_name" 2>/dev/null || true)"
+  if [[ -z "$command_path" ]]; then
+    echo "FAIL receipt runtime probe $key"
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  if ! output="$("$command_path" "$@" 2>&1)"; then
     echo "FAIL receipt runtime probe $key"
     receipt_failures=$((receipt_failures + 1))
     return 1
@@ -213,14 +262,21 @@ validate_locked_receipt_value() {
 append_apt_receipt_expectations() {
   local package
   local apt_line
-  local apt_key
-  local apt_value
-  local apt_arch
-  local -a apt_packages=(
-    cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
-  )
-  for package in "${apt_packages[@]}"; do
-    if ! apt_line="$(dpkg-query -W -f='apt:${binary:Package}=${Version}\n' "$package" 2>/dev/null)"; then
+ local apt_key
+ local apt_value
+ local apt_arch
+  local dpkg_query_path
+ local -a apt_packages=(
+   cifs-utils curl git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+ )
+  dpkg_query_path="$(verify_resolve_command dpkg-query 2>/dev/null || true)"
+  [[ -n "$dpkg_query_path" ]] || {
+    echo 'FAIL receipt runtime probe dpkg-query'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  }
+ for package in "${apt_packages[@]}"; do
+    if ! apt_line="$("$dpkg_query_path" -W -f='apt:${binary:Package}=${Version}\n' "$package" 2>/dev/null)"; then
       echo "FAIL receipt runtime probe apt:$package"
       receipt_failures=$((receipt_failures + 1))
       return 1
@@ -357,7 +413,8 @@ fi
 if ! validate_runtime_receipt; then
   failures=$((failures + 1))
 fi
-login_shell="$(command -v bash)"
+login_shell="$(verify_resolve_command bash 2>/dev/null || true)"
+[[ -n "$login_shell" ]] || { echo 'FAIL login shell bash is unavailable'; failures=$((failures + 1)); login_shell=/usr/bin/bash; }
 login_path="$(PATH=/usr/bin:/bin HOME="$HOME" "$login_shell" -lc 'printf "%s" "$PATH"')"
 for required_path in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   if [[ ":$login_path:" == *":$required_path:"* ]]; then
@@ -376,9 +433,9 @@ for command in rtk codex claude herdr; do
     failures=$((failures + 1))
   fi
 done
-if command -v systemctl >/dev/null 2>&1; then
+if systemctl_path="$(verify_resolve_command systemctl 2>/dev/null)"; then
   for service in ssh tailscaled; do
-    if systemctl is-active --quiet "$service"; then
+    if "$systemctl_path" is-active --quiet "$service"; then
       echo "PASS service $service active"
     else
       echo "FAIL service $service inactive"
@@ -388,14 +445,17 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 printf 'Versions:\n'
-rtk --version 2>/dev/null || true
-codex --version 2>/dev/null || true
-claude --version 2>/dev/null || true
-herdr --version 2>/dev/null || true
+for version_command in rtk codex claude herdr; do
+  if version_path="$(verify_resolve_command "$version_command" 2>/dev/null)"; then
+    "$version_path" --version 2>/dev/null || true
+  fi
+done
 git --version 2>/dev/null || true
-gh --version 2>/dev/null | head -n 1 || true
-mosh --version 2>/dev/null | head -n 1 || true
-pwsh --version 2>/dev/null || true
+gh --version 2>/dev/null | /usr/bin/head -n 1 || true
+mosh --version 2>/dev/null | /usr/bin/head -n 1 || true
+if pwsh_path="$(verify_resolve_command pwsh 2>/dev/null)"; then
+  "$pwsh_path" --version 2>/dev/null || true
+fi
 
 if [[ "$failures" -ne 0 ]]; then
   echo "Verification failed: $failures check(s)" >&2

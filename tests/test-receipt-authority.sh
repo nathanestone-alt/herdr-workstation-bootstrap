@@ -17,6 +17,7 @@ source_root="$test_root/source"
 rtk_source_root="$fixture_home/src/rtk"
 runtime_root="$fixture_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 stdlib_root="$runtime_root/lib/python3.13"
+entrypoint_root="$test_root/entrypoint"
 
 mkdir -p \
   "$fixture_root/bin" \
@@ -99,8 +100,65 @@ git -C "$source_root" config user.name fixture
 git -C "$source_root" add .
 git -C "$source_root" commit -qm 'fixture bootstrap source'
 
+# The entrypoint itself is a separate clean committed fixture.  The source
+# checkout below is intentionally mutated by later probes, while the direct
+# receipt invocation must continue to prove its own helper before it reads
+# that mutable input.
+mkdir -p "$entrypoint_root/scripts/ubuntu"
+cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$entrypoint_root/scripts/ubuntu/receipt-authority.sh"
+cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$entrypoint_root/scripts/ubuntu/source-attestation.sh"
+git -C "$entrypoint_root" init -q
+git -C "$entrypoint_root" config user.email fixture@example.invalid
+git -C "$entrypoint_root" config user.name fixture
+git -C "$entrypoint_root" add .
+git -C "$entrypoint_root" commit -qm 'fixture receipt entrypoint'
+entrypoint_script="$entrypoint_root/scripts/ubuntu/receipt-authority.sh"
+
+# Direct receipt help must bind the committed helper before sourcing it, and
+# must not resolve any integrity or Git seam through a hostile PATH.
+receipt_hostile_path="$test_root/receipt-hostile-path"
+mkdir -p "$receipt_hostile_path"
+for receipt_hostile_command in env git realpath dirname find mktemp chmod stat sha256sum gawk head cp rm; do
+  cat > "$receipt_hostile_path/$receipt_hostile_command" <<EOF
+#!/usr/bin/bash
+: > '$test_root/receipt-path-$receipt_hostile_command-reached'
+exit 99
+EOF
+  chmod 0755 "$receipt_hostile_path/$receipt_hostile_command"
+done
+if ! /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
+  /usr/bin/bash "$entrypoint_script" --help > "$test_root/receipt-help-output" 2>&1; then
+  cat "$test_root/receipt-help-output" >&2
+  exit 1
+fi
+for receipt_hostile_command in env git realpath dirname find mktemp chmod stat sha256sum gawk head cp rm; do
+  [[ ! -e "$test_root/receipt-path-$receipt_hostile_command-reached" ]] || {
+    echo "Receipt authority resolved hostile PATH command: $receipt_hostile_command" >&2
+    exit 1
+  }
+done
+
+dirty_entrypoint_root="$test_root/dirty-entrypoint"
+cp -a -- "$entrypoint_root" "$dirty_entrypoint_root"
+dirty_receipt_marker="$test_root/dirty-receipt-top-level"
+dirty_receipt_function_marker="$test_root/dirty-receipt-function"
+cat >> "$dirty_entrypoint_root/scripts/ubuntu/source-attestation.sh" <<EOF
+: > '$dirty_receipt_marker'
+attestation_create_git_snapshot() { : > '$dirty_receipt_function_marker'; return 0; }
+EOF
+if /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
+  /usr/bin/bash "$dirty_entrypoint_root/scripts/ubuntu/receipt-authority.sh" --help \
+  > "$test_root/dirty-receipt-output" 2>&1; then
+  echo 'Dirty live receipt helper was accepted.' >&2
+  exit 1
+fi
+[[ ! -e "$dirty_receipt_marker" && ! -e "$dirty_receipt_function_marker" ]] || {
+  echo 'Dirty receipt helper code executed before attestation.' >&2
+  exit 1
+}
+
 run_authority() {
-  bash "$repo_root/scripts/ubuntu/receipt-authority.sh" "$@" \
+  bash "$entrypoint_script" "$@" \
     --source-root "$source_root" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \

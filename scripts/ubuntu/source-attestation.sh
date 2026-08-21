@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 
 # Shared source-attestation primitives.  This file is sourced only after the
 # caller has arranged for the exact committed copy to be available.  The
@@ -13,12 +13,32 @@ attestation_mktemp_bin='/usr/bin/mktemp'
 attestation_mkdir_bin='/usr/bin/mkdir'
 attestation_chmod_bin='/usr/bin/chmod'
 attestation_stat_bin='/usr/bin/stat'
-attestation_awk_bin='/usr/bin/awk'
+attestation_awk_bin='/usr/bin/gawk'
 attestation_rm_bin='/usr/bin/rm'
 attestation_readlink_bin='/usr/bin/readlink'
 attestation_head_bin='/usr/bin/head'
 attestation_sort_bin='/usr/bin/sort'
+attestation_dirname_bin='/usr/bin/dirname'
 attestation_trusted_path='/usr/sbin:/usr/bin:/sbin:/bin'
+attestation_git_dir=''
+attestation_common_git_dir=''
+
+declare -a attestation_temporary_paths=()
+
+attestation_register_temporary_path() {
+  [[ -n "${1:-}" ]] && attestation_temporary_paths+=("$1")
+}
+
+attestation_cleanup_temporary_paths() {
+  local path
+  for path in "${attestation_temporary_paths[@]:-}"; do
+    if [[ -n "$path" ]]; then
+      "$attestation_chmod_bin" -R u+w -- "$path" 2>/dev/null || true
+      "$attestation_rm_bin" -rf -- "$path"
+    fi
+  done
+  attestation_temporary_paths=()
+}
 
 attestation_snapshot_dir=''
 attestation_snapshot_manifest=''
@@ -81,7 +101,7 @@ attestation_git() {
     "$attestation_git_bin" \
     --no-replace-objects \
     -C "$source_path" \
-    --git-dir=.git \
+    --git-dir="${attestation_git_dir:-.git}" \
     --work-tree=. \
     -c core.attributesfile=/dev/null \
     -c core.excludesfile=/dev/null \
@@ -106,7 +126,7 @@ attestation_git_config() {
     "$attestation_git_bin" \
     --no-replace-objects \
     -C "$source_path" \
-    --git-dir=.git \
+    --git-dir="${attestation_git_dir:-.git}" \
     --work-tree=. \
     "$@"
 }
@@ -142,6 +162,7 @@ attestation_config_is_safe() {
   local dangerous
   local sparse_checkout
   local sparse_index
+  local common_git_dir="${attestation_common_git_dir:-$source_path/.git}"
   dangerous="$(attestation_git_config "$source_path" config --local --no-includes --name-only --get-regexp \
     '^(include|filter\.|diff\..*\.textconv$|merge\..*\.driver$|credential\.|url\..*\.insteadOf$|core\.(attributesfile|excludesfile|fsmonitor|hooksPath|worktree|alternateRefsCommand|askPass|gitProxy|sshCommand)$|extensions\.|remote\..*\.(promisor|partialclonefilter|uploadpack|receivepack)$)' 2>/dev/null || true)"
   [[ -z "$dangerous" ]] || {
@@ -158,27 +179,23 @@ attestation_config_is_safe() {
     echo "Repository-local sparse index is not permitted: $source_path" >&2
     return 1
   }
-  [[ ! -e "$source_path/.git/info/sparse-checkout" ]] || {
+  [[ ! -e "$common_git_dir/info/sparse-checkout" ]] || {
     echo "Sparse-checkout metadata is not permitted: $source_path" >&2
     return 1
   }
-  [[ ! -e "$source_path/.git/shallow" ]] || {
+  [[ ! -e "$common_git_dir/shallow" && ! -e "$source_path/.git/shallow" ]] || {
     echo "Shallow repositories are not permitted: $source_path" >&2
     return 1
   }
-  [[ ! -e "$source_path/.git/commondir" ]] || {
-    echo "External Git common directories are not permitted: $source_path" >&2
-    return 1
-  }
-  [[ ! -e "$source_path/.git/objects/info/alternates" ]] || {
+  [[ ! -e "$common_git_dir/objects/info/alternates" ]] || {
     echo "External Git alternates are not permitted: $source_path" >&2
     return 1
   }
-  [[ ! -e "$source_path/.git/objects/info/http-alternates" ]] || {
+  [[ ! -e "$common_git_dir/objects/info/http-alternates" ]] || {
     echo "External Git HTTP alternates are not permitted: $source_path" >&2
     return 1
   }
-  [[ -z "$("$attestation_find_bin" -P "$source_path/.git" -maxdepth 1 -name 'sharedindex.*' -print -quit 2>/dev/null || true)" ]] || {
+  [[ -z "$("$attestation_find_bin" -P "$common_git_dir" -maxdepth 1 -name 'sharedindex.*' -print -quit 2>/dev/null || true)" ]] || {
     echo "Git split-index storage is not permitted: $source_path" >&2
     return 1
   }
@@ -203,6 +220,7 @@ attestation_config_is_safe() {
 attestation_snapshot_cleanup() {
   local path="${1:-${attestation_snapshot_dir:-}}"
   [[ -n "$path" && "$path" == /tmp/* && -d "$path" ]] || return 0
+  "$attestation_chmod_bin" -R u+w -- "$path" 2>/dev/null || true
   "$attestation_rm_bin" -rf -- "$path"
 }
 
@@ -302,12 +320,21 @@ attestation_compare_live_checkout() {
   done
 }
 
+attestation_snapshot_abort() {
+  local snapshot_path="${1:-}"
+  shift || true
+  "$attestation_rm_bin" -f -- "$@" 2>/dev/null || true
+  attestation_snapshot_cleanup "$snapshot_path"
+  return 1
+}
+
 attestation_create_git_snapshot() {
   local source_path="${1:-}"
   local expected_url="${2:-}"
   local expected_ref="${3:-}"
   local require_live="${4:-true}"
-  local canonical_source_path git_dir git_toplevel actual_url actual_ref
+  local canonical_source_path git_dir common_git_dir git_toplevel actual_url actual_ref
+  local git_pointer git_pointer_path commondir_spec
   local tree_file index_file stage_file snapshot_path manifest_path
   local record meta path mode type oid digest snapshot_mode
   local index_meta index_path index_mode index_oid index_stage
@@ -319,6 +346,8 @@ attestation_create_git_snapshot() {
   attestation_snapshot_commit=''
   attestation_snapshot_url=''
   attestation_snapshot_manifest_sha256=''
+  attestation_git_dir=''
+  attestation_common_git_dir=''
   attestation_reject_git_environment || return 1
   attestation_assert_canonical_git || return 1
   [[ "$source_path" == /* && -d "$source_path" && ! -L "$source_path" ]] || {
@@ -334,13 +363,57 @@ attestation_create_git_snapshot() {
     echo "Git checkout contains a symlinked path component: $source_path" >&2
     return 1
   }
-  [[ -d "$canonical_source_path/.git" && ! -L "$canonical_source_path/.git" ]] || {
+  [[ -e "$canonical_source_path/.git" && ! -L "$canonical_source_path/.git" && \
+    ( -d "$canonical_source_path/.git" || -f "$canonical_source_path/.git" ) ]] || {
     echo "Git checkout metadata is missing or unsafe: $source_path" >&2
     return 1
   }
-  git_dir="$canonical_source_path/.git"
-  [[ -d "$git_dir/objects" && ! -L "$git_dir/objects" && -d "$git_dir/refs" && ! -L "$git_dir/refs" ]] || {
-    echo "Git checkout object or ref storage is missing: $source_path" >&2
+  if [[ -d "$canonical_source_path/.git" ]]; then
+    git_dir="$canonical_source_path/.git"
+    common_git_dir="$git_dir"
+  else
+    git_pointer="$(< "$canonical_source_path/.git")"
+    [[ "$git_pointer" != *$'\n'* && "$git_pointer" != *$'\r'* && \
+      "$git_pointer" == gitdir:\ /* ]] || {
+      echo "Git checkout pointer cannot be read safely: $source_path" >&2
+      return 1
+    }
+    git_pointer_path="${git_pointer#gitdir: }"
+    git_dir="$($attestation_realpath_bin -e -- "$git_pointer_path" 2>/dev/null || true)"
+    [[ -n "$git_dir" && "$git_pointer" == "gitdir: $git_dir" ]] || {
+      echo "Git checkout pointer is not canonical: $source_path" >&2
+      return 1
+    }
+    [[ -d "$git_dir" && ! -L "$git_dir" && -f "$git_dir/commondir" && \
+      ! -L "$git_dir/commondir" ]] || {
+      echo "Git checkout worktree metadata is missing or unsafe: $source_path" >&2
+      return 1
+    }
+    commondir_spec="$(< "$git_dir/commondir")"
+    [[ "$commondir_spec" == '../..' ]] || {
+      echo "Git checkout common directory is not local: $source_path" >&2
+      return 1
+    }
+    common_git_dir="$($attestation_realpath_bin -e -- "$git_dir/$commondir_spec" 2>/dev/null || true)"
+    [[ -n "$common_git_dir" && -d "$common_git_dir" && ! -L "$common_git_dir" ]] || {
+      echo "Git checkout common directory is missing or unsafe: $source_path" >&2
+      return 1
+    }
+  fi
+  attestation_git_dir="$git_dir"
+  attestation_common_git_dir="$common_git_dir"
+  attestation_reject_symlink_components "$git_dir" || {
+    echo "Git checkout Git directory contains a symlinked component: $source_path" >&2
+    return 1
+  }
+  attestation_reject_symlink_components "$common_git_dir" || {
+    echo "Git checkout common Git directory contains a symlinked component: $source_path" >&2
+    return 1
+  }
+  [[ -d "$common_git_dir/objects" && ! -L "$common_git_dir/objects" && \
+    -d "$common_git_dir/refs" && ! -L "$common_git_dir/refs" && \
+    -f "$git_dir/index" && ! -L "$git_dir/index" ]] || {
+    echo "Git checkout object, ref, or index storage is missing: $source_path" >&2
     return 1
   }
   git_metadata_entry="$("$attestation_find_bin" -P "$git_dir" -mindepth 1 \
@@ -349,7 +422,13 @@ attestation_create_git_snapshot() {
     echo "Git metadata contains a symlink: $git_metadata_entry" >&2
     return 1
   }
-  config_file="$git_dir/config"
+  git_metadata_entry="$("$attestation_find_bin" -P "$common_git_dir" -mindepth 1 \
+    \( -type l -o \( ! -type f ! -type d \) \) -print -quit 2>/dev/null || true)"
+  [[ -z "$git_metadata_entry" ]] || {
+    echo "Common Git metadata contains a symlink: $git_metadata_entry" >&2
+    return 1
+  }
+  config_file="$common_git_dir/config"
   [[ -f "$config_file" && ! -L "$config_file" ]] || {
     echo "Git checkout config is missing or not a regular file: $source_path" >&2
     return 1
@@ -402,17 +481,29 @@ attestation_create_git_snapshot() {
     return 1
   fi
 
-  tree_file="$($attestation_mktemp_bin)"
-  index_file="$($attestation_mktemp_bin)"
-  stage_file="$($attestation_mktemp_bin)"
-  snapshot_path="$($attestation_mktemp_bin -d /tmp/herdr-source-snapshot.XXXXXX)"
+  tree_file="$($attestation_mktemp_bin)" || return 1
+  attestation_register_temporary_path "$tree_file"
+  index_file="$($attestation_mktemp_bin)" || {
+    "$attestation_rm_bin" -f -- "$tree_file"
+    return 1
+  }
+  attestation_register_temporary_path "$index_file"
+  stage_file="$($attestation_mktemp_bin)" || {
+    "$attestation_rm_bin" -f -- "$tree_file" "$index_file"
+    return 1
+  }
+  attestation_register_temporary_path "$stage_file"
+  snapshot_path="$($attestation_mktemp_bin -d /tmp/herdr-source-snapshot.XXXXXX)" || {
+    "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
+    return 1
+  }
+  attestation_register_temporary_path "$snapshot_path"
   manifest_path="$snapshot_path/.source-attestation"
   attestation_snapshot_dir="$snapshot_path"
   attestation_snapshot_manifest="$manifest_path"
   if ! attestation_git "$canonical_source_path" ls-tree --full-tree -r -z "$actual_ref" > "$tree_file"; then
     echo "Git committed tree cannot be read: $source_path" >&2
-    "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-    attestation_snapshot_cleanup
+    attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
     return 1
   fi
 
@@ -428,43 +519,44 @@ attestation_create_git_snapshot() {
     read -r mode type oid <<< "$meta"
     attestation_valid_relative_path "$path" || {
       echo "Committed Git tree contains an unsafe path: $path" >&2
-      "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-      attestation_snapshot_cleanup
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
     case "/$path/" in
       */.git/*)
         echo "Committed Git tree contains repository metadata: $path" >&2
-        "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-        attestation_snapshot_cleanup
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
         ;;
     esac
     [[ "$type" == blob && ( "$mode" == 100644 || "$mode" == 100755 ) ]] || {
       echo "Committed Git tree contains an unsupported mode or object: $path" >&2
-      "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-      attestation_snapshot_cleanup
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
-    snapshot_mode="$(attestation_snapshot_mode "$mode")" || return 1
+    snapshot_mode="$(attestation_snapshot_mode "$mode")" || {
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
+      return 1
+    }
     "$attestation_git_bin" --no-replace-objects --git-dir="$git_dir" -c core.attributesfile=/dev/null \
       -c core.hooksPath=/dev/null cat-file -e "$oid^{blob}" 2>/dev/null || {
       echo "Committed Git blob is missing: $path" >&2
-      "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-      attestation_snapshot_cleanup
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
-    "$attestation_mkdir_bin" -p -- "$snapshot_path/$(dirname -- "$path")"
+    "$attestation_mkdir_bin" -p -- "$snapshot_path/$($attestation_dirname_bin -- "$path")"
     if ! /usr/bin/env -i HOME=/nonexistent PATH="$attestation_trusted_path" LC_ALL=C TZ=UTC \
       GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 \
       "$attestation_git_bin" --no-replace-objects --git-dir="$git_dir" cat-file blob "$oid" > "$snapshot_path/$path"; then
       echo "Committed Git blob cannot be materialized: $path" >&2
-      "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-      attestation_snapshot_cleanup
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     fi
     "$attestation_chmod_bin" "$snapshot_mode" -- "$snapshot_path/$path"
-    digest="$(attestation_hash_file "$snapshot_path/$path")" || return 1
+    digest="$(attestation_hash_file "$snapshot_path/$path")" || {
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
+      return 1
+    }
     attestation_expected_mode["$path"]="$snapshot_mode"
     attestation_expected_git_mode["$path"]="$mode"
     attestation_expected_oid["$path"]="$oid"
@@ -474,41 +566,47 @@ attestation_create_git_snapshot() {
   done < "$tree_file"
   ((file_count > 0)) || {
     echo "Committed Git tree is empty: $source_path" >&2
-    "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
-    attestation_snapshot_cleanup
+    attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
     return 1
   }
 
   if [[ "$require_live" == true ]]; then
     [[ -f "$git_dir/index" && ! -L "$git_dir/index" ]] || {
       echo "Git checkout index is missing or unsafe: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
     if ! attestation_git "$canonical_source_path" ls-files --unmerged -z > "$stage_file"; then
       echo "Git index unmerged-state query failed: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     fi
     [[ ! -s "$stage_file" ]] || {
       echo "Git checkout has staged or unmerged entries: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
     if ! attestation_git "$canonical_source_path" ls-files -v -z > "$index_file"; then
       echo "Git index flag query failed: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     fi
     while IFS= read -r -d '' index_path; do
       [[ "${index_path:0:1}" == H ]] || {
         echo "Git index contains an assume-unchanged, skip-worktree, or non-normal flag: $source_path" >&2
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
       }
       index_path="${index_path:2}"
       [[ -n "${attestation_expected_oid[$index_path]+x}" ]] || {
         echo "Git index contains an unexpected path: $index_path" >&2
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
       }
     done < "$index_file"
     if ! attestation_git "$canonical_source_path" ls-files --stage -z > "$stage_file"; then
       echo "Git index content query failed: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     fi
     declare -A attestation_seen_index=()
@@ -518,24 +616,31 @@ attestation_create_git_snapshot() {
       read -r index_mode index_oid index_stage <<< "$index_meta"
       [[ "$index_stage" == 0 && -n "${attestation_expected_oid[$index_path]+x}" ]] || {
         echo "Git index differs from the committed tree: $index_path" >&2
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
       }
       [[ "$index_mode" == "${attestation_expected_git_mode[$index_path]}" ]] || {
         echo "Git index mode differs from the committed tree: $index_path" >&2
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
       }
       [[ "$index_oid" == "${attestation_expected_oid[$index_path]}" ]] || {
         echo "Git index blob differs from the committed tree: $index_path" >&2
+        attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
         return 1
       }
       attestation_seen_index["$index_path"]='1'
     done < "$stage_file"
     [[ "${#attestation_seen_index[@]}" == "${#attestation_expected_oid[@]}" ]] || {
       echo "Git index does not contain exactly the committed paths: $source_path" >&2
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
       return 1
     }
 
-    attestation_compare_live_checkout "$canonical_source_path" "$snapshot_path" || return 1
+    attestation_compare_live_checkout "$canonical_source_path" "$snapshot_path" || {
+      attestation_snapshot_abort "$snapshot_path" "$tree_file" "$index_file" "$stage_file"
+      return 1
+    }
   fi
 
   while IFS= read -r -d '' entry; do
@@ -559,7 +664,10 @@ attestation_create_git_snapshot() {
   "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
   attestation_snapshot_commit="$actual_ref"
   attestation_snapshot_url="$actual_url"
-  attestation_snapshot_manifest_sha256="$(attestation_hash_file "$manifest_path")" || return 1
+  attestation_snapshot_manifest_sha256="$(attestation_hash_file "$manifest_path")" || {
+    attestation_snapshot_abort "$snapshot_path"
+    return 1
+  }
 }
 
 attestation_manifest_value() {
@@ -721,7 +829,7 @@ attestation_verify_payload_manifest() {
 attestation_canonical_cargo() {
   local user_home="$1"
   local cargo_path="$user_home/.cargo/bin/cargo"
-  local resolved
+  local resolved mode
   [[ "$user_home" == /* && "$user_home" != / ]] || return 1
   [[ -x "$cargo_path" ]] || return 1
   resolved="$($attestation_realpath_bin -e -- "$cargo_path" 2>/dev/null || true)"
@@ -730,6 +838,7 @@ attestation_canonical_cargo() {
     echo "Cargo executable resolves outside the approved toolchain roots: $cargo_path -> $resolved" >&2
     return 1
   }
-  [[ "$($attestation_stat_bin -c '%a' -- "$resolved" 2>/dev/null || true)" =~ ^[0-7]+$ ]] || return 1
-  printf '%s\n' "$cargo_path"
+  mode="$($attestation_stat_bin -c '%a' -- "$resolved" 2>/dev/null || true)"
+  [[ "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || return 1
+  printf '%s\n' "$resolved"
 }

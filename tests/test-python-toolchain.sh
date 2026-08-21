@@ -10,6 +10,7 @@ trap 'rm -rf "$test_root"' EXIT
 # testing the exact current files in a disposable clean Git fixture.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+/usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
 git -C "$source_fixture" config user.email fixture@example.invalid

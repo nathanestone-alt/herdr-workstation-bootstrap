@@ -10,12 +10,63 @@ trap 'rm -rf "$test_root"' EXIT
 # invoked from a mutable developer worktree as well as from CI.
 source_fixture="$test_root/source"
 cp -a -- "$repo_root/." "$source_fixture/"
+/usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
 git -C "$source_fixture" init -q
 git -C "$source_fixture" config user.email fixture@example.invalid
 git -C "$source_fixture" config user.name fixture
 git -C "$source_fixture" add -f .
 git -C "$source_fixture" commit -qm 'clean bootstrap fencing fixture'
+
+# An entrypoint must not source a dirty live helper, even when that helper
+# contains top-level code and a forged attestation function.
+dirty_bootstrap_root="$test_root/dirty-bootstrap"
+cp -a -- "$source_fixture" "$dirty_bootstrap_root"
+dirty_bootstrap_marker="$test_root/dirty-bootstrap-top-level"
+dirty_bootstrap_function_marker="$test_root/dirty-bootstrap-function"
+cat >> "$dirty_bootstrap_root/scripts/ubuntu/source-attestation.sh" <<EOF
+: > '$dirty_bootstrap_marker'
+attestation_create_git_snapshot() { : > '$dirty_bootstrap_function_marker'; return 0; }
+EOF
+
+# Every prelude command is deliberately shadowed by a marker binary.  The
+# entrypoints must bind to absolute system tools before any PATH lookup.
+hostile_path_bin="$test_root/hostile-path-bin"
+mkdir -p "$hostile_path_bin"
+for hostile_command in env git realpath dirname find mktemp chmod stat sha256sum gawk cp rm mkdir head; do
+  cat > "$hostile_path_bin/$hostile_command" <<EOF
+#!/usr/bin/bash
+: > '$test_root/path-$hostile_command-reached'
+exit 99
+EOF
+  chmod 0755 "$hostile_path_bin/$hostile_command"
+done
+
+set +e
+env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" \
+  /usr/bin/bash "$dirty_bootstrap_root/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
+  > "$test_root/dirty-bootstrap-output" 2>&1
+dirty_bootstrap_status=$?
+set -e
+(( dirty_bootstrap_status != 0 )) || { echo 'Dirty live bootstrap helper was accepted.' >&2; exit 1; }
+[[ ! -e "$dirty_bootstrap_marker" && ! -e "$dirty_bootstrap_function_marker" ]] || {
+  echo 'Dirty bootstrap helper code executed before attestation.' >&2
+  exit 1
+}
+
+if ! env -i HOME="$test_root/home" PATH="$hostile_path_bin:/usr/bin:/bin" \
+  /usr/bin/bash "$source_fixture/scripts/ubuntu/bootstrap.sh" --phase validate-lock \
+  > "$test_root/hostile-bootstrap-output" 2>&1; then
+  cat "$test_root/hostile-bootstrap-output" >&2
+  exit 1
+fi
+for hostile_command in env git realpath dirname find mktemp chmod stat sha256sum gawk cp rm mkdir head; do
+  [[ ! -e "$test_root/path-$hostile_command-reached" ]] || {
+    echo "Bootstrap resolved hostile PATH command: $hostile_command" >&2
+    exit 1
+  }
+done
+
 bootstrap_script="$source_fixture/scripts/ubuntu/bootstrap.sh"
 attestation_helper="$source_fixture/scripts/ubuntu/source-attestation.sh"
 repo_root="$source_fixture"
@@ -168,6 +219,51 @@ if PATH="$fake_git_bin:$HOME/.local/fake-cargo:/usr/bin:/bin" install_rtk_from_s
   :
 fi
 [[ ! -e "$path_cargo_marker" ]] || { echo 'PATH-resolved Cargo was used.' >&2; exit 1; }
+printf 'locked source\n' > "$rtk_source/README"
+chmod 0644 "$rtk_source/README"
+
+# Deterministic Cargo replacement race: replace the user-writable Cargo path
+# while the function is paused after validation and private staging.  The
+# staged inode must execute, while the replacement remains unexecuted and the
+# post-use identity check fails closed.
+cargo_race_safe="$test_root/cargo-race-safe"
+cargo_race_hostile="$test_root/cargo-race-hostile"
+cargo_race_safe_marker="$test_root/cargo-race-safe-executed"
+cargo_race_hostile_marker="$test_root/cargo-race-hostile-executed"
+cat > "$cargo_race_safe" <<EOF
+#!/usr/bin/bash
+: > '$cargo_race_safe_marker'
+EOF
+cat > "$cargo_race_hostile" <<EOF
+#!/usr/bin/bash
+: > '$cargo_race_hostile_marker'
+EOF
+chmod 0755 "$cargo_race_safe" "$cargo_race_hostile"
+cp -- "$cargo_race_safe" "$HOME/.cargo/bin/cargo"
+cargo_race_ready="$test_root/cargo-race-ready"
+cargo_race_continue="$test_root/cargo-race-continue"
+(
+  HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-cargo-exec \
+  HERDR_BOOTSTRAP_TEST_READY_FILE="$cargo_race_ready" \
+  HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$cargo_race_continue" \
+  install_rtk_from_source "$rtk_source" https://example.invalid/rtk.git "$rtk_source_commit"
+) > "$test_root/cargo-race-output" 2>&1 &
+cargo_race_pid=$!
+while [[ ! -e "$cargo_race_ready" ]]; do sleep 0.01; done
+rm -- "$HOME/.cargo/bin/cargo"
+ln -s "$cargo_race_hostile" "$HOME/.cargo/bin/cargo"
+: > "$cargo_race_continue"
+set +e
+wait "$cargo_race_pid"
+cargo_race_status=$?
+set -e
+(( cargo_race_status != 0 )) || { echo 'Cargo replacement race was accepted.' >&2; exit 1; }
+[[ -e "$cargo_race_safe_marker" && ! -e "$cargo_race_hostile_marker" ]] || {
+  echo 'Cargo replacement race executed the swapped user path.' >&2
+  exit 1
+}
+rm -- "$HOME/.cargo/bin/cargo"
+cp -- "$cargo_race_safe" "$HOME/.cargo/bin/cargo"
 
 expect_rtk_install_rejected() {
   local label="$1"
@@ -392,6 +488,36 @@ if wait "$race_pid"; then
 fi
 [[ -L "$HOME/.local/bin/rtk" && "$(readlink "$HOME/.local/bin/rtk")" == "$race_other" ]] || {
   echo 'RTK alias replacement race changed the replacement path.' >&2
+  exit 1
+}
+
+# The same detach race with a non-symlink replacement must preserve the
+# replacement at the public name while failing closed.
+rm -- "$HOME/.local/bin/rtk"
+ln -s "$canonical_rtk" "$HOME/.local/bin/rtk"
+regular_race_ready="$test_root/rtk-regular-race-ready"
+regular_race_continue="$test_root/rtk-regular-race-continue"
+regular_race_content='raced regular RTK replacement'
+(
+  HERDR_BOOTSTRAP_TEST_PAUSE_PHASE=before-rtk-regular-alias-removal \
+  HERDR_BOOTSTRAP_TEST_READY_FILE="$regular_race_ready" \
+  HERDR_BOOTSTRAP_TEST_CONTINUE_FILE="$regular_race_continue" \
+  fence_remove_managed_link "$canonical_rtk" "$HOME/.local/bin/rtk" before-rtk-regular-alias-removal
+) > "$test_root/rtk-regular-race-output" 2>&1 &
+regular_race_pid=$!
+while [[ ! -e "$regular_race_ready" ]]; do sleep 0.01; done
+rm -- "$HOME/.local/bin/rtk"
+printf '%s\n' "$regular_race_content" > "$HOME/.local/bin/rtk"
+chmod 0644 "$HOME/.local/bin/rtk"
+: > "$regular_race_continue"
+set +e
+wait "$regular_race_pid"
+regular_race_status=$?
+set -e
+(( regular_race_status != 0 )) || { echo 'RTK regular replacement race was accepted.' >&2; exit 1; }
+[[ -f "$HOME/.local/bin/rtk" && ! -L "$HOME/.local/bin/rtk" && \
+   "$(< "$HOME/.local/bin/rtk")" == "$regular_race_content" ]] || {
+  echo 'RTK regular replacement was not preserved at the public name.' >&2
   exit 1
 }
 

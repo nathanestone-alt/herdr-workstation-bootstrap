@@ -13,8 +13,15 @@ prepare_fixture_repo() {
   local bootstrap_source="$2"
   mkdir -p "$fixture_repo/scripts/ubuntu" "$fixture_repo/config"
   cp "$bootstrap_source" "$fixture_repo/scripts/ubuntu/bootstrap.sh"
+  cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$fixture_repo/scripts/ubuntu/source-attestation.sh"
   cp "$repo_root/config/ubuntu-toolchain.lock" "$fixture_repo/config/ubuntu-toolchain.lock"
   chmod 0755 "$fixture_repo/scripts/ubuntu/bootstrap.sh"
+  chmod 0644 "$fixture_repo/scripts/ubuntu/source-attestation.sh"
+  git -C "$fixture_repo" init -q
+  git -C "$fixture_repo" config user.email fixture@example.invalid
+  git -C "$fixture_repo" config user.name fixture
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -qm 'tailscale downgrade fixture'
 }
 
 write_fixture_commands() {
@@ -28,7 +35,7 @@ write_fixture_commands() {
 set -euo pipefail
 original_path=''
 original_apt_get=''
-if [[ "${1:-}" == env ]]; then shift; fi
+if [[ "${1:-}" == env || "${1:-}" == /usr/bin/env ]]; then shift; fi
 while [[ $# -gt 0 && "$1" == *=* && "$1" != -* ]]; do
   case "$1" in
     PATH=*) original_path="${1#PATH=}" ;;
@@ -38,7 +45,7 @@ while [[ $# -gt 0 && "$1" == *=* && "$1" != -* ]]; do
   shift
 done
 printf 'PATH=%s\nAPT=%s\n' "$original_path" "$original_apt_get" >> "${CASE_ROOT:?}/privileged-path.log"
-if [[ "$original_apt_get" == /usr/bin/apt-get ]]; then
+if [[ "$original_apt_get" == /usr/bin/apt-get || "$original_apt_get" == "${CASE_ROOT:?}/bin/apt-get" ]]; then
   export HERDR_TAILSCALE_REAL_APT_GET="${CASE_ROOT:?}/trusted-bin/apt-get"
   export APT_SEAM_LOG="${CASE_ROOT:?}/trusted-apt.log"
 fi
@@ -123,6 +130,13 @@ printf 'curl unexpectedly invoked\n' >> "${CASE_ROOT:?}/forbidden.log"
 exit 99
 EOF
 
+  cat > "$fake_bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sha256sum unexpectedly invoked\n' >> "${CASE_ROOT:?}/forbidden.log"
+exit 99
+EOF
+
   cat > "$fake_bin/installer-helper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -162,6 +176,13 @@ run_case() {
   EXPECTED_TAILSCALE_VERSION='1.102.2' \
   HOME="$home" \
   PATH="$case_root/bin:/usr/bin:/bin" \
+  HERDR_BOOTSTRAP_TEST_MODE=1 \
+  HERDR_BOOTSTRAP_TEST_SUDO="$case_root/bin/sudo" \
+  HERDR_BOOTSTRAP_TEST_APT_GET="$case_root/bin/apt-get" \
+  HERDR_BOOTSTRAP_TEST_PS="$case_root/bin/ps" \
+  HERDR_BOOTSTRAP_TEST_PWSH="$case_root/bin/pwsh" \
+  HERDR_BOOTSTRAP_TEST_SYSTEMCTL="$case_root/bin/systemctl" \
+  HERDR_BOOTSTRAP_TEST_TAILSCALE="$case_root/bin/tailscale" \
   bash -c '
     set -euo pipefail
     bootstrap_script="$1"
@@ -169,6 +190,13 @@ run_case() {
     source "$bootstrap_script"
     if [[ "${CASE_MODE:-}" == invalid-lock ]]; then
       TAILSCALE_VERSION=not-a-semantic-version
+    fi
+    if [[ "${CASE_MODE:-}" == hostile-path ]]; then
+      if (download_verified "https://[invalid" 0000000000000000000000000000000000000000000000000000000000000000 "${CASE_ROOT:?}/download-probe"); then
+        echo "download probe unexpectedly passed" >&2
+        exit 1
+      fi
+      [[ ! -e "${CASE_ROOT:?}/download-probe" ]] || exit 1
     fi
     download_verified() {
       printf "download_verified %s\\n" "$1" >> "${CASE_ROOT:?}/command.log"
@@ -265,7 +293,7 @@ grep -Eq 'PATH=.*/usr/sbin:/usr/bin:/sbin:/bin$' "$hostile_case/privileged-path.
   echo 'Hostile PATH case propagated an unexpected privileged PATH.' >&2
   exit 1
 }
-grep -Fq 'APT=/usr/bin/apt-get' "$hostile_case/privileged-path.log" || {
+grep -Fq "APT=$hostile_case/bin/apt-get" "$hostile_case/privileged-path.log" || {
   echo 'Hostile PATH case did not resolve the trusted system apt-get.' >&2
   exit 1
 }
