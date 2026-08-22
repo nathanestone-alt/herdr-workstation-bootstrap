@@ -92,26 +92,37 @@ launcher_capability_bind_parent() {
 }
 
 launcher_capability_parse_policy() {
-  local line header_count=0 origin_count=0 commit_count=0
+  local line policy_line=0
   launcher_capability_policy_origin=''
   launcher_capability_policy_commit=''
-  while IFS= read -r line; do
-    case "$line" in
-      herdr-bootstrap-policy-v1) ((header_count += 1)) ;;
-      origin=*)
-        ((origin_count += 1))
-        [[ -z "$launcher_capability_policy_origin" ]] || launcher_capability_fail 'duplicate policy origin'
+  while :; do
+    line=''
+    if ! IFS= read -r -u 9 line; then
+      [[ -z "$line" ]] || launcher_capability_fail 'policy grammar is not exact'
+      break
+    fi
+    case "$policy_line" in
+      0)
+        [[ "$line" == 'herdr-bootstrap-policy-v1' ]] ||
+          launcher_capability_fail 'policy grammar is not exact'
+        policy_line=1
+        ;;
+      1)
+        [[ "$line" == origin=* ]] ||
+          launcher_capability_fail 'policy grammar is not exact'
         launcher_capability_policy_origin="${line#origin=}"
+        policy_line=2
         ;;
-      commit=*)
-        ((commit_count += 1))
-        [[ -z "$launcher_capability_policy_commit" ]] || launcher_capability_fail 'duplicate policy commit'
+      2)
+        [[ "$line" == commit=* ]] ||
+          launcher_capability_fail 'policy grammar is not exact'
         launcher_capability_policy_commit="${line#commit=}"
+        policy_line=3
         ;;
-      *) launcher_capability_fail "malformed policy line: $line" ;;
+      *) launcher_capability_fail 'policy grammar is not exact' ;;
     esac
-  done < "/proc/$BASHPID/fd/9"
-  [[ "$header_count" == 1 && "$origin_count" == 1 && "$commit_count" == 1 &&
+  done
+  [[ "$policy_line" == 3 &&
     "$launcher_capability_policy_commit" =~ ^[0-9a-f]{40}$ ]] || {
     launcher_capability_fail 'policy grammar is not exact'
   }
@@ -119,6 +130,19 @@ launcher_capability_parse_policy() {
     "$launcher_capability_policy_origin" != *..* &&
     "$launcher_capability_policy_origin" != *@* ]] || {
     launcher_capability_fail 'policy origin is not canonical HTTPS'
+  }
+
+  # fd 9 has been consumed directly.  These canonical bytes are exactly the
+  # validated three-line policy, so later lifetime checks must not reopen fd 9.
+  launcher_capability_policy_hash="$(
+    printf '%s\n' \
+      'herdr-bootstrap-policy-v1' \
+      "origin=$launcher_capability_policy_origin" \
+      "commit=$launcher_capability_policy_commit" |
+      /usr/bin/sha256sum | /usr/bin/gawk '{print $1}'
+  )"
+  [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] || {
+    launcher_capability_fail 'policy descriptor hash is invalid'
   }
 }
 
@@ -231,11 +255,6 @@ launcher_capability_bind() {
   launcher_capability_policy_identity="$policy_identity"
   launcher_capability_stage_identity="$stage_identity"
   launcher_capability_launcher_identity="$launcher_identity"
-  launcher_capability_policy_hash="$(/usr/bin/sha256sum -- "$policy_fd_path" |
-    /usr/bin/gawk '{print $1}')"
-  [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] ||
-    launcher_capability_fail 'policy descriptor hash is invalid'
-
   if [[ "$payload_mode" != 1 ]]; then
     [[ "$repo_root" == "$stage_dir" ]] ||
       launcher_capability_fail 'entrypoint repository is not the staged repository'
@@ -290,8 +309,8 @@ launcher_capability_lifetime() {
     "$(launcher_capability_identity /proc/$BASHPID/fd/10)" == "$launcher_capability_stage_identity" &&
     "$(launcher_capability_identity /proc/$BASHPID/fd/11)" == "$launcher_capability_launcher_identity" ]] ||
     launcher_capability_fail 'launcher capability replacement detected'
-  [[ "$(/usr/bin/sha256sum -- /proc/$BASHPID/fd/9 | /usr/bin/gawk '{print $1}')" == "$launcher_capability_policy_hash" ]] ||
-    launcher_capability_fail 'policy capability bytes changed'
+  [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] ||
+    launcher_capability_fail 'policy capability hash is unavailable'
 }
 
 [[ "$#" -ge 1 && ( "$1" == bootstrap || "$1" == receipt-authority || "$1" == verify ) ]] ||

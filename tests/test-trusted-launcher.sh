@@ -119,6 +119,93 @@ for command_name in env bash git realpath stat sha256sum gawk mktemp rm find sle
   [[ ! -e "$test_root/hostile-$command_name-reached" ]] || fail_test "launcher resolved hostile PATH command: $command_name"
 done
 
+# Exercise the capability helper directly with a descriptor opened before the
+# policy path loses read permission.  This is the boundary that the installed
+# launcher crosses when it opens the root-owned policy and then drops identity.
+helper_definitions="$test_root/launcher-capability-definitions.sh"
+set +e
+/usr/bin/awk '
+  /sha256sum/ && (/\$policy_fd_path/ || /\/proc\/\$BASHPID\/fd\/9/) {
+    print
+    bad=1
+  }
+  /</ && (/\$policy_fd_path/ || /\/proc\/\$BASHPID\/fd\/9/) {
+    print
+    bad=1
+  }
+  END { exit bad }
+' "$repo_root/scripts/ubuntu/launcher-capability.sh" > "$test_root/policy-reopen.out"
+policy_reopen_audit_status=$?
+set -e
+(( policy_reopen_audit_status == 0 )) || {
+  cat "$test_root/policy-reopen.out" >&2
+  fail_test 'capability helper reopens policy bytes through a path after descriptor binding'
+}
+/usr/bin/awk '/^\[\[ "\$#" -ge 1/ { exit } { print }' \
+  "$repo_root/scripts/ubuntu/launcher-capability.sh" > "$helper_definitions"
+inherited_policy=$'herdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
+duplicate_header_policy=$'herdr-bootstrap-policy-v1\nherdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
+malformed_policy=$'herdr-bootstrap-policy-v1\ninvalid-policy-line\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
+trailing_bytes_policy=$'herdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\ntrailing-bytes'
+run_parser_fixture() {
+  local label="$1" policy_contents="$2" should_pass="$3" policy="$test_root/parser-$1" expected_hash status
+  printf '%s' "$policy_contents" > "$policy"
+  chmod 0600 "$policy"
+  expected_hash="$(/usr/bin/sha256sum -- "$policy" | /usr/bin/awk '{print $1}')"
+  set +e
+  (
+    set -euo pipefail
+    trap 'chmod 0600 -- "$policy"' EXIT
+    exec 9<"$policy"
+    chmod 000 -- "$policy"
+    # shellcheck disable=SC1090
+    source "$helper_definitions"
+    launcher_capability_parse_policy
+    printf '%s\n' "$launcher_capability_policy_hash" > "$test_root/parser-$label.hash"
+  ) > "$test_root/parser-$label.out" 2>&1
+  status=$?
+  set -e
+  chmod 0600 -- "$policy"
+  if [[ "$should_pass" == 1 ]]; then
+    (( status == 0 )) || { cat "$test_root/parser-$label.out" >&2; fail_test "$label inherited-fd policy parse failed"; }
+    [[ "$(<"$test_root/parser-$label.hash")" == "$expected_hash" ]] ||
+      fail_test "$label policy hash did not cover the inherited descriptor bytes"
+  else
+    (( status != 0 )) || fail_test "$label malformed policy unexpectedly passed";
+  fi
+}
+run_parser_fixture inherited-fd "$inherited_policy" 1
+run_parser_fixture duplicate-header "$duplicate_header_policy" 0
+run_parser_fixture malformed-line "$malformed_policy" 0
+run_parser_fixture trailing-bytes "$trailing_bytes_policy" 0
+
+run_descriptor_fixture() {
+  local label="$1" action="$2" policy="$test_root/descriptor-$1" replacement="$test_root/descriptor-$1-replacement" status
+  printf '%s' "$inherited_policy" > "$policy"
+  printf '%s' "$inherited_policy" > "$replacement"
+  chmod 0600 "$policy" "$replacement"
+  set +e
+  (
+    set -euo pipefail
+    exec 9<"$policy"
+    expected_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/9)"
+    # shellcheck disable=SC1090
+    source "$helper_definitions"
+    case "$action" in
+      substitution) exec 9<&-; exec 9<"$replacement" ;;
+      absence) exec 9<&- ;;
+      *) exit 2 ;;
+    esac
+    launcher_capability_assert_fd 9 "$policy" "$expected_identity"
+  ) > "$test_root/descriptor-$label.out" 2>&1
+  status=$?
+  set -e
+  (( status != 0 )) || { cat "$test_root/descriptor-$label.out" >&2; fail_test "$label descriptor mutation unexpectedly passed"; }
+}
+run_descriptor_fixture substitution substitution
+run_descriptor_fixture absence absence
+echo 'inherited policy descriptor, malformed-policy, duplicate-policy, substitution, and absence tests passed.'
+
 forged_root="$test_root/forged"; forged_marker="$test_root/forged-entrypoint-reached"
 mkdir -p "$forged_root/scripts/ubuntu"
 cp -- "$source_root/scripts/ubuntu/trusted-launcher.sh" "$forged_root/scripts/ubuntu/trusted-launcher.sh"
