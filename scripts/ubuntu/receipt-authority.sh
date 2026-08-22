@@ -459,7 +459,7 @@ receipt_materialize_helper_from_payload() {
     "$receipt_script_path" == "$receipt_prelude_source_root/scripts/ubuntu/receipt-authority.sh" ]] || {
     receipt_trust_fail 'payload receipt paths are not topology-bound'
   }
-  if [[ -z "$fixture_root" ]]; then
+  if [[ -z "$receipt_prelude_fixture_root" ]]; then
     [[ "$(/usr/bin/id -u)" == 0 ]] || receipt_trust_fail 'production payload receipt requires root'
     while IFS= read -r -d '' receipt_stage_entry; do
       [[ "$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$receipt_stage_entry" 2>/dev/null || true)" == 0 && \
@@ -549,6 +549,7 @@ receipt_prelude_payload_root=''
 receipt_prelude_payload_manifest=''
 receipt_prelude_payload_hash=''
 receipt_prelude_source_commit=''
+receipt_prelude_fixture_root=''
 receipt_prelude_args=("$@")
 receipt_user_home_hint="${HOME:-}"
 for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; receipt_arg_index++)); do
@@ -586,6 +587,11 @@ for ((receipt_arg_index=0; receipt_arg_index < ${#receipt_prelude_args[@]}; rece
     --source-commit)
       ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--source-commit requires a value'
       receipt_prelude_source_commit="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
+      ((receipt_arg_index++))
+      ;;
+    --fixture-root)
+      ((receipt_arg_index + 1 < ${#receipt_prelude_args[@]})) || receipt_trust_fail '--fixture-root requires a value'
+      receipt_prelude_fixture_root="${receipt_prelude_args[$((receipt_arg_index + 1))]}"
       ((receipt_arg_index++))
       ;;
   esac
