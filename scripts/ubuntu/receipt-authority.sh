@@ -489,13 +489,13 @@ receipt_materialize_helper_from_payload() {
     "$($receipt_head_bin -n 1 -- "$receipt_prelude_source_manifest")" == herdr-source-snapshot-v2 ]] || {
     receipt_trust_fail 'source snapshot manifest is missing or malformed'
   }
-  receipt_prelude_manifest_commit="$($receipt_awk -F= '$1 == "commit" { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_source_manifest" 2>/dev/null || true)"
+  receipt_prelude_manifest_commit="$($receipt_awk_bin -F= '$1 == "commit" { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_source_manifest" 2>/dev/null || true)"
   [[ "$receipt_prelude_manifest_commit" == "$receipt_prelude_source_commit" ]] || {
     receipt_trust_fail 'source snapshot commit is not externally bound'
   }
-  receipt_payload_helper_record="$($receipt_awk -F '\t' '$1 == "F" && $4 == "source/scripts/ubuntu/source-attestation.sh" { print; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_payload_manifest" 2>/dev/null || true)"
+  receipt_payload_helper_record="$($receipt_awk_bin -F '\t' '$1 == "F" && $4 == "source/scripts/ubuntu/source-attestation.sh" { print; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_payload_manifest" 2>/dev/null || true)"
   IFS=$'\t' read -r _ receipt_payload_helper_mode receipt_payload_helper_sha receipt_payload_helper_path <<< "$receipt_payload_helper_record"
-  receipt_source_helper_record="$($receipt_awk -F '\t' '$1 == "F" && $5 == "scripts/ubuntu/source-attestation.sh" { print; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_source_manifest" 2>/dev/null || true)"
+  receipt_source_helper_record="$($receipt_awk_bin -F '\t' '$1 == "F" && $5 == "scripts/ubuntu/source-attestation.sh" { print; found++ } END { exit(found == 1 ? 0 : 1) }' "$receipt_prelude_source_manifest" 2>/dev/null || true)"
   IFS=$'\t' read -r _ receipt_source_helper_mode receipt_source_helper_oid receipt_source_helper_sha receipt_source_helper_path <<< "$receipt_source_helper_record"
   [[ "$receipt_payload_helper_path" == source/scripts/ubuntu/source-attestation.sh && \
     "$receipt_payload_helper_mode" =~ ^(444|555|644|755)$ && "$receipt_payload_helper_sha" =~ ^[0-9a-f]{64}$ && \
@@ -1067,6 +1067,8 @@ declare -A role_version role_version_hash role_version_output
 for role in "${roles[@]}"; do
   IFS=$'\t' read -r role_version["$role"] role_version_hash["$role"] role_version_output["$role"] < <(probe_role_version "$role")
 done
+[[ "${role_version[rtk]}" == "rtk $RTK_VERSION" ]] ||
+  fail "RTK measured version does not match lock: ${role_version[rtk]} (expected rtk $RTK_VERSION)"
 
 python_version_output="$(receipt_exec_python_unprivileged "${role_execution_command_path[python313]}" --version 2>&1)" || fail 'python3.13 --version failed'
 [[ "$python_version_output" == "Python $PYTHON_VERSION" ]] || fail "Python version does not match lock: $python_version_output"

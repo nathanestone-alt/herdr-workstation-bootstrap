@@ -47,17 +47,36 @@ assert_rejected() {
   local label="$1"
   local archive="$2"
   local target="$3"
+  local expected_diagnostic="${4:-}"
   local archive_sha
+  local good_id good_hash
   archive_sha="$(/usr/bin/sha256sum -- "$archive" | /usr/bin/gawk '{print $1}')"
+  write_rtk_binary "$target" "$version"
+  good_id="$(stat -Lc '%d:%i' -- "$target")"
+  good_hash="$(/usr/bin/sha256sum -- "$target" | /usr/bin/gawk '{print $1}')"
   if rtk_release_install_archive "$archive" "$archive_sha" "$version" "$target" \
     > "$test_root/$label.log" 2>&1; then
     echo "RTK release fixture unexpectedly accepted $label." >&2
     exit 1
   fi
-  [[ ! -e "$target" && ! -L "$target" ]] || {
-    echo "RTK release fixture published a rejected $label payload." >&2
+  [[ -f "$target" && ! -L "$target" &&
+    "$(stat -Lc '%d:%i' -- "$target")" == "$good_id" &&
+    "$(/usr/bin/sha256sum -- "$target" | /usr/bin/gawk '{print $1}')" == "$good_hash" &&
+    "$("$target" --version)" == "rtk $version" ]] || {
+    echo "RTK release fixture did not preserve the good installed $label payload." >&2
     exit 1
   }
+  [[ -z "$(find "${target%/*}" -maxdepth 1 -name '.rtk-release.*' -print -quit)" ]] || {
+    echo "RTK release fixture leaked a publication staging file for $label." >&2
+    exit 1
+  }
+  if [[ -n "$expected_diagnostic" ]]; then
+    grep -Fqx -- "$expected_diagnostic" "$test_root/$label.log" || {
+      cat "$test_root/$label.log" >&2
+      echo "RTK release fixture emitted the wrong $label diagnostic." >&2
+      exit 1
+    }
+  fi
 }
 
 # Positive path: the only public mutation is an atomic replacement of the
@@ -73,13 +92,19 @@ rtk_release_install_archive "$valid_archive" "$valid_sha" "$version" "$positive_
 
 # A checksum mismatch fails before extraction or publication.
 checksum_target="$(new_target checksum-mismatch)"
+write_rtk_binary "$checksum_target" "$version"
+checksum_good_id="$(stat -Lc '%d:%i' -- "$checksum_target")"
+checksum_good_hash="$(/usr/bin/sha256sum -- "$checksum_target" | /usr/bin/gawk '{print $1}')"
 if rtk_release_install_archive "$valid_archive" \
   '0000000000000000000000000000000000000000000000000000000000000000' \
   "$version" "$checksum_target" > "$test_root/checksum-mismatch.log" 2>&1; then
   echo 'RTK release fixture accepted a checksum mismatch.' >&2
   exit 1
 fi
-[[ ! -e "$checksum_target" && ! -L "$checksum_target" ]] || exit 1
+[[ -f "$checksum_target" && ! -L "$checksum_target" &&
+  "$(stat -Lc '%d:%i' -- "$checksum_target")" == "$checksum_good_id" &&
+  "$(/usr/bin/sha256sum -- "$checksum_target" | /usr/bin/gawk '{print $1}')" == "$checksum_good_hash" ]] || exit 1
+[[ -z "$(find "${checksum_target%/*}" -maxdepth 1 -name '.rtk-release.*' -print -quit)" ]] || exit 1
 
 # Version validation is performed by executing the staged binary before the
 # canonical name is changed.
@@ -123,14 +148,24 @@ chmod 0600 "$duplicate_archive"
 assert_rejected duplicate "$duplicate_archive" "$(new_target duplicate)"
 
 unexpected_root="$test_root/unexpected"
-unexpected_archive="$test_root/rtk-unexpected.tar.gz"
+unexpected_archive="$test_root/rtk-multiple-members.tar.gz"
 mkdir -p "$unexpected_root"
 cp -- "$valid_root/rtk" "$unexpected_root/rtk"
 printf 'unexpected\n' > "$unexpected_root/other"
 /usr/bin/tar --create --gzip --file="$unexpected_archive" --format=gnu \
   -C "$unexpected_root" rtk other
 chmod 0600 "$unexpected_archive"
-assert_rejected unexpected "$unexpected_archive" "$(new_target unexpected)"
+assert_rejected multiple-members "$unexpected_archive" "$(new_target multiple-members)"
+
+unexpected_name_root="$test_root/unexpected-name"
+unexpected_name_archive="$test_root/rtk-unexpected-name.tar.gz"
+mkdir -p "$unexpected_name_root"
+write_rtk_binary "$unexpected_name_root/other" "$version"
+/usr/bin/tar --create --gzip --file="$unexpected_name_archive" --format=gnu \
+  -C "$unexpected_name_root" other
+chmod 0600 "$unexpected_name_archive"
+assert_rejected unexpected-name "$unexpected_name_archive" "$(new_target unexpected-name)" \
+  'RTK release install: RTK archive contains an unexpected payload: "other"'
 
 wrong_mode_root="$test_root/wrong-mode"
 wrong_mode_archive="$test_root/rtk-wrong-mode.tar.gz"

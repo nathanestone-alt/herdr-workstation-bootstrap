@@ -163,6 +163,15 @@ bootstrap_command_path() {
   printf '%s\n' "$resolved"
 }
 
+bootstrap_receipt_authority_path() {
+  printf '%s\n' '/etc/stmodel/issue-961/receipt-authority.json'
+}
+
+bootstrap_query_apt_manifest() {
+  /usr/bin/dpkg-query -W -f='apt:${binary:Package}=${Version}\n' \
+    cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+}
+
 bootstrap_exec_system() {
   local bootstrap_exec_arg
   local -a bootstrap_exec_args=()
@@ -734,7 +743,7 @@ install_receipt_from_snapshots() {
     source "$stage/source/scripts/ubuntu/source-attestation.sh"
     attestation_reject_git_environment
     attestation_verify_payload_manifest "$stage" "$stage/.payload-manifest" "$expected_payload_sha"
-    exec /usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
+    /usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
       --install \
       --source-root "$stage/source" \
       --source-manifest "$stage/source/.source-attestation" \
@@ -1446,17 +1455,15 @@ bootstrap_install_locked_deb() {
   local root_stage_dir
   root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-deb-root.XXXXXX)"
   bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
-    "$package_path" "$root_stage_dir" "$expected_sha" "$apt_get_bin" \
-    "${CASE_ROOT:-}" "${APT_SEAM_LOG:-}" <<'HERDR_DEB_ROOT'
+    "$package_path" "$root_stage_dir" "$expected_sha" "$apt_get_bin" <<'HERDR_DEB_ROOT'
 set -euo pipefail
 package_path="$1"
 stage_dir="$2"
 expected_sha="$3"
 apt_get_bin="$4"
-case_root="$5"
-apt_seam_log="$6"
 expected_owner="$(/usr/bin/id -u)"
 expected_group="$(/usr/bin/id -g)"
+apt_get_path=/usr/bin/apt-get
 [[ -d "$stage_dir" && ! -L "$stage_dir" &&
   "$(/usr/bin/stat -c '%u' -- "$stage_dir")" == "$expected_owner" &&
   "$(/usr/bin/stat -c '%g' -- "$stage_dir")" == "$expected_group" &&
@@ -1477,13 +1484,18 @@ trap '/usr/bin/rm -rf -- "$stage_dir"' EXIT
   "$(/usr/bin/sha256sum -- "$stage_dir/package.deb" | /usr/bin/gawk '{print $1}')" == "$package_hash" ]] || exit 24
 [[ "$(/usr/bin/stat -Lc '%d:%i' -- "$package_path")" == "$package_id" &&
   "$(/usr/bin/sha256sum -- "$package_path" | /usr/bin/gawk '{print $1}')" == "$expected_sha" ]] || exit 24
-if [[ -n "$case_root" ]]; then
-  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin CASE_ROOT="$case_root" APT_SEAM_LOG="$apt_seam_log" \
-    "$apt_get_bin" install -y "$stage_dir/package.deb"
-else
-  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
-    "$apt_get_bin" install -y "$stage_dir/package.deb"
-fi
+[[ "$apt_get_bin" == "$apt_get_path" && -x "$apt_get_path" && ! -L "$apt_get_path" &&
+  "$(/usr/bin/realpath -e -- "$apt_get_path" 2>/dev/null || true)" == "$apt_get_path" &&
+  "$(/usr/bin/stat -c '%u:%g' -- "$apt_get_path")" == 0:0 &&
+  "$(/usr/bin/stat -c '%a' -- "$apt_get_path")" =~ ^[0-7]+$ &&
+  $((8#$(/usr/bin/stat -c '%a' -- "$apt_get_path") & 022)) == 0 ]] || exit 24
+exec 8<"$apt_get_path"
+apt_fd_path="/proc/$BASHPID/fd/8"
+apt_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$apt_get_path")"
+[[ "$(/usr/bin/realpath -e -- "$apt_fd_path" 2>/dev/null || true)" == "$apt_get_path" &&
+  "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$apt_fd_path")" == "$apt_identity" ]] || exit 24
+/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
+  /proc/self/fd/8 install -y "$stage_dir/package.deb"
 HERDR_DEB_ROOT
 }
 
@@ -1802,11 +1814,18 @@ install_tools() {
   local code_fd
   local manifest_tmp
   local ps_bin
+  local rtk_existing_target
+  local receipt_authority_manifest_path
   ps_bin="$(bootstrap_command_path ps)"
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   validate_toolchain_lock || exit 22
   validate_cargo_roots || exit 24
+  if [[ -L "$HOME/.cargo/bin/rtk" ]]; then
+    rtk_existing_target="$(/usr/bin/realpath -e -- "$HOME/.cargo/bin/rtk" 2>/dev/null || true)"
+    echo "A pre-existing canonical RTK symlink is not migrated: $HOME/.cargo/bin/rtk -> $rtk_existing_target. Inspect and remove it out of band before rerunning the tools phase." >&2
+    exit 24
+  fi
   validate_managed_paths \
     "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
     "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" \
@@ -1958,6 +1977,12 @@ install_tools() {
   install_receipt_from_snapshots
 
   manifest="$state_dir/toolchain-manifest.txt"
+  receipt_authority_manifest_path="$(bootstrap_receipt_authority_path)"
+  [[ "$receipt_authority_manifest_path" == /* && -f "$receipt_authority_manifest_path" &&
+    ! -L "$receipt_authority_manifest_path" ]] || {
+      echo "Receipt authority handoff is missing its published authority: $receipt_authority_manifest_path" >&2
+      exit 24
+    }
   manifest_tmp="$(mktemp "$state_anchor/.toolchain-manifest.XXXXXX")"
   bootstrap_register_cleanup "$manifest_tmp"
   {
@@ -1998,10 +2023,9 @@ install_tools() {
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
     printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"
     printf 'powershell=%s\n' "$("$(bootstrap_command_path pwsh)" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
-    printf 'receipt_authority_path=%s\n' '/etc/stmodel/issue-961/receipt-authority.json'
-    printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum /etc/stmodel/issue-961/receipt-authority.json | /usr/bin/gawk '{print $1}')"
-    /usr/bin/dpkg-query -W -f='apt:${binary:Package}=${Version}\n' \
-      cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync
+    printf 'receipt_authority_path=%s\n' "$receipt_authority_manifest_path"
+    printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum -- "$receipt_authority_manifest_path" | /usr/bin/gawk '{print $1}')"
+    bootstrap_query_apt_manifest
   } > "$manifest_tmp"
   fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
   mv -T -- "$manifest_tmp" "$state_anchor/toolchain-manifest.txt"

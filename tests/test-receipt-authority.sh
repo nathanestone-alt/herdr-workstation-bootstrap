@@ -70,6 +70,19 @@ include-system-site-packages = false
 version = $PYTHON_VERSION
 EOF
 
+fixture_runtime_args=()
+if [[ "$(id -u)" == 0 ]]; then
+  fixture_runtime_uid="$(id -u nobody 2>/dev/null || true)"
+  fixture_runtime_gid="$(id -g nobody 2>/dev/null || true)"
+  if [[ "$fixture_runtime_uid" =~ ^[1-9][0-9]*$ && "$fixture_runtime_gid" =~ ^[0-9]+$ ]]; then
+    chown -R "$fixture_runtime_uid:$fixture_runtime_gid" "$fixture_home"
+    fixture_runtime_args=(--fixture-runtime-uid "$fixture_runtime_uid" --fixture-runtime-gid "$fixture_runtime_gid")
+  else
+    echo 'SKIP: root-gated receipt payload tests (no non-root fixture account).' >&2
+    exit 0
+  fi
+fi
+
 mkdir -p "$source_root/config" "$source_root/scripts/ubuntu"
 cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$source_root/scripts/ubuntu/receipt-authority.sh"
 cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$source_root/scripts/ubuntu/source-attestation.sh"
@@ -101,7 +114,8 @@ chmod 0700 "$transport"
   --commit "$source_commit" \
   --fixture-root "$fixture_root" \
   --fixture-transport "$transport" \
-  --fixture-home "$fixture_home" > "$test_root/launcher-install.out"
+  --fixture-home "$fixture_home" \
+  "${fixture_runtime_args[@]}" > "$test_root/launcher-install.out"
 launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
 entrypoint_script="$launcher"
 repin_launcher_pause() {
@@ -112,6 +126,7 @@ repin_launcher_pause() {
     --fixture-root "$fixture_root" \
     --fixture-transport "$transport" \
     --fixture-home "$fixture_home" \
+    "${fixture_runtime_args[@]}" \
     --fixture-receipt-pause-phase "$phase" \
     --fixture-receipt-pause-ready "$ready" \
     --fixture-receipt-pause-continue "$continue_file" > /dev/null
@@ -207,6 +222,23 @@ expect_failure() {
   fi
 }
 
+expect_failure_diagnostic() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  local output="$test_root/$label.diagnostic"
+  set +e
+  "$@" > "$output" 2>&1
+  local status="$?"
+  set -e
+  (( status != 0 )) || { echo "$label unexpectedly passed." >&2; exit 1; }
+  grep -Fqx -- "$expected" "$output" || {
+    cat "$output" >&2
+    echo "$label did not emit the exact intended diagnostic: $expected" >&2
+    exit 1
+  }
+}
+
 run_authority --install
 run_authority --check
 [[ -f "$authority_path" && ! -L "$authority_path" ]] || exit 1
@@ -219,6 +251,13 @@ run_authority --check
 [[ "$(jq -r '.python313.venv.home' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.base_prefix' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.stdlib' "$receipt_path")" == "$stdlib_root" ]] || exit 1
+
+mv -- "$fixture_home/.cargo/bin/rtk" "$test_root/rtk-good"
+make_tool "$fixture_home/.cargo/bin/rtk" 'rtk 0.0.0'
+expect_failure_diagnostic rtk-measured-version \
+  "receipt authority: RTK measured version does not match lock: rtk 0.0.0 (expected rtk $RTK_VERSION)" \
+  run_authority --check
+mv -- "$test_root/rtk-good" "$fixture_home/.cargo/bin/rtk"
 
 # A root-side Python probe must not import a caller-controlled sitecustomize or
 # user site. Demonstrate the hostile control first, then exercise the exact
@@ -323,96 +362,118 @@ set -e
 
 # A manifest/tree supplied without the root-bound payload hash and commit is
 # self-authenticating and must not be allowed to source authority inputs.
-while IFS= read -r receipt_test_git_var; do
-  unset "$receipt_test_git_var"
-done < <(compgen -e | /usr/bin/grep '^GIT_')
-source "$repo_root/scripts/ubuntu/source-attestation.sh"
-attestation_create_git_snapshot "$source_root" '' ''
-unbound_source_snapshot="$attestation_snapshot_dir"
-unbound_source_manifest="$attestation_snapshot_manifest"
-duplicate_source_manifest="$test_root/duplicate-source-attestation"
-{
-  printf 'herdr-source-snapshot-v2\n'
-  cat "$unbound_source_manifest"
-} > "$duplicate_source_manifest"
-if attestation_verify_snapshot "$unbound_source_snapshot" "$duplicate_source_manifest"; then
-  echo 'Duplicate source-manifest header was accepted.' >&2
-  exit 1
-fi
-expect_failure 'unsigned source manifest' /usr/bin/env -i \
-  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC BASH_ENV= ENV= \
-  "$launcher" --entrypoint receipt-authority -- --check \
-  --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
-  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --fixture-root "$fixture_root"
-payload_probe="$test_root/payload-probe"
-mkdir -p "$payload_probe/source"
-cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
-chmod -R u+w "$payload_probe"
-payload_probe_manifest="$payload_probe/.payload-manifest"
-attestation_build_payload_manifest "$payload_probe" "$payload_probe_manifest"
-payload_probe_hash="$(attestation_hash_file "$payload_probe_manifest")"
-expect_payload_failure() {
-  local label="$1"
-  shift
-  expect_failure "$label" /usr/bin/env -i \
-    HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-    BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- "$@" \
-    --source-root "$payload_probe/source" \
-    --source-manifest "$payload_probe/source/.source-attestation" \
-    --payload-root "$payload_probe" \
-    --payload-manifest "$payload_probe_manifest" \
+if [[ "$(id -u)" != 0 ]]; then
+  expect_failure_diagnostic payload-root-gate \
+    'herdr launcher capability: payload receipt requires root' \
+    /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+    LC_ALL=C TZ=UTC BASH_ENV= ENV= \
+    "$launcher" --entrypoint receipt-authority -- \
+    --payload-root "$test_root/not-a-root-payload"
+  echo "SKIP: root-gated payload authenticity and positive transaction tests (uid=$(id -u))."
+else
+  while IFS= read -r receipt_test_git_var; do
+    unset "$receipt_test_git_var"
+  done < <(compgen -e | /usr/bin/grep '^GIT_')
+  source "$repo_root/scripts/ubuntu/source-attestation.sh"
+  attestation_create_git_snapshot "$source_root" '' ''
+  unbound_source_snapshot="$attestation_snapshot_dir"
+  unbound_source_manifest="$attestation_snapshot_manifest"
+  duplicate_source_manifest="$test_root/duplicate-source-attestation"
+  {
+    printf 'herdr-source-snapshot-v2\n'
+    cat "$unbound_source_manifest"
+  } > "$duplicate_source_manifest"
+  if attestation_verify_snapshot "$unbound_source_snapshot" "$duplicate_source_manifest"; then
+    echo 'Duplicate source-manifest header was accepted.' >&2
+    exit 1
+  fi
+  expect_failure 'unsigned source manifest' /usr/bin/env -i \
+    HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC BASH_ENV= ENV= \
+    "$launcher" --entrypoint receipt-authority -- --check \
+    --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
     --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
     --fixture-root "$fixture_root"
-}
-expect_payload_failure 'unsigned payload source commit'
-expect_payload_failure 'unsigned payload manifest hash' --source-commit "$attestation_snapshot_commit"
+  payload_probe="$test_root/payload-probe"
+  mkdir -p "$payload_probe/source"
+  cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
+  chmod -R u+w "$payload_probe"
+  payload_probe_manifest="$payload_probe/.payload-manifest"
+  attestation_build_payload_manifest "$payload_probe" "$payload_probe_manifest"
+  payload_probe_hash="$(attestation_hash_file "$payload_probe_manifest")"
+  chown -R 0:0 "$payload_probe"
+  chmod 0700 "$payload_probe"
+  run_payload_authority() {
+    local mode="$1"
+    local root="$2"
+    local payload_hash="$3"
+    local payload_commit="$4"
+    /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+      LC_ALL=C TZ=UTC BASH_ENV= ENV= /usr/bin/bash -c '
+        payload_root="$1"
+        launcher="$2"
+        policy="$3"
+        shift 3
+        exec 9<"$policy"
+        exec 10<"$payload_root"
+        exec 11<"$launcher"
+        /usr/bin/bash "$payload_root/source/scripts/ubuntu/receipt-authority.sh" "$@"
+      ' _ "$root" "$launcher" "$fixture_root/etc/herdr-workstation/bootstrap-policy.conf" \
+      "$mode" \
+      --source-root "$root/source" \
+      --source-manifest "$root/source/.source-attestation" \
+      --payload-root "$root" \
+      --payload-manifest "$root/.payload-manifest" \
+      --payload-manifest-sha256 "$payload_hash" \
+      --source-commit "$payload_commit" \
+      --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
+      --fixture-root "$fixture_root"
+  }
+  expect_failure_diagnostic unsigned-payload-source-commit \
+    'receipt authority trust prelude: payload source requires a mandatory externally bound commit' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" ''
+  expect_failure_diagnostic unsigned-payload-manifest-hash \
+    'receipt authority trust prelude: payload manifest requires a mandatory external SHA-256 binding' \
+    run_payload_authority --check "$payload_probe" '' "$attestation_snapshot_commit"
+  run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit"
+  [[ "$(/usr/bin/jq -r '.source_commit_sha' "$receipt_path")" == "$source_commit" ]] || {
+    echo 'Root payload receipt transaction did not hand off the approved source commit.' >&2
+    exit 1
+  }
 
-# This payload is internally coherent: it is a real second Git commit, its
-# source snapshot is freshly attested, and its payload manifest hash is bound.
-# It must still fail because the installed policy approves source_commit, not
-# merely any self-consistent payload commit.
-alternate_source_checkout="$test_root/alternate-source"
-git clone -q "$source_root" "$alternate_source_checkout"
-git -C "$alternate_source_checkout" config user.email fixture@example.invalid
-git -C "$alternate_source_checkout" config user.name fixture
-printf '%s\n' 'alternate coherent payload commit' > "$alternate_source_checkout/alternate.txt"
-git -C "$alternate_source_checkout" add alternate.txt
-git -C "$alternate_source_checkout" commit -qm 'alternate coherent payload commit'
-attestation_create_git_snapshot "$alternate_source_checkout" '' ''
-alternate_payload_probe="$test_root/alternate-payload-probe"
-mkdir -p "$alternate_payload_probe/source"
-cp -a -- "$attestation_snapshot_dir/." "$alternate_payload_probe/source/"
-chmod -R u+w "$alternate_payload_probe"
-alternate_payload_manifest="$alternate_payload_probe/.payload-manifest"
-attestation_build_payload_manifest "$alternate_payload_probe" "$alternate_payload_manifest"
-alternate_payload_hash="$(attestation_hash_file "$alternate_payload_manifest")"
-alternate_source_commit="$attestation_snapshot_commit"
-[[ "$alternate_source_commit" != "$source_commit" ]] || {
-  echo 'Alternate coherent payload did not receive a different commit.' >&2
-  exit 1
-}
-expect_failure 'coherent payload with non-policy source commit' /usr/bin/env -i \
-  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --check \
-  --source-root "$alternate_payload_probe/source" \
-  --source-manifest "$alternate_payload_probe/source/.source-attestation" \
-  --payload-root "$alternate_payload_probe" \
-  --payload-manifest "$alternate_payload_manifest" \
-  --payload-manifest-sha256 "$alternate_payload_hash" \
-  --source-commit "$alternate_source_commit" \
-  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --fixture-root "$fixture_root"
-printf 'payload tamper\n' >> "$payload_probe/source/README"
-expect_failure 'tampered payload tree' /usr/bin/env -i \
-  HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
-  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --check \
-  --source-root "$payload_probe/source" --source-manifest "$payload_probe/source/.source-attestation" \
-  --payload-root "$payload_probe" --payload-manifest "$payload_probe_manifest" \
-  --payload-manifest-sha256 "$payload_probe_hash" --source-commit "$attestation_snapshot_commit" \
-  --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --fixture-root "$fixture_root"
-attestation_cleanup_temporary_paths
+  # This payload is internally coherent: it is a real second Git commit, its
+  # source snapshot is freshly attested, and its payload manifest hash is
+  # bound. It must still fail because policy approves only source_commit.
+  alternate_source_checkout="$test_root/alternate-source"
+  git clone -q "$source_root" "$alternate_source_checkout"
+  git -C "$alternate_source_checkout" config user.email fixture@example.invalid
+  git -C "$alternate_source_checkout" config user.name fixture
+  printf '%s\n' 'alternate coherent payload commit' > "$alternate_source_checkout/alternate.txt"
+  git -C "$alternate_source_checkout" add alternate.txt
+  git -C "$alternate_source_checkout" commit -qm 'alternate coherent payload commit'
+  attestation_create_git_snapshot "$alternate_source_checkout" '' ''
+  alternate_payload_probe="$test_root/alternate-payload-probe"
+  mkdir -p "$alternate_payload_probe/source"
+  cp -a -- "$attestation_snapshot_dir/." "$alternate_payload_probe/source/"
+  chmod -R u+w "$alternate_payload_probe"
+  alternate_payload_manifest="$alternate_payload_probe/.payload-manifest"
+  attestation_build_payload_manifest "$alternate_payload_probe" "$alternate_payload_manifest"
+  alternate_payload_hash="$(attestation_hash_file "$alternate_payload_manifest")"
+  alternate_source_commit="$attestation_snapshot_commit"
+  [[ "$alternate_source_commit" != "$source_commit" ]] || {
+    echo 'Alternate coherent payload did not receive a different commit.' >&2
+    exit 1
+  }
+  chown -R 0:0 "$alternate_payload_probe"
+  chmod 0700 "$alternate_payload_probe"
+  expect_failure_diagnostic coherent-non-policy-payload \
+    'receipt authority: source snapshot commit does not equal the approved policy commit' \
+    run_payload_authority --check "$alternate_payload_probe" "$alternate_payload_hash" "$alternate_source_commit"
+  printf 'payload tamper\n' >> "$payload_probe/source/README"
+  expect_failure_diagnostic tampered-payload-tree \
+    'receipt authority: source snapshot manifest is invalid or externally unbound' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit"
+  attestation_cleanup_temporary_paths
+fi
 
 # The race run intentionally produced a new content-bound receipt pair.  Make
 # that pair the baseline for the remaining reconciliation probes.

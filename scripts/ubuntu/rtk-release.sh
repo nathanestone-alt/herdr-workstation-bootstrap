@@ -87,6 +87,7 @@ rtk_release_install_archive() (
   local candidate_mode version_output
   local target_parent parent_fd parent_fd_path parent_id target_state target_id target_hash
   local target_owner target_mode publish_stage publish_id publish_hash publish_mode publish_owner
+  local publish_fd publish_fd_path
   local -a archive_entries extracted_entries
 
   [[ "$archive_path" == /* && "$target_path" == /* ]] || rtk_release_abort 'archive and target paths must be absolute'
@@ -107,7 +108,17 @@ rtk_release_install_archive() (
 
   stage_dir="$(/usr/bin/mktemp -d /tmp/herdr-rtk-release.XXXXXX)"
   /usr/bin/chmod 0700 -- "$stage_dir"
-  trap '/usr/bin/rm -rf -- "$stage_dir"' EXIT
+  rtk_release_cleanup() {
+    local status="$1"
+    set +e
+    if [[ -n "${publish_stage:-}" && -n "${publish_id:-}" && -f "$publish_stage" && ! -L "$publish_stage" &&
+      "$(/usr/bin/stat -Lc '%d:%i' -- "$publish_stage" 2>/dev/null || true)" == "$publish_id" ]]; then
+      /usr/bin/rm -f -- "$publish_stage"
+    fi
+    [[ -n "${stage_dir:-}" && -d "$stage_dir" ]] && /usr/bin/rm -rf -- "$stage_dir"
+    return "$status"
+  }
+  trap 'rtk_release_cleanup "$?"' EXIT
   rtk_release_assert_private_directory "$stage_dir" "$current_uid"
 
   # Bind the downloaded pathname before any archive parsing.  The private
@@ -230,15 +241,22 @@ rtk_release_install_archive() (
   # checked again after the pause.  The final rename is the only public-name
   # mutation, so readers observe either the old complete file or the new one.
   publish_stage="$(/usr/bin/mktemp "$target_parent/.rtk-release.XXXXXX")"
+  publish_id="$(/usr/bin/stat -Lc '%d:%i' -- "$publish_stage" 2>/dev/null || true)"
+  [[ "$publish_id" =~ ^[0-9]+:[0-9]+$ ]] || rtk_release_abort 'RTK publication staging identity is invalid'
   /usr/bin/chmod 0600 -- "$publish_stage"
   /usr/bin/cp -- "$candidate_fd_path" "$publish_stage"
   /usr/bin/chmod 0755 -- "$publish_stage"
-  publish_id="$(/usr/bin/stat -Lc '%d:%i' -- "$publish_stage" 2>/dev/null || true)"
-  publish_hash="$(/usr/bin/sha256sum -- "$publish_stage" | /usr/bin/gawk '{print $1}')"
+  exec {publish_fd}<"$publish_stage" || rtk_release_abort 'could not open the RTK publication descriptor'
+  publish_fd_path="/proc/$BASHPID/fd/$publish_fd"
+  [[ "$publish_id" =~ ^[0-9]+:[0-9]+$ &&
+    "$(/usr/bin/stat -Lc '%d:%i' -- "$publish_fd_path" 2>/dev/null || true)" == "$publish_id" ]] ||
+    rtk_release_abort 'RTK publication descriptor identity is invalid'
+  publish_hash="$(/usr/bin/sha256sum -- "$publish_fd_path" | /usr/bin/gawk '{print $1}')"
   publish_mode="$(/usr/bin/stat -c '%a' -- "$publish_stage" 2>/dev/null || true)"
   publish_owner="$(/usr/bin/stat -c '%u' -- "$publish_stage" 2>/dev/null || true)"
   [[ -f "$publish_stage" && ! -L "$publish_stage" && "$publish_owner" == "$current_uid" && \
     "$publish_mode" == 755 && \
+    "$(/usr/bin/stat -Lc '%d:%i' -- "$publish_stage" 2>/dev/null || true)" == "$publish_id" && \
     "$publish_hash" == "$candidate_hash" && "$publish_id" =~ ^[0-9]+:[0-9]+$ ]] ||
     rtk_release_abort 'RTK publication staging identity is invalid'
   rtk_release_pause "$pause_hook" before-rtk-publish
@@ -247,7 +265,7 @@ rtk_release_install_archive() (
   rtk_release_require_parent "$target_parent" "$parent_fd_path" "$parent_id"
   rtk_release_assert_file_stable "$candidate" "$candidate_fd_path" "$candidate_id" "$candidate_hash" ||
     rtk_release_abort 'RTK binary changed before publication'
-  rtk_release_assert_file_stable "$publish_stage" "$publish_stage" "$publish_id" "$publish_hash" ||
+  rtk_release_assert_file_stable "$publish_stage" "$publish_fd_path" "$publish_id" "$publish_hash" ||
     rtk_release_abort 'RTK publication staging file changed'
   if [[ "$target_state" == present ]]; then
     [[ -f "$target_path" && ! -L "$target_path" && \

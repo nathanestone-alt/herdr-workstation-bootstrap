@@ -100,3 +100,8 @@ Local Git metadata, origin configuration, manifests, lockfiles, and hashes are
 never used as the external provisioning anchor. The policy and staged Git
 metadata are still checked as defense in depth after the launcher has bound
 the reviewed commit.
+
+The tools phase treats $HOME/.cargo/bin/rtk as the canonical regular-file
+publication path. A pre-existing symlink at that exact path is reported and
+left untouched; inspect and remove or replace it out of band before rerunning
+the tools phase. The phase never follows or silently deletes that symlink.

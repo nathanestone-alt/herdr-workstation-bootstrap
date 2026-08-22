@@ -199,19 +199,30 @@ launcher_capability_bind() {
       launcher_capability_fail 'production launcher capability is not root-owned'
   fi
 
-  [[ "$stage_dir" == "$staging_root"/.incoming.* ]] ||
-    launcher_capability_fail 'staged repository is not a direct staging child'
-  stage_mode="$(/usr/bin/stat -Lc '%a' -- "$stage_fd_path" 2>/dev/null || true)"
-  [[ "$stage_mode" == 755 &&
-    "$(/usr/bin/stat -Lc '%u:%g' -- "$stage_fd_path")" == "$policy_uid:$policy_gid" ]] ||
-    launcher_capability_fail 'staged repository owner or mode is unsafe'
-  [[ "$entry_path" == "$stage_dir/scripts/ubuntu/$expected_entry.sh" ]] ||
-    launcher_capability_fail 'entrypoint escaped its stage'
+  if [[ "$payload_mode" == 1 ]]; then
+    [[ "$expected_entry" == receipt-authority && "$(/usr/bin/id -u)" == 0 ]] ||
+      launcher_capability_fail 'payload receipt requires root'
+    [[ -n "$payload_arg" && "$stage_dir" == "$payload_arg" ]] ||
+      launcher_capability_fail 'payload root is not descriptor-bound'
+    [[ "$repo_root" == "$stage_dir/source" ]] ||
+      launcher_capability_fail 'payload receipt source escaped its root stage'
+    [[ "$(/usr/bin/stat -Lc '%u:%g:%a' -- "$stage_fd_path")" == 0:0:700 ]] ||
+      launcher_capability_fail 'payload stage is not root-owned and private'
+  else
+    [[ "$stage_dir" == "$staging_root"/.incoming.* ]] ||
+      launcher_capability_fail 'staged repository is not a direct staging child'
+    stage_mode="$(/usr/bin/stat -Lc '%a' -- "$stage_fd_path" 2>/dev/null || true)"
+    [[ "$stage_mode" == 755 &&
+      "$(/usr/bin/stat -Lc '%u:%g' -- "$stage_fd_path")" == "$policy_uid:$policy_gid" ]] ||
+      launcher_capability_fail 'staged repository owner or mode is unsafe'
+    [[ "$entry_path" == "$stage_dir/scripts/ubuntu/$expected_entry.sh" ]] ||
+      launcher_capability_fail 'entrypoint escaped its stage'
+  fi
   launcher_capability_owner_mode "$entry_path" "$policy_uid" "$policy_gid" 755 ||
     launcher_capability_fail 'entrypoint owner or mode is unsafe'
-  helper_path="$stage_dir/scripts/ubuntu/launcher-capability.sh"
+  helper_path="$repo_root/scripts/ubuntu/launcher-capability.sh"
   helper_path="$(launcher_capability_realpath "$helper_path")"
-  [[ "$helper_path" == "$stage_dir/scripts/ubuntu/launcher-capability.sh" ]] ||
+  [[ "$helper_path" == "$repo_root/scripts/ubuntu/launcher-capability.sh" ]] ||
     launcher_capability_fail 'capability helper escaped its stage'
   launcher_capability_owner_mode "$helper_path" "$policy_uid" "$policy_gid" 755 ||
     launcher_capability_fail 'capability helper owner or mode is unsafe'
@@ -225,17 +236,7 @@ launcher_capability_bind() {
   [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] ||
     launcher_capability_fail 'policy descriptor hash is invalid'
 
-  if [[ "$payload_mode" == 1 ]]; then
-    [[ "$expected_entry" == receipt-authority && "$(/usr/bin/id -u)" == 0 ]] ||
-      launcher_capability_fail 'payload receipt requires root'
-    [[ -n "$payload_arg" &&
-      "$(launcher_capability_realpath "$payload_arg")" == "$stage_dir" ]] ||
-      launcher_capability_fail 'payload root is not descriptor-bound'
-    [[ "$repo_root" == "$stage_dir/source" ]] ||
-      launcher_capability_fail 'payload receipt source escaped its root stage'
-    [[ "$(/usr/bin/stat -Lc '%u:%g:%a' -- "$stage_dir")" == 0:0:700 ]] ||
-      launcher_capability_fail 'payload stage is not root-owned and private'
-  else
+  if [[ "$payload_mode" != 1 ]]; then
     [[ "$repo_root" == "$stage_dir" ]] ||
       launcher_capability_fail 'entrypoint repository is not the staged repository'
   fi
