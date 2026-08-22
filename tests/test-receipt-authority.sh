@@ -434,6 +434,11 @@ else
   payload_probe_manifest="$payload_probe/.payload-manifest"
   attestation_build_payload_manifest "$payload_probe" "$payload_probe_manifest"
   payload_probe_hash="$(attestation_hash_file "$payload_probe_manifest")"
+  # attestation_create_git_snapshot rewrites the global
+  # attestation_snapshot_commit, and a later probe snapshots an alternate
+  # checkout. Bind this probe's externally approved commit now so every
+  # payload_probe run keeps supplying it.
+  payload_probe_commit="$attestation_snapshot_commit"
   chown -R 0:0 "$payload_probe"
   chmod 0700 "$payload_probe"
   run_payload_authority() {
@@ -488,12 +493,12 @@ else
   chmod 0755 "$payload_capability_entry"
   expect_failure_diagnostic production-payload-writable-entrypoint-mode \
     'herdr launcher capability: entrypoint owner or mode is unsafe' \
-    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" production
   chmod 0555 "$payload_capability_entry"
   chmod 0755 "$payload_capability_helper"
   expect_failure_diagnostic production-payload-writable-helper-mode \
     'herdr launcher capability: capability helper owner or mode is unsafe' \
-    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" production
   chmod 0555 "$payload_capability_helper"
 
   payload_stage_writable_entry="$payload_probe/source/config/ubuntu-toolchain.lock"
@@ -501,15 +506,15 @@ else
   chmod 0664 "$payload_stage_writable_entry"
   expect_failure_diagnostic production-payload-stage-writable-entry \
     'receipt authority trust prelude: payload receipt stage is not root-owned and non-writable' \
-    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" production
   chmod "$payload_stage_writable_mode" "$payload_stage_writable_entry"
   expect_failure_diagnostic unsigned-payload-source-commit \
     'receipt authority trust prelude: payload source requires a mandatory externally bound commit' \
     run_payload_authority --check "$payload_probe" "$payload_probe_hash" ''
   expect_failure_diagnostic unsigned-payload-manifest-hash \
     'receipt authority trust prelude: payload manifest requires a mandatory external SHA-256 binding' \
-    run_payload_authority --check "$payload_probe" '' "$attestation_snapshot_commit"
-  run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit"
+    run_payload_authority --check "$payload_probe" '' "$payload_probe_commit"
+  run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$payload_probe_commit"
   [[ "$(/usr/bin/jq -r '.source_commit_sha' "$receipt_path")" == "$source_commit" ]] || {
     echo 'Root payload receipt transaction did not hand off the approved source commit.' >&2
     exit 1
@@ -545,7 +550,7 @@ else
   printf 'payload tamper\n' >> "$payload_probe/source/README"
   expect_failure_diagnostic tampered-payload-tree \
     'receipt authority: source snapshot manifest is invalid or externally unbound' \
-    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit"
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit"
   attestation_cleanup_temporary_paths
 fi
 
