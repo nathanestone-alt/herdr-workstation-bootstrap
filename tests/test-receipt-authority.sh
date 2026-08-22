@@ -274,9 +274,26 @@ EOF
 [[ -f "$python_import_marker" ]] || { echo 'Python import control did not establish the hostile sitecustomize fixture.' >&2; exit 1; }
 rm -f -- "$python_import_marker"
 /usr/bin/env -i HOME=/nonexistent PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
-  PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 PYTHONPATH= PYTHONHOME= PYTHONSTARTUP= PYTHONINSPECT=0 \
+  PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 PYTHONPATH= PYTHONHOME= PYTHONSTARTUP= \
   /usr/bin/python3 -c 'pass'
 [[ ! -e "$python_import_marker" ]] || { echo 'Sanitized Python probe imported caller-controlled sitecustomize.' >&2; exit 1; }
+pty_probe_output="$test_root/python-pty-probe.output"
+pty_probe_typescript="$test_root/python-pty-probe.typescript"
+pty_probe_command="/usr/bin/env -i HOME=/nonexistent PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 PYTHONPATH= PYTHONHOME= PYTHONSTARTUP= /usr/bin/python3 -c 'pass'"
+if ! /usr/bin/timeout --foreground 5s /usr/bin/script -qefc "$pty_probe_command" "$pty_probe_typescript" \
+  < /dev/null > "$pty_probe_output" 2>&1; then
+  cat "$pty_probe_output" >&2
+  echo 'Sanitized Python probe did not exit without input on a PTY.' >&2
+  exit 1
+fi
+for python_helper in \
+  "$repo_root/scripts/ubuntu/receipt-authority.sh" \
+  "$repo_root/scripts/ubuntu/bootstrap.sh"; do
+  if grep -Fq 'PYTHONINSPECT=0' "$python_helper"; then
+    echo "Python execution path reintroduced PYTHONINSPECT=0: $python_helper" >&2
+    exit 1
+  fi
+done
 grep -Fq 'PYTHONSAFEPATH=1' "$repo_root/scripts/ubuntu/receipt-authority.sh" || {
   echo 'Receipt Python execution path does not enforce PYTHONSAFEPATH.' >&2
   exit 1

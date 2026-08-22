@@ -210,7 +210,6 @@ bootstrap_exec_python() {
     PYTHONPATH= \
     PYTHONHOME= \
     PYTHONSTARTUP= \
-    PYTHONINSPECT=0 \
     "$@"
 }
 

@@ -196,7 +196,6 @@ receipt_exec_python() {
     PYTHONPATH= \
     PYTHONHOME= \
     PYTHONSTARTUP= \
-    PYTHONINSPECT=0 \
     "${receipt_exec_args[@]}"
 }
 
@@ -223,7 +222,6 @@ receipt_exec_python_unprivileged() {
     PYTHONPATH= \
     PYTHONHOME= \
     PYTHONSTARTUP= \
-    PYTHONINSPECT=0 \
     PYTHONSAFEPATH=1 \
     "$receipt_setpriv_bin" --reuid="$receipt_user_uid" --regid="$receipt_user_gid" --clear-groups --no-new-privs \
     "${receipt_exec_args[@]}"
