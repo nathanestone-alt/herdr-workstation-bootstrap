@@ -3,7 +3,11 @@ set -euo pipefail
 umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d)"
+if [[ "$(id -u)" == 0 ]]; then
+  test_root="$(mktemp -d /var/lib/herdr-bootstrap-fencing.XXXXXX)"
+else
+  test_root="$(mktemp -d)"
+fi
 trap 'rm -rf -- "$test_root"' EXIT
 
 canonical_origin='https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git'
@@ -153,7 +157,12 @@ run_pwsh_target_case() {
   local canonical_target="$case_root/system/opt/microsoft/powershell/7/pwsh"
   local fallback_target="$case_root/system/usr/bin/pwsh"
   local hostile_target="$case_root/hostile/pwsh"
-  local launcher output status fixture_commit dispatch_sentinel
+  local launcher output status fixture_commit dispatch_sentinel expected_target expected_diagnostic
+  local nonroot_uid
+  if [[ ( "$case_mode" == non-root-owner || "$case_mode" == writable-parent ) && "$(id -u)" != 0 ]]; then
+    echo "SKIP: root-only PowerShell trust regression '$case_name' (uid=$(id -u); root required)."
+    return 0
+  fi
   mkdir -p -- "$case_root" "$source_fixture" "$fixture_root" "$fixture_home" \
     "$(dirname -- "$canonical_target")" "$(dirname -- "$fallback_target")" \
     "$(dirname -- "$hostile_target")"
@@ -163,14 +172,42 @@ run_pwsh_target_case() {
 
   printf '#!/usr/bin/bash\nexit 0\n' > "$fallback_target"
   chmod 0755 "$fallback_target"
-  if [[ "$case_mode" == official ]]; then
-    printf '#!/usr/bin/bash\nexit 0\n' > "$canonical_target"
-    chmod 0755 "$canonical_target"
-  else
-    printf '#!/usr/bin/bash\nexit 99\n' > "$hostile_target"
-    chmod 0755 "$hostile_target"
-    ln -s -- "$hostile_target" "$canonical_target"
-  fi
+  case "$case_mode" in
+    official|non-root-owner|writable-parent)
+      printf '#!/usr/bin/bash\nexit 0\n' > "$canonical_target"
+      chmod 0755 "$canonical_target"
+      ;;
+    hostile)
+      printf '#!/usr/bin/bash\nexit 99\n' > "$hostile_target"
+      chmod 0755 "$hostile_target"
+      ln -s -- "$hostile_target" "$canonical_target"
+      ;;
+    fallback)
+      ;;
+    fallback-hostile)
+      printf '#!/usr/bin/bash\nexit 99\n' > "$hostile_target"
+      chmod 0755 "$hostile_target"
+      rm -f -- "$fallback_target"
+      ln -s -- "$hostile_target" "$fallback_target"
+      ;;
+    *)
+      echo "Unknown PowerShell target case mode: $case_mode" >&2
+      exit 1
+      ;;
+  esac
+  case "$case_mode" in
+    non-root-owner)
+      nonroot_uid="$(id -u nobody 2>/dev/null || true)"
+      [[ "$nonroot_uid" =~ ^[1-9][0-9]*$ ]] || {
+        echo "SKIP: root-only PowerShell trust regression '$case_name' (no non-root fixture account)."
+        return 0
+      }
+      chown "$nonroot_uid" "$canonical_target"
+      ;;
+    writable-parent)
+      chmod 0777 "$(dirname -- "$canonical_target")"
+      ;;
+  esac
 
   # Point only the two PowerShell names at the disposable fixture. The real
   # bootstrap trust seam and its strict assertion remain under test.
@@ -216,14 +253,16 @@ EOF
     "$launcher" --entrypoint bootstrap -- --phase pwsh-target > "$case_root/output.log" 2>&1
   status=$?
   set -e
-  if [[ "$case_mode" == official ]]; then
+  if [[ "$case_mode" == official || "$case_mode" == fallback ]]; then
     (( status == 0 )) || {
       cat "$case_root/output.log" >&2
       echo 'Official PowerShell layout was rejected.' >&2
       exit 1
     }
     output="$(/usr/bin/tail -n 1 -- "$case_root/output.log")"
-    [[ "$output" == "$canonical_target" ]] || {
+    expected_target="$canonical_target"
+    [[ "$case_mode" == fallback ]] && expected_target="$fallback_target"
+    [[ "$output" == "$expected_target" ]] || {
       cat "$case_root/output.log" >&2
       echo 'Bootstrap did not select the canonical PowerShell target.' >&2
       exit 1
@@ -234,7 +273,25 @@ EOF
       echo "Unsafe canonical PowerShell target returned status $status." >&2
       exit 1
     }
-    grep -Fq "trusted binary is missing or not a regular executable: $canonical_target" \
+    case "$case_mode" in
+      hostile)
+        expected_diagnostic="trusted binary is missing or not a regular executable: $canonical_target"
+        ;;
+      fallback-hostile)
+        expected_diagnostic="trusted binary is missing or not a regular executable: $fallback_target"
+        ;;
+      non-root-owner)
+        expected_diagnostic="trusted binary is not root-owned: $canonical_target"
+        ;;
+      writable-parent)
+        expected_diagnostic="trusted binary parent is not root-owned and non-writable: $(dirname -- "$canonical_target")"
+        ;;
+      *)
+        echo "Unexpected rejected PowerShell target case mode: $case_mode" >&2
+        exit 1
+        ;;
+    esac
+    grep -Fq -- "$expected_diagnostic" \
       "$case_root/output.log" || {
       cat "$case_root/output.log" >&2
       echo 'Unsafe canonical PowerShell target was not rejected at the trust seam.' >&2
@@ -245,6 +302,10 @@ EOF
 
 run_pwsh_target_case official official
 run_pwsh_target_case hostile hostile
+run_pwsh_target_case fallback fallback
+run_pwsh_target_case fallback-hostile fallback-hostile
+run_pwsh_target_case non-root-owner non-root-owner
+run_pwsh_target_case writable-parent writable-parent
 
 # Preserve the already-resolved fencing invariants in this end-to-end guard.
 ! /usr/bin/grep -Fq '.cargo/env' "$repo_root/scripts/ubuntu/bootstrap.sh" ||

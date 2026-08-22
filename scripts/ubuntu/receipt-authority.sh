@@ -209,7 +209,7 @@ receipt_exec_python_unprivileged() {
       receipt_exec_args+=("$receipt_exec_arg")
     fi
   done
-  if [[ -n "$fixture_root" || "$(/usr/bin/id -u)" != 0 ]]; then
+  if [[ -n "$receipt_prelude_fixture_root" || "$(/usr/bin/id -u)" != 0 ]]; then
     receipt_exec_python "${receipt_exec_args[@]}"
     return
   fi

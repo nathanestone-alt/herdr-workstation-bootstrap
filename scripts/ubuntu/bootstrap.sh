@@ -101,9 +101,27 @@ bootstrap_trust_reject_symlink_components() {
   done
 }
 
+bootstrap_trust_assert_root_owned_parent_chain() {
+  local path="$1"
+  local current="${path%/*}"
+  local owner mode
+  [[ -n "$current" ]] || current='/'
+  while :; do
+    owner="$($bootstrap_stat_bin -c '%u' -- "$current" 2>/dev/null || true)"
+    mode="$($bootstrap_stat_bin -c '%a' -- "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || {
+      bootstrap_trust_fail "trusted binary parent is not root-owned and non-writable: $current"
+    }
+    [[ "$current" == / ]] && break
+    current="${current%/*}"
+    [[ -n "$current" ]] || current='/'
+  done
+}
+
 bootstrap_trust_assert_binary() {
   local path="$1"
-  local resolved mode
+  local require_root="${2:-0}"
+  local resolved mode owner
   [[ -f "$path" && ! -L "$path" && -x "$path" ]] || {
     bootstrap_trust_fail "trusted binary is missing or not a regular executable: $path"
   }
@@ -115,6 +133,13 @@ bootstrap_trust_assert_binary() {
   [[ "$mode" =~ ^[0-7]+$ && $((8#$mode & 022)) == 0 ]] || {
     bootstrap_trust_fail "trusted binary is writable by group or other users: $path"
   }
+  if [[ "$require_root" == 1 ]]; then
+    owner="$($bootstrap_stat_bin -c '%u' -- "$path" 2>/dev/null || true)"
+    [[ "$owner" == 0 ]] || {
+      bootstrap_trust_fail "trusted binary is not root-owned: $path"
+    }
+    bootstrap_trust_assert_root_owned_parent_chain "$path"
+  fi
 }
 
 for bootstrap_trusted_binary in \
@@ -149,6 +174,7 @@ trap 'bootstrap_cleanup "$?"' EXIT
 bootstrap_command_path() {
   local name="$1"
   local default_path=''
+  local require_root=0
   local resolved
   case "$name" in
     sudo) default_path='/usr/bin/sudo' ;;
@@ -158,6 +184,7 @@ bootstrap_command_path() {
     pwsh)
       if [[ -x "$bootstrap_powershell_canonical_path" ]]; then
         default_path="$bootstrap_powershell_canonical_path"
+        [[ "${launcher_capability_owner_uid:-}" == 0 ]] && require_root=1
       else
         default_path="$bootstrap_powershell_fallback_path"
       fi
@@ -165,7 +192,7 @@ bootstrap_command_path() {
     tailscale) default_path='/usr/bin/tailscale' ;;
     *) bootstrap_trust_fail "unsupported command seam: $name" ;;
   esac
-  bootstrap_trust_assert_binary "$default_path"
+  bootstrap_trust_assert_binary "$default_path" "$require_root"
   resolved="$($bootstrap_realpath_bin -e -- "$default_path" 2>/dev/null || true)"
   [[ "$resolved" == "$default_path" ]] || bootstrap_trust_fail "command seam is not the canonical system binary: $name"
   printf '%s\n' "$resolved"

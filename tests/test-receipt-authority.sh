@@ -396,7 +396,7 @@ if [[ "$(id -u)" != 0 ]]; then
     LC_ALL=C TZ=UTC BASH_ENV= ENV= \
     "$launcher" --entrypoint receipt-authority -- \
     --payload-root "$test_root/not-a-root-payload"
-  echo "SKIP: root-gated payload authenticity and positive transaction tests (uid=$(id -u))."
+  echo "SKIP: root-only production payload-stage ownership regression and payload authenticity tests (uid=$(id -u); root required)."
 else
   while IFS= read -r receipt_test_git_var; do
     unset "$receipt_test_git_var"
@@ -434,6 +434,13 @@ else
     local root="$2"
     local payload_hash="$3"
     local payload_commit="$4"
+    local fixture_mode="${5:-fixture}"
+    local -a fixture_args=()
+    case "$fixture_mode" in
+      fixture) fixture_args=(--fixture-root "$fixture_root") ;;
+      production) ;;
+      *) echo "Unknown payload authority fixture mode: $fixture_mode" >&2; exit 1 ;;
+    esac
     /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
       LC_ALL=C TZ=UTC BASH_ENV= ENV= /usr/bin/bash -c '
         payload_root="$1"
@@ -457,8 +464,15 @@ else
       --payload-manifest-sha256 "$payload_hash" \
       --source-commit "$payload_commit" \
       --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-      --fixture-root "$fixture_root"
+      "${fixture_args[@]}"
   }
+  payload_stage_writable_entry="$payload_probe/source/config/ubuntu-toolchain.lock"
+  payload_stage_writable_mode="$(stat -c '%a' -- "$payload_stage_writable_entry")"
+  chmod 0664 "$payload_stage_writable_entry"
+  expect_failure_diagnostic production-payload-stage-writable-entry \
+    'receipt authority trust prelude: payload receipt stage is not root-owned and non-writable' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+  chmod "$payload_stage_writable_mode" "$payload_stage_writable_entry"
   expect_failure_diagnostic unsigned-payload-source-commit \
     'receipt authority trust prelude: payload source requires a mandatory externally bound commit' \
     run_payload_authority --check "$payload_probe" "$payload_probe_hash" ''
