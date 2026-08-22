@@ -305,6 +305,13 @@ run_parent_capability_fixture substituted-file-for-receipt root-receipt "$parent
 run_parent_capability_fixture substituted-directory-for-launcher installed-launcher "$parent_capability_directory" 0
 echo 'parent capability positive, missing, substituted, and role-distinction tests passed.'
 
+for capability_blob in \
+  scripts/ubuntu/launcher-capability.sh \
+  scripts/ubuntu/receipt-authority.sh; do
+  [[ "$(git -C "$repo_root" ls-tree HEAD -- "$capability_blob" | /usr/bin/awk '{ print $1 }')" == 100755 ]] ||
+    fail_test "Git-tree mode for $capability_blob is not 100755"
+done
+
 # The capability entrypoint/helper mode contract is role-specific.  An
 # installed-launcher stage is a live checkout that keeps its committed 100755
 # blobs writable by their owner (0755).  A payload receipt instead executes the
@@ -340,6 +347,29 @@ run_capability_mode_fixture() {
     (( status != 0 )) || fail_test "$label capability mode contract unexpectedly passed"
   fi
 }
+expect_invalid_payload_mode_selector() {
+  local label="$1" payload_mode="$2"
+  local output status
+  set +e
+  output="$(
+    (
+      set -euo pipefail
+      # shellcheck disable=SC1090
+      source "$helper_definitions"
+      launcher_capability_expected_entry_mode "$payload_mode"
+    ) 2>&1
+  )"
+  status=$?
+  set -e
+  (( status == 24 )) || {
+    printf '%s\n' "$output" >&2
+    fail_test "$label selector did not fail with status 24"
+  }
+  [[ "$output" == 'herdr launcher capability: payload mode selector is invalid' ]] || {
+    printf '%s\n' "$output" >&2
+    fail_test "$label selector emitted the wrong diagnostic"
+  }
+}
 capability_mode_uid="$(/usr/bin/id -u)"
 capability_mode_foreign_uid=$(( capability_mode_uid + 1 ))
 run_capability_mode_fixture payload-hardened 1 0555 "$capability_mode_uid" 1
@@ -352,8 +382,8 @@ run_capability_mode_fixture launcher-hardened 0 0555 "$capability_mode_uid" 0
 run_capability_mode_fixture launcher-group-writable 0 0775 "$capability_mode_uid" 0
 run_capability_mode_fixture launcher-world-writable 0 0757 "$capability_mode_uid" 0
 run_capability_mode_fixture launcher-foreign-owner 0 0755 "$capability_mode_foreign_uid" 0
-run_capability_mode_fixture invalid-selector 2 0755 "$capability_mode_uid" 0
-run_capability_mode_fixture empty-selector '' 0755 "$capability_mode_uid" 0
+expect_invalid_payload_mode_selector invalid-selector 2
+expect_invalid_payload_mode_selector empty-selector ''
 echo 'capability entrypoint payload/installed-launcher mode contract tests passed.'
 
 forged_root="$test_root/forged"; forged_marker="$test_root/forged-entrypoint-reached"
