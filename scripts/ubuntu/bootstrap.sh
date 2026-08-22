@@ -665,12 +665,22 @@ install_receipt_from_snapshots() {
       "$policy_origin" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*\.git$ &&
       "$policy_origin" != *..* && "$policy_origin" != *@* ]] || exit 24
     stage="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-payload.XXXXXX)"
-    cleanup_root_payload() { /usr/bin/rm -rf -- "$stage"; }
+    receipt_parent_capability=''
+    cleanup_root_payload() {
+      /usr/bin/rm -rf -- "$stage"
+      [[ -z "$receipt_parent_capability" ]] || /usr/bin/rm -rf -- "$receipt_parent_capability"
+    }
     trap cleanup_root_payload EXIT
     /usr/bin/tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions
     /usr/bin/chown -R --no-dereference 0:0 -- "$stage"
     exec 10<"$stage"
     [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/10)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
+    receipt_parent_capability="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-capability.XXXXXX)"
+    /usr/bin/chmod 0700 -- "$receipt_parent_capability"
+    exec 12<"$receipt_parent_capability"
+    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/12)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
+    /usr/bin/rm -rf -- "$receipt_parent_capability"
+    receipt_parent_capability=''
     [[ -f /usr/local/libexec/herdr-workstation-bootstrap &&
       ! -L /usr/local/libexec/herdr-workstation-bootstrap &&
       "$(/usr/bin/realpath -e -- /usr/local/libexec/herdr-workstation-bootstrap 2>/dev/null || true)" == /usr/local/libexec/herdr-workstation-bootstrap &&

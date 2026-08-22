@@ -121,7 +121,19 @@ else
 fi
 stage_dir="$($launcher_mktemp_bin -d "$stage_root/.incoming.XXXXXX")" || fail 'staging directory creation failed'
 exec 10<"$stage_dir" || fail 'staged repository capability open failed'
-cleanup() { local s=$1; set +e; [[ -d $stage_dir ]] && "$launcher_rm_bin" -rf -- "$stage_dir"; exec 9<&- 2>/dev/null || true; exec 10<&- 2>/dev/null || true; exec 11<&- 2>/dev/null || true; return "$s"; }
+parent_capability_path=''
+cleanup() {
+  local s=$1
+  set +e
+  [[ -z "$parent_capability_path" || ! -e "$parent_capability_path" ]] ||
+    "$launcher_rm_bin" -rf -- "$parent_capability_path"
+  [[ -d $stage_dir ]] && "$launcher_rm_bin" -rf -- "$stage_dir"
+  exec 9<&- 2>/dev/null || true
+  exec 10<&- 2>/dev/null || true
+  exec 11<&- 2>/dev/null || true
+  exec 12<&- 2>/dev/null || true
+  return "$s"
+}
 trap 'cleanup "$?"' EXIT
 "$launcher_chmod_bin" 0755 -- "$stage_dir" || fail 'staging directory publication failed'
 assert_dir "$stage_dir" 755
@@ -153,6 +165,50 @@ else
   home="$($launcher_getent_bin passwd "$uid" | $launcher_awk_bin -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
 fi
 [[ $home == /* && $home != / && "$launcher_runtime_uid" =~ ^[0-9]+$ && "$launcher_runtime_gid" =~ ^[0-9]+$ ]] || fail 'no safe runtime user home or identity'
+parent_capability_kind=installed-launcher
+if [[ "$entrypoint" == scripts/ubuntu/receipt-authority.sh ]]; then
+  parent_capability_kind=root-receipt
+fi
+case "$parent_capability_kind" in
+  installed-launcher)
+    parent_capability_path="$("$launcher_mktemp_bin" "$stage_root/.parent-capability.XXXXXX")" ||
+      fail 'installed-launcher parent capability creation failed'
+    printf 'L' > "$parent_capability_path" ||
+      fail 'installed-launcher parent capability materialization failed'
+    "$launcher_chmod_bin" 0600 -- "$parent_capability_path" ||
+      fail 'installed-launcher parent capability permission setup failed'
+    [[ -f "$parent_capability_path" && ! -L "$parent_capability_path" ]] ||
+      fail 'installed-launcher parent capability is not a regular file'
+    ;;
+  root-receipt)
+    parent_capability_path="$("$launcher_mktemp_bin" -d "$stage_root/.parent-capability.XXXXXX")" ||
+      fail 'root-receipt parent capability creation failed'
+    "$launcher_chmod_bin" 0700 -- "$parent_capability_path" ||
+      fail 'root-receipt parent capability permission setup failed'
+    [[ -d "$parent_capability_path" && ! -L "$parent_capability_path" ]] ||
+      fail 'root-receipt parent capability is not a directory'
+    ;;
+  *) fail 'parent capability kind is invalid' ;;
+esac
+parent_capability_id="$("$launcher_stat_bin" -Lc '%d:%i' -- "$parent_capability_path" 2>/dev/null || true)"
+[[ "$parent_capability_id" =~ ^[0-9]+:[0-9]+$ ]] ||
+  fail 'parent capability identity is unavailable'
+[[ "$("$launcher_realpath_bin" -e -- "$parent_capability_path" 2>/dev/null || true)" == "$parent_capability_path" ]] ||
+  fail 'parent capability path is not canonical'
+[[ "$("$launcher_stat_bin" -Lc '%u:%g' -- "$parent_capability_path" 2>/dev/null || true)" == "$launcher_expected_uid:$launcher_expected_gid" ]] ||
+  fail 'parent capability owner is unsafe'
+exec 12<"$parent_capability_path" || fail 'parent capability open failed'
+[[ "$("$launcher_stat_bin" -Lc '%d:%i' -- "/proc/$BASHPID/fd/12" 2>/dev/null || true)" == "$parent_capability_id" ]] ||
+  fail 'parent capability descriptor identity changed'
+if [[ "$parent_capability_kind" == installed-launcher ]]; then
+  [[ "$("$launcher_stat_bin" -Lc '%a:%F' -- "/proc/$BASHPID/fd/12" 2>/dev/null || true)" == '600:regular file' ]] ||
+    fail 'installed-launcher parent capability descriptor is unsafe'
+else
+  [[ "$("$launcher_stat_bin" -Lc '%a:%F' -- "/proc/$BASHPID/fd/12" 2>/dev/null || true)" == '700:directory' ]] ||
+    fail 'root-receipt parent capability descriptor is unsafe'
+fi
+"$launcher_rm_bin" -rf -- "$parent_capability_path" || fail 'parent capability cleanup failed'
+parent_capability_path=''
 launcher_env_args=(
   HOME="$home" PATH="$launcher_trusted_path" LC_ALL=C TZ=UTC BASH_ENV= ENV=
 )

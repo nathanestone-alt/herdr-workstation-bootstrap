@@ -62,25 +62,76 @@ launcher_capability_assert_fd() {
 }
 
 launcher_capability_process_has_descriptors() {
-  local pid="$1" policy_id="$2" stage_id="$3" launcher_id="$4"
+  local pid="$1" policy_id="$2" stage_id="$3" launcher_id="$4" parent_capability_id="${5:-}"
   [[ "$(launcher_capability_identity "/proc/$pid/fd/9")" == "$policy_id" &&
     "$(launcher_capability_identity "/proc/$pid/fd/10")" == "$stage_id" &&
-    "$(launcher_capability_identity "/proc/$pid/fd/11")" == "$launcher_id" ]]
+    "$(launcher_capability_identity "/proc/$pid/fd/11")" == "$launcher_id" ]] || return 1
+  [[ -z "$parent_capability_id" ||
+    "$(launcher_capability_identity "/proc/$pid/fd/12")" == "$parent_capability_id" ]]
 }
 
 launcher_capability_parent_pid() {
   /usr/bin/gawk '$1 == "PPid:" { print $2; exit }' "/proc/$1/status" 2>/dev/null || true
 }
 
+launcher_capability_assert_parent_capability() {
+  local kind="$1" expected_uid="$2" expected_gid="$3"
+  local fd_path="/proc/$BASHPID/fd/12" identity expected_mode expected_size owner_mode object_size
+  case "$kind" in
+    installed-launcher)
+      expected_mode=600
+      expected_size=1
+      [[ -e "$fd_path" ]] || launcher_capability_fail 'parent capability descriptor 12 is unavailable'
+      identity="$(launcher_capability_identity "$fd_path")"
+      [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:regular[[:space:]]file:[0-9]+:[0-9]+$ ]] ||
+        launcher_capability_fail 'installed-launcher parent capability is not a regular file'
+      ;;
+    root-receipt)
+      expected_mode=700
+      [[ -e "$fd_path" ]] || launcher_capability_fail 'root-receipt capability descriptor 12 is unavailable'
+      identity="$(launcher_capability_identity "$fd_path")"
+      [[ "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:directory:[0-9]+:[0-9]+$ ]] ||
+        launcher_capability_fail 'root-receipt parent capability is not a directory'
+      ;;
+    *) launcher_capability_fail 'parent capability kind is invalid' ;;
+  esac
+  owner_mode="$(/usr/bin/stat -Lc '%u:%g:%a' -- "$fd_path" 2>/dev/null || true)"
+  [[ "$owner_mode" == "$expected_uid:$expected_gid:$expected_mode" ]] || {
+    launcher_capability_fail 'parent capability owner or mode is unsafe'
+  }
+  if [[ "$kind" == installed-launcher ]]; then
+    object_size="$(/usr/bin/stat -Lc '%s' -- "$fd_path" 2>/dev/null || true)"
+    [[ "$object_size" == "$expected_size" ]] ||
+      launcher_capability_fail 'installed-launcher parent capability size is unsafe'
+  fi
+  launcher_capability_capture_readonly launcher_capability_parent_capability_kind "$kind"
+  launcher_capability_capture_readonly launcher_capability_parent_capability_identity "$identity"
+}
+
 launcher_capability_bind_parent() {
   local policy_id="$1" stage_id="$2" launcher_id="$3" launcher_path="$4" payload_mode="$5"
-  local pid="$PPID" next depth process_uid
+  local owner_uid="$6" owner_gid="$7" parent_capability_kind="$8"
+  local pid="$PPID" next depth process_uid current_uid parent_capability_id
   local -a argv=()
   launcher_capability_parent_found=0
   launcher_capability_root_transaction_parent=0
+  launcher_capability_assert_parent_capability "$parent_capability_kind" "$owner_uid" "$owner_gid"
+  parent_capability_id="$launcher_capability_parent_capability_identity"
+  current_uid="$(/usr/bin/id -u 2>/dev/null || true)"
+  [[ "$current_uid" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$current_uid" != "$owner_uid" ]]; then
+    # A dropped child cannot inspect a root-owned parent's /proc fd table.
+    # The role-bound, owner-bound fd 12 capability is the direct proof in
+    # this branch; same-UID callers retain the ancestry proof below.
+    case "$parent_capability_kind" in
+      installed-launcher) launcher_capability_parent_found=1 ;;
+      root-receipt) launcher_capability_root_transaction_parent=1 ;;
+    esac
+    return 0
+  fi
   for ((depth = 0; depth < 16; depth++)); do
     [[ "$pid" =~ ^[0-9]+$ && "$pid" != 0 ]] || break
-    if launcher_capability_process_has_descriptors "$pid" "$policy_id" "$stage_id" "$launcher_id"; then
+    if launcher_capability_process_has_descriptors "$pid" "$policy_id" "$stage_id" "$launcher_id" "$parent_capability_id"; then
       mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || true
       process_uid="$(/usr/bin/stat -c '%u' -- "/proc/$pid" 2>/dev/null || true)"
       if [[ "${argv[0]:-}" == /usr/bin/bash &&
@@ -304,8 +355,15 @@ launcher_capability_bind() {
   launcher_capability_assert_fd 9 "$policy_path" "$policy_identity"
   launcher_capability_assert_fd 10 "$stage_dir" "$stage_identity"
   launcher_capability_assert_fd 11 "$launcher_path" "$launcher_identity"
+  local parent_capability_kind
+  if [[ "$expected_entry" == receipt-authority ]]; then
+    parent_capability_kind=root-receipt
+  else
+    parent_capability_kind=installed-launcher
+  fi
   launcher_capability_bind_parent "$policy_identity" "$stage_identity" \
-    "$launcher_identity" "$launcher_path" "$payload_mode" || {
+    "$launcher_identity" "$launcher_path" "$payload_mode" "$policy_uid" "$policy_gid" \
+    "$parent_capability_kind" || {
     launcher_capability_fail 'no capable installed-launcher or root-receipt parent holds the descriptors'
   }
   if [[ "$payload_mode" == 1 ]]; then
@@ -349,7 +407,8 @@ launcher_capability_bind() {
 launcher_capability_lifetime() {
   [[ "$(launcher_capability_identity /proc/$BASHPID/fd/9)" == "$launcher_capability_policy_identity" &&
     "$(launcher_capability_identity /proc/$BASHPID/fd/10)" == "$launcher_capability_stage_identity" &&
-    "$(launcher_capability_identity /proc/$BASHPID/fd/11)" == "$launcher_capability_launcher_identity" ]] ||
+    "$(launcher_capability_identity /proc/$BASHPID/fd/11)" == "$launcher_capability_launcher_identity" &&
+    "$(launcher_capability_identity /proc/$BASHPID/fd/12)" == "$launcher_capability_parent_capability_identity" ]] ||
     launcher_capability_fail 'launcher capability replacement detected'
   [[ "$launcher_capability_policy_hash" == "$(
     printf '%s\n' \

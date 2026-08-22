@@ -426,6 +426,10 @@ else
         exec 9<"$policy"
         exec 10<"$payload_root"
         exec 11<"$launcher"
+        receipt_parent_capability="$(/usr/bin/mktemp -d /tmp/herdr-test-receipt-capability.XXXXXX)"
+        /usr/bin/chmod 0700 -- "$receipt_parent_capability"
+        exec 12<"$receipt_parent_capability"
+        /usr/bin/rm -rf -- "$receipt_parent_capability"
         /usr/bin/bash "$payload_root/source/scripts/ubuntu/receipt-authority.sh" "$@"
       ' _ "$root" "$launcher" "$fixture_root/etc/herdr-workstation/bootstrap-policy.conf" \
       "$mode" \

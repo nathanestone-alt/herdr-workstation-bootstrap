@@ -37,6 +37,9 @@ printf '%s\n' "$(/usr/bin/id -u)" > "$HOME/runtime-uid"
 printf '%s\n' "$(/usr/bin/id -g)" > "$HOME/runtime-gid"
 /usr/bin/id -G > "$HOME/runtime-groups"
 /usr/bin/awk '/^NoNewPrivs:/ { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' /proc/self/status > "$HOME/runtime-no-new-privs"
+printf '%s\n' "$launcher_capability_parent_capability_kind" > "$HOME/parent-capability-kind"
+/usr/bin/stat -Lc '%u:%g:%a:%F' -- /proc/$BASHPID/fd/12 > "$HOME/parent-capability-stat"
+/usr/bin/readlink -- /proc/$BASHPID/fd/12 > "$HOME/parent-capability-link"
 EOF
   chmod 0755 "$source_root/scripts/ubuntu/"*.sh
   git -C "$source_root" init -q
@@ -261,6 +264,47 @@ run_descriptor_fixture substitution substitution
 run_descriptor_fixture absence absence
 echo 'inherited policy descriptor, exact-byte, NUL/byte-count, alias-reopen, substitution, and absence tests passed.'
 
+parent_capability_file="$test_root/parent-capability-file"
+parent_capability_directory="$test_root/parent-capability-directory"
+printf 'L' > "$parent_capability_file"
+chmod 0600 "$parent_capability_file"
+mkdir "$parent_capability_directory"
+chmod 0700 "$parent_capability_directory"
+run_parent_capability_fixture() {
+  local label="$1" kind="$2" object="$3" should_pass="$4" output status
+  set +e
+  output="$(
+    (
+      set -euo pipefail
+      exec 12<&- 2>/dev/null || true
+      if [[ -n "$object" ]]; then
+        exec 12<"$object"
+        [[ "$should_pass" == 1 ]] && rm -rf -- "$object"
+      fi
+      # shellcheck disable=SC1090
+      source "$helper_definitions"
+      launcher_capability_assert_parent_capability "$kind" "$(/usr/bin/id -u)" "$(/usr/bin/id -g)"
+    ) 2>&1
+  )"
+  status=$?
+  set -e
+  if [[ "$should_pass" == 1 ]]; then
+    (( status == 0 )) || { printf '%s\n' "$output" >&2; fail_test "$label parent capability validation failed"; }
+  else
+    (( status != 0 )) || fail_test "$label parent capability unexpectedly passed"
+  fi
+}
+run_parent_capability_fixture installed-file installed-launcher "$parent_capability_file" 1
+run_parent_capability_fixture root-receipt-directory root-receipt "$parent_capability_directory" 1
+printf 'L' > "$parent_capability_file"
+chmod 0600 "$parent_capability_file"
+mkdir "$parent_capability_directory"
+chmod 0700 "$parent_capability_directory"
+run_parent_capability_fixture missing installed-launcher '' 0
+run_parent_capability_fixture substituted-file-for-receipt root-receipt "$parent_capability_file" 0
+run_parent_capability_fixture substituted-directory-for-launcher installed-launcher "$parent_capability_directory" 0
+echo 'parent capability positive, missing, substituted, and role-distinction tests passed.'
+
 forged_root="$test_root/forged"; forged_marker="$test_root/forged-entrypoint-reached"
 mkdir -p "$forged_root/scripts/ubuntu"
 cp -- "$source_root/scripts/ubuntu/trusted-launcher.sh" "$forged_root/scripts/ubuntu/trusted-launcher.sh"
@@ -438,6 +482,10 @@ else
     [[ "$(< "$fixture_home/runtime-gid")" == "$root_drop_gid" ]] || fail_test 'launcher did not set the fixture gid'
     [[ "$(tr -d '[:space:]' < "$fixture_home/runtime-groups")" == "$root_drop_gid" ]] || fail_test 'launcher did not clear supplementary groups'
     [[ "$(< "$fixture_home/runtime-no-new-privs")" == 1 ]] || fail_test 'launcher did not set no_new_privs'
+    [[ "$root_drop_uid" != "$(id -u)" ]] || fail_test 'root-drop fixture did not cross a uid boundary'
+    [[ "$(< "$fixture_home/parent-capability-kind")" == installed-launcher ]] || fail_test 'root-drop fixture used the wrong parent capability role'
+    [[ "$(< "$fixture_home/parent-capability-stat")" == '0:0:600:regular file' ]] || fail_test 'root-drop fixture parent capability owner/mode/type is wrong'
+    [[ "$(< "$fixture_home/parent-capability-link")" == *' (deleted)' ]] || fail_test 'root-drop fixture parent capability was not unlinked'
     [[ "$(stat -c '%u:%g:%a' "$launcher")" == 0:0:755 ]] || fail_test 'root-gated launcher binary is not root-owned'
     [[ "$(stat -c '%u:%g:%a' "$policy")" == 0:0:600 ]] || fail_test 'root-gated policy is not root-owned and private'
     [[ "$(stat -c '%u:%g:%a' "$stage_root")" == 0:0:755 ]] || fail_test 'root-gated staging root is not root-owned'
