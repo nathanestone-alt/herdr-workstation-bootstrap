@@ -23,7 +23,7 @@ launcher_capability_reject_symlink_components() {
 }
 
 launcher_capability_identity() {
-  /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "$1" 2>/dev/null || true
+  /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F:%s:%Y' -- "$1" 2>/dev/null || true
 }
 
 launcher_capability_realpath() {
@@ -37,6 +37,17 @@ launcher_capability_owner_mode() {
   gid="$(/usr/bin/stat -c '%g' -- "$path" 2>/dev/null || true)"
   mode="$(/usr/bin/stat -c '%a' -- "$path" 2>/dev/null || true)"
   [[ "$uid" == "$expected_uid" && "$gid" == "$expected_gid" && "$mode" == "$expected_mode" ]]
+}
+
+launcher_capability_capture_readonly() {
+  local variable="$1" expected="$2"
+  if [[ -v "$variable" ]]; then
+    [[ "${!variable}" == "$expected" ]] ||
+      launcher_capability_fail "captured capability changed: $variable"
+  else
+    printf -v "$variable" '%s' "$expected"
+  fi
+  readonly "$variable"
 }
 
 launcher_capability_assert_fd() {
@@ -92,7 +103,14 @@ launcher_capability_bind_parent() {
 }
 
 launcher_capability_parse_policy() {
-  local line policy_line=0
+  local expected_size="${1:-}" line policy_line=0 canonical_size
+  [[ "$expected_size" =~ ^[0-9]+$ ]] ||
+    launcher_capability_fail 'policy descriptor size is invalid'
+  if [[ "${launcher_capability_policy_captured:-0}" == 1 ]]; then
+    [[ "$expected_size" == "$launcher_capability_policy_byte_count" ]] ||
+      launcher_capability_fail 'policy descriptor size changed'
+    return 0
+  fi
   launcher_capability_policy_origin=''
   launcher_capability_policy_commit=''
   while :; do
@@ -132,6 +150,17 @@ launcher_capability_parse_policy() {
     launcher_capability_fail 'policy origin is not canonical HTTPS'
   }
 
+  canonical_size="$(
+    printf '%s\n' \
+      'herdr-bootstrap-policy-v1' \
+      "origin=$launcher_capability_policy_origin" \
+      "commit=$launcher_capability_policy_commit" |
+      /usr/bin/wc -c | /usr/bin/gawk '{print $1}'
+  )"
+  [[ "$canonical_size" =~ ^[0-9]+$ && "$canonical_size" == "$expected_size" ]] || {
+    launcher_capability_fail 'policy bytes are not exact'
+  }
+
   # fd 9 has been consumed directly.  These canonical bytes are exactly the
   # validated three-line policy, so later lifetime checks must not reopen fd 9.
   launcher_capability_policy_hash="$(
@@ -144,6 +173,15 @@ launcher_capability_parse_policy() {
   [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] || {
     launcher_capability_fail 'policy descriptor hash is invalid'
   }
+  launcher_capability_capture_readonly launcher_capability_policy_origin \
+    "$launcher_capability_policy_origin"
+  launcher_capability_capture_readonly launcher_capability_policy_commit \
+    "$launcher_capability_policy_commit"
+  launcher_capability_capture_readonly launcher_capability_policy_byte_count \
+    "$canonical_size"
+  launcher_capability_capture_readonly launcher_capability_policy_hash \
+    "$launcher_capability_policy_hash"
+  launcher_capability_capture_readonly launcher_capability_policy_captured 1
 }
 
 launcher_capability_bind() {
@@ -153,6 +191,7 @@ launcher_capability_bind() {
   local entry_source helper_path entry_dir
   local policy_fd_path stage_fd_path launcher_fd_path
   local policy_path policy_dir policy_identity launcher_path launcher_dir launcher_identity
+  local policy_size payload_root_value
   local staging_root stage_dir stage_identity entry_path repo_root
   local prefix expected_launcher expected_staging helper_identity
   local policy_uid policy_gid policy_mode stage_mode
@@ -175,9 +214,11 @@ launcher_capability_bind() {
   policy_identity="$(launcher_capability_identity "$policy_fd_path")"
   stage_identity="$(launcher_capability_identity "$stage_fd_path")"
   launcher_identity="$(launcher_capability_identity "$launcher_fd_path")"
-  [[ "$policy_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:regular[[:space:]]file$ &&
-    "$stage_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:directory$ &&
-    "$launcher_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:regular[[:space:]]file$ ]] || {
+  policy_size="$(/usr/bin/stat -Lc '%s' -- "$policy_fd_path" 2>/dev/null || true)"
+  [[ "$policy_size" =~ ^[0-9]+$ ]] || launcher_capability_fail 'policy descriptor size is unavailable'
+  [[ "$policy_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:regular[[:space:]]file:[0-9]+:[0-9]+$ &&
+    "$stage_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:directory:[0-9]+:[0-9]+$ &&
+    "$launcher_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:regular[[:space:]]file:[0-9]+:[0-9]+$ ]] || {
     launcher_capability_fail 'capability descriptors are not policy, stage, and launcher objects'
   }
   policy_path="$(launcher_capability_realpath "$policy_fd_path")"
@@ -251,10 +292,10 @@ launcher_capability_bind() {
   launcher_capability_owner_mode "$helper_path" "$policy_uid" "$policy_gid" 755 ||
     launcher_capability_fail 'capability helper owner or mode is unsafe'
 
-  launcher_capability_parse_policy
-  launcher_capability_policy_identity="$policy_identity"
-  launcher_capability_stage_identity="$stage_identity"
-  launcher_capability_launcher_identity="$launcher_identity"
+  launcher_capability_parse_policy "$policy_size"
+  launcher_capability_capture_readonly launcher_capability_policy_identity "$policy_identity"
+  launcher_capability_capture_readonly launcher_capability_stage_identity "$stage_identity"
+  launcher_capability_capture_readonly launcher_capability_launcher_identity "$launcher_identity"
   if [[ "$payload_mode" != 1 ]]; then
     [[ "$repo_root" == "$stage_dir" ]] ||
       launcher_capability_fail 'entrypoint repository is not the staged repository'
@@ -294,13 +335,14 @@ launcher_capability_bind() {
 
   launcher_capability_entry_name="$expected_entry"
   launcher_capability_entry_path="$entry_path"
-  launcher_capability_repo_root="$repo_root"
-  launcher_capability_stage_root="$stage_dir"
-  launcher_capability_policy_path="$policy_path"
-  launcher_capability_owner_uid="$policy_uid"
-  launcher_capability_owner_gid="$policy_gid"
-  launcher_capability_payload_root=''
-  [[ "$payload_mode" == 1 ]] && launcher_capability_payload_root="$stage_dir"
+  launcher_capability_capture_readonly launcher_capability_repo_root "$repo_root"
+  launcher_capability_capture_readonly launcher_capability_stage_root "$stage_dir"
+  launcher_capability_capture_readonly launcher_capability_policy_path "$policy_path"
+  launcher_capability_capture_readonly launcher_capability_owner_uid "$policy_uid"
+  launcher_capability_capture_readonly launcher_capability_owner_gid "$policy_gid"
+  payload_root_value=''
+  [[ "$payload_mode" == 1 ]] && payload_root_value="$stage_dir"
+  launcher_capability_capture_readonly launcher_capability_payload_root "$payload_root_value"
   return 0
 }
 
@@ -309,8 +351,13 @@ launcher_capability_lifetime() {
     "$(launcher_capability_identity /proc/$BASHPID/fd/10)" == "$launcher_capability_stage_identity" &&
     "$(launcher_capability_identity /proc/$BASHPID/fd/11)" == "$launcher_capability_launcher_identity" ]] ||
     launcher_capability_fail 'launcher capability replacement detected'
-  [[ "$launcher_capability_policy_hash" =~ ^[0-9a-f]{64}$ ]] ||
-    launcher_capability_fail 'policy capability hash is unavailable'
+  [[ "$launcher_capability_policy_hash" == "$(
+    printf '%s\n' \
+      'herdr-bootstrap-policy-v1' \
+      "origin=$launcher_capability_policy_origin" \
+      "commit=$launcher_capability_policy_commit" |
+      /usr/bin/sha256sum | /usr/bin/gawk '{print $1}'
+  )" ]] || launcher_capability_fail 'policy capability capture changed'
 }
 
 [[ "$#" -ge 1 && ( "$1" == bootstrap || "$1" == receipt-authority || "$1" == verify ) ]] ||

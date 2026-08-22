@@ -102,7 +102,15 @@ run_fixture_entrypoint bootstrap --phase validate-lock > "$test_root/dirty-boots
 run_fixture_entrypoint receipt-authority --help > "$test_root/dirty-receipt-output" 2>&1
 set +e
 run_fixture_entrypoint verify > "$test_root/dirty-verify-output" 2>&1
+dirty_verify_status=$?
 set -e
+# The clean fixture reaches verify, then reports its intentionally missing
+# managed tools; the capability/repository boundary must still complete first.
+(( dirty_verify_status == 1 )) || {
+  cat "$test_root/dirty-verify-output" >&2
+  echo "Clean verified verify entrypoint returned unexpected status $dirty_verify_status." >&2
+  exit 1
+}
 for entrypoint in bootstrap receipt-authority verify; do
   [[ ! -e "$test_root/dirty-$entrypoint-before-line-10" ]] || {
     echo "Dirty $entrypoint code before line 10 executed." >&2

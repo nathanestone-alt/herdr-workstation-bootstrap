@@ -122,62 +122,117 @@ done
 # Exercise the capability helper directly with a descriptor opened before the
 # policy path loses read permission.  This is the boundary that the installed
 # launcher crosses when it opens the root-owned policy and then drops identity.
-helper_definitions="$test_root/launcher-capability-definitions.sh"
+parser_access_root="$test_root/parser-access"
+mkdir -p "$parser_access_root"
+chmod 0755 "$test_root" "$parser_access_root"
+helper_definitions="$parser_access_root/launcher-capability-definitions.sh"
 set +e
 /usr/bin/awk '
-  /sha256sum/ && (/\$policy_fd_path/ || /\/proc\/\$BASHPID\/fd\/9/) {
+  function has_policy_alias(line) {
+    return index(line, "policy_fd_path") ||
+      index(line, "policy_path") ||
+      index(line, "launcher_capability_policy_path") ||
+      index(line, "/etc/herdr-workstation/bootstrap-policy.conf") ||
+      index(line, "bootstrap-policy.conf") ||
+      index(line, "/proc/$BASHPID/fd/9") ||
+      index(line, "/proc/${BASHPID}/fd/9") ||
+      index(line, "/proc/$PPID/fd/9") ||
+      index(line, "/proc/${PPID}/fd/9") ||
+      index(line, "/proc/self/fd/9") ||
+      index(line, "/proc/self/fd/09") ||
+      index(line, "/proc/$$/fd/9") ||
+      index(line, "/proc/$$/fd/09") ||
+      index(line, "/dev/fd/9")
+  }
+  /(^|[[:space:]\/])(sha256sum|cat|tee|dd|od|xxd|hexdump|base64|cmp|diff|awk|gawk|sed|grep|head|tail|wc|tr|sort|strings|python|perl)([[:space:]]|$)/ && has_policy_alias($0) {
     print
     bad=1
   }
-  /</ && (/\$policy_fd_path/ || /\/proc\/\$BASHPID\/fd\/9/) {
+  /</ && has_policy_alias($0) {
     print
     bad=1
   }
   END { exit bad }
-' "$repo_root/scripts/ubuntu/launcher-capability.sh" > "$test_root/policy-reopen.out"
+' "$repo_root/scripts/ubuntu/launcher-capability.sh" > "$parser_access_root/policy-reopen.out"
 policy_reopen_audit_status=$?
 set -e
 (( policy_reopen_audit_status == 0 )) || {
-  cat "$test_root/policy-reopen.out" >&2
-  fail_test 'capability helper reopens policy bytes through a path after descriptor binding'
+  cat "$parser_access_root/policy-reopen.out" >&2
+  fail_test 'capability helper has a policy-content reopen through a path or fd alias'
 }
 /usr/bin/awk '/^\[\[ "\$#" -ge 1/ { exit } { print }' \
   "$repo_root/scripts/ubuntu/launcher-capability.sh" > "$helper_definitions"
+chmod 0644 "$helper_definitions"
 inherited_policy=$'herdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
 duplicate_header_policy=$'herdr-bootstrap-policy-v1\nherdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
 malformed_policy=$'herdr-bootstrap-policy-v1\ninvalid-policy-line\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\n'
 trailing_bytes_policy=$'herdr-bootstrap-policy-v1\norigin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git\ncommit=0123456789012345678901234567890123456789\ntrailing-bytes'
-run_parser_fixture() {
-  local label="$1" policy_contents="$2" should_pass="$3" policy="$test_root/parser-$1" expected_hash status
-  printf '%s' "$policy_contents" > "$policy"
+parser_drop_uid=''
+parser_drop_gid=''
+if [[ "$(id -u)" == 0 && -x /usr/bin/setpriv ]]; then
+  parser_drop_uid="$(id -u nobody 2>/dev/null || true)"
+  parser_drop_gid="$(id -g nobody 2>/dev/null || true)"
+  [[ "$parser_drop_uid" =~ ^[0-9]+$ && "$parser_drop_gid" =~ ^[0-9]+$ ]] ||
+    fail_test 'root parser fixture could not resolve nobody identity'
+fi
+parser_command='set -euo pipefail
+source "$1"
+launcher_capability_parse_policy "$2"
+printf "%s\n" "$launcher_capability_policy_hash"'
+run_parser_file_fixture() {
+  local label="$1" policy="$2" should_pass="$3" expected_hash policy_size parser_output status
   chmod 0600 "$policy"
   expected_hash="$(/usr/bin/sha256sum -- "$policy" | /usr/bin/awk '{print $1}')"
+  policy_size="$(/usr/bin/stat -c '%s' -- "$policy")"
   set +e
-  (
-    set -euo pipefail
-    trap 'chmod 0600 -- "$policy"' EXIT
-    exec 9<"$policy"
-    chmod 000 -- "$policy"
-    # shellcheck disable=SC1090
-    source "$helper_definitions"
-    launcher_capability_parse_policy
-    printf '%s\n' "$launcher_capability_policy_hash" > "$test_root/parser-$label.hash"
-  ) > "$test_root/parser-$label.out" 2>&1
+  parser_output="$(
+    (
+      set -euo pipefail
+      exec 9<"$policy"
+      chmod 000 -- "$policy"
+      if [[ -n "$parser_drop_uid" ]]; then
+        /usr/bin/setpriv --reuid="$parser_drop_uid" --regid="$parser_drop_gid" --clear-groups \
+          /usr/bin/bash -c "$parser_command" _ "$helper_definitions" "$policy_size"
+      else
+        /usr/bin/bash -c "$parser_command" _ "$helper_definitions" "$policy_size"
+      fi
+    ) 2>&1
+  )"
   status=$?
   set -e
   chmod 0600 -- "$policy"
   if [[ "$should_pass" == 1 ]]; then
-    (( status == 0 )) || { cat "$test_root/parser-$label.out" >&2; fail_test "$label inherited-fd policy parse failed"; }
-    [[ "$(<"$test_root/parser-$label.hash")" == "$expected_hash" ]] ||
+    (( status == 0 )) || { printf '%s\n' "$parser_output" >&2; fail_test "$label inherited-fd policy parse failed"; }
+    [[ "$parser_output" == "$expected_hash" ]] ||
       fail_test "$label policy hash did not cover the inherited descriptor bytes"
   else
-    (( status != 0 )) || fail_test "$label malformed policy unexpectedly passed";
+    (( status != 0 )) || fail_test "$label malformed policy unexpectedly passed"
   fi
+}
+run_parser_fixture() {
+  local label="$1" policy_contents="$2" should_pass="$3" policy="$parser_access_root/parser-$1"
+  printf '%s' "$policy_contents" > "$policy"
+  run_parser_file_fixture "$label" "$policy" "$should_pass"
 }
 run_parser_fixture inherited-fd "$inherited_policy" 1
 run_parser_fixture duplicate-header "$duplicate_header_policy" 0
 run_parser_fixture malformed-line "$malformed_policy" 0
 run_parser_fixture trailing-bytes "$trailing_bytes_policy" 0
+nul_embedded_policy="$parser_access_root/parser-nul-embedded"
+{
+  printf '%s\n' 'herdr-bootstrap-policy-v1'
+  printf '%s\0%s\n' 'origin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git' ''
+  printf '%s\n' 'commit=0123456789012345678901234567890123456789'
+} > "$nul_embedded_policy"
+run_parser_file_fixture nul-embedded "$nul_embedded_policy" 0
+nul_trailing_policy="$parser_access_root/parser-nul-trailing"
+{
+  printf '%s\n' 'herdr-bootstrap-policy-v1'
+  printf '%s\n' 'origin=https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git'
+  printf '%s\n' 'commit=0123456789012345678901234567890123456789'
+  printf '\0'
+} > "$nul_trailing_policy"
+run_parser_file_fixture nul-trailing "$nul_trailing_policy" 0
 
 run_descriptor_fixture() {
   local label="$1" action="$2" policy="$test_root/descriptor-$1" replacement="$test_root/descriptor-$1-replacement" status
@@ -188,7 +243,7 @@ run_descriptor_fixture() {
   (
     set -euo pipefail
     exec 9<"$policy"
-    expected_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/9)"
+    expected_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F:%s:%Y' -- /proc/$BASHPID/fd/9)"
     # shellcheck disable=SC1090
     source "$helper_definitions"
     case "$action" in
@@ -204,7 +259,7 @@ run_descriptor_fixture() {
 }
 run_descriptor_fixture substitution substitution
 run_descriptor_fixture absence absence
-echo 'inherited policy descriptor, malformed-policy, duplicate-policy, substitution, and absence tests passed.'
+echo 'inherited policy descriptor, exact-byte, NUL/byte-count, alias-reopen, substitution, and absence tests passed.'
 
 forged_root="$test_root/forged"; forged_marker="$test_root/forged-entrypoint-reached"
 mkdir -p "$forged_root/scripts/ubuntu"
