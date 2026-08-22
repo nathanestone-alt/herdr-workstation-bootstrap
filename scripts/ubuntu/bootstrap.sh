@@ -22,6 +22,8 @@ readonly bootstrap_mkdir_bin='/usr/bin/mkdir'
 readonly bootstrap_head_bin='/usr/bin/head'
 readonly bootstrap_getent_bin='/usr/bin/getent'
 readonly bootstrap_id_bin='/usr/bin/id'
+readonly bootstrap_powershell_canonical_path='/opt/microsoft/powershell/7/pwsh'
+readonly bootstrap_powershell_fallback_path='/usr/bin/pwsh'
 
 export PATH="$bootstrap_trusted_path"
 export LC_ALL=C
@@ -153,7 +155,13 @@ bootstrap_command_path() {
     apt-get) default_path='/usr/bin/apt-get' ;;
     systemctl) default_path='/usr/bin/systemctl' ;;
     ps) default_path='/usr/bin/ps' ;;
-    pwsh) default_path='/usr/bin/pwsh' ;;
+    pwsh)
+      if [[ -x "$bootstrap_powershell_canonical_path" ]]; then
+        default_path="$bootstrap_powershell_canonical_path"
+      else
+        default_path="$bootstrap_powershell_fallback_path"
+      fi
+      ;;
     tailscale) default_path='/usr/bin/tailscale' ;;
     *) bootstrap_trust_fail "unsupported command seam: $name" ;;
   esac

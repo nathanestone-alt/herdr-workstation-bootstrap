@@ -142,6 +142,110 @@ for entrypoint in bootstrap receipt-authority verify; do
     { cat "$direct_output" >&2; echo "Direct $entrypoint lacked a capability rejection." >&2; exit 1; }
 done
 
+run_pwsh_target_case() {
+  local case_name="$1"
+  local case_mode="$2"
+  local case_root="$test_root/pwsh-target-$case_name"
+  local source_fixture="$case_root/source"
+  local fixture_root="$case_root/fixture"
+  local fixture_home="$fixture_root/home"
+  local transport="$fixture_root/transport.git"
+  local canonical_target="$case_root/system/opt/microsoft/powershell/7/pwsh"
+  local fallback_target="$case_root/system/usr/bin/pwsh"
+  local hostile_target="$case_root/hostile/pwsh"
+  local launcher output status fixture_commit dispatch_sentinel
+  mkdir -p -- "$case_root" "$source_fixture" "$fixture_root" "$fixture_home" \
+    "$(dirname -- "$canonical_target")" "$(dirname -- "$fallback_target")" \
+    "$(dirname -- "$hostile_target")"
+  cp -a -- "$repo_root/." "$source_fixture/"
+  /usr/bin/rm -rf -- "$source_fixture/.git" "$source_fixture/.agents" "$source_fixture/.codex"
+  chmod 0755 "$source_fixture"
+
+  printf '#!/usr/bin/bash\nexit 0\n' > "$fallback_target"
+  chmod 0755 "$fallback_target"
+  if [[ "$case_mode" == official ]]; then
+    printf '#!/usr/bin/bash\nexit 0\n' > "$canonical_target"
+    chmod 0755 "$canonical_target"
+  else
+    printf '#!/usr/bin/bash\nexit 99\n' > "$hostile_target"
+    chmod 0755 "$hostile_target"
+    ln -s -- "$hostile_target" "$canonical_target"
+  fi
+
+  # Point only the two PowerShell names at the disposable fixture. The real
+  # bootstrap trust seam and its strict assertion remain under test.
+  /usr/bin/sed -i \
+    -e "s|/opt/microsoft/powershell/7/pwsh|$canonical_target|g" \
+    -e "s|/usr/bin/pwsh|$fallback_target|g" \
+    "$source_fixture/scripts/ubuntu/bootstrap.sh"
+  dispatch_sentinel='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
+  /usr/bin/awk -v sentinel="$dispatch_sentinel" '
+    $0 == sentinel { exit }
+    { print }
+  ' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
+  /usr/bin/mv -T -- "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" \
+    "$source_fixture/scripts/ubuntu/bootstrap.sh"
+  cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "$phase" in
+    pwsh-target) bootstrap_command_path pwsh ;;
+    *) echo "Unsupported fixture phase: $phase" >&2; exit 2 ;;
+  esac
+fi
+EOF
+  chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
+
+  /usr/bin/git -C "$source_fixture" init -q
+  /usr/bin/git -C "$source_fixture" config user.email fixture@example.invalid
+  /usr/bin/git -C "$source_fixture" config user.name fixture
+  /usr/bin/git -C "$source_fixture" remote add origin "$canonical_origin"
+  /usr/bin/git -C "$source_fixture" add -f .
+  /usr/bin/git -C "$source_fixture" commit -qm "PowerShell target $case_name fixture"
+  /usr/bin/git clone -q --bare "$source_fixture" "$transport"
+  chmod 0700 "$transport"
+  fixture_commit="$(/usr/bin/git -C "$source_fixture" rev-parse --verify HEAD^{commit})"
+  /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" \
+    --origin "$canonical_origin" --commit "$fixture_commit" \
+    --fixture-root "$fixture_root" --fixture-transport "$transport" --fixture-home "$fixture_home" \
+    > "$case_root/launcher-install.out"
+  launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
+
+  set +e
+  /usr/bin/env -i HOME="$fixture_home" PATH="$hostile_bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    BASH_ENV= ENV= LC_ALL=C TZ=UTC \
+    "$launcher" --entrypoint bootstrap -- --phase pwsh-target > "$case_root/output.log" 2>&1
+  status=$?
+  set -e
+  if [[ "$case_mode" == official ]]; then
+    (( status == 0 )) || {
+      cat "$case_root/output.log" >&2
+      echo 'Official PowerShell layout was rejected.' >&2
+      exit 1
+    }
+    output="$(/usr/bin/tail -n 1 -- "$case_root/output.log")"
+    [[ "$output" == "$canonical_target" ]] || {
+      cat "$case_root/output.log" >&2
+      echo 'Bootstrap did not select the canonical PowerShell target.' >&2
+      exit 1
+    }
+  else
+    (( status == 24 )) || {
+      cat "$case_root/output.log" >&2
+      echo "Unsafe canonical PowerShell target returned status $status." >&2
+      exit 1
+    }
+    grep -Fq "trusted binary is missing or not a regular executable: $canonical_target" \
+      "$case_root/output.log" || {
+      cat "$case_root/output.log" >&2
+      echo 'Unsafe canonical PowerShell target was not rejected at the trust seam.' >&2
+      exit 1
+    }
+  fi
+}
+
+run_pwsh_target_case official official
+run_pwsh_target_case hostile hostile
+
 # Preserve the already-resolved fencing invariants in this end-to-end guard.
 ! /usr/bin/grep -Fq '.cargo/env' "$repo_root/scripts/ubuntu/bootstrap.sh" ||
   { echo 'Bootstrap still sources .cargo/env.' >&2; exit 1; }
