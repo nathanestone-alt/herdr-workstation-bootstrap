@@ -18,7 +18,7 @@ expect_failure() {
 }
 
 make_fixture() {
-  local name="$1" pause_kind="${2:-none}" runtime_uid_arg="${3:-}" runtime_gid_arg="${4:-}"
+  local name="$1" pause_kind="${2:-none}" runtime_uid_arg="${3:-}" runtime_gid_arg="${4:-}" publish_mode="${5:-none}"
   fixture_root="$test_root/$name/fixture"
   source_root="$test_root/$name/source"
   fixture_home="$fixture_root/home"
@@ -63,7 +63,21 @@ EOF
     entry_ready="$fixture_root/entry.ready"; entry_continue="$fixture_root/entry.continue"
     install_args+=(--fixture-entry-ready "$entry_ready" --fixture-entry-continue "$entry_continue")
   fi
-  /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" "${install_args[@]}" >"$test_root/$name/install.out"
+  if [[ "$publish_mode" == publish-failure || "$publish_mode" == publish-replace ]]; then
+    publish_ready="$fixture_root/publish.ready"
+    publish_continue="$fixture_root/publish.continue"
+    install_args+=(--fixture-publish-pause-ready "$publish_ready" --fixture-publish-pause-continue "$publish_continue")
+    [[ "$publish_mode" == publish-failure ]] &&
+      install_args+=(--fixture-publish-fail-after-stage)
+  elif [[ "$publish_mode" != none ]]; then
+    fail_test "unknown publication fixture mode: $publish_mode"
+  fi
+  if [[ "$publish_mode" == publish-failure || "$publish_mode" == publish-replace ]]; then
+    /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" "${install_args[@]}" >"$test_root/$name/install.out" 2>&1 &
+    publish_install_pid=$!
+  else
+    /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" "${install_args[@]}" >"$test_root/$name/install.out"
+  fi
 launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
 policy="$fixture_root/etc/herdr-workstation/bootstrap-policy.conf"
 policy_dir="$fixture_root/etc/herdr-workstation"
@@ -207,6 +221,62 @@ chmod 0755 "$replacement"; mv -T -- "$replacement" "$staged_entry"; : > "$entry_
 set +e; wait "$entry_race_pid"; entry_race_status=$?; set -e
 (( entry_race_status != 0 )) || fail_test 'entrypoint replacement race was accepted'
 [[ ! -e "$test_root/replacement-entrypoint-reached" ]] || fail_test 'replacement entrypoint executed'
+
+# A publication failure after staging must remove only the staging inode it
+# created, leaving no root-owned .herdr-bootstrap-publish.* residue.
+make_fixture publish-failure none '' '' publish-failure
+for attempt in $(seq 1 2000); do
+  [[ -e "$publish_ready" ]] && break
+  sleep 0.01
+done
+if [[ ! -e "$publish_ready" ]]; then
+  : > "$publish_continue"
+  kill "$publish_install_pid" 2>/dev/null || true
+  wait "$publish_install_pid" 2>/dev/null || true
+  fail_test 'publication failure fixture did not reach its staging pause'
+fi
+: > "$publish_continue"
+set +e
+wait "$publish_install_pid"
+publish_failure_status=$?
+set -e
+(( publish_failure_status != 0 )) || fail_test 'publication failure fixture unexpectedly passed'
+[[ -z "$(find "$fixture_root" -type f -name '.herdr-bootstrap-publish.*' -print -quit)" ]] ||
+  fail_test 'failed publication leaked a staging file'
+
+# If the staging pathname is replaced by an unrelated inode while paused,
+# identity-bound cleanup must fail closed and preserve that replacement.
+make_fixture publish-replace none '' '' publish-replace
+for attempt in $(seq 1 2000); do
+  [[ -e "$publish_ready" ]] && break
+  sleep 0.01
+done
+if [[ ! -e "$publish_ready" ]]; then
+  : > "$publish_continue"
+  kill "$publish_install_pid" 2>/dev/null || true
+  wait "$publish_install_pid" 2>/dev/null || true
+  fail_test 'publication replacement fixture did not reach its staging pause'
+fi
+publish_stage_path="$(find "$fixture_root" -type f -name '.herdr-bootstrap-publish.*' -print -quit)"
+[[ -n "$publish_stage_path" ]] || {
+  : > "$publish_continue"
+  kill "$publish_install_pid" 2>/dev/null || true
+  wait "$publish_install_pid" 2>/dev/null || true
+  fail_test 'publication replacement fixture did not expose its staging file'
+}
+mv -- "$publish_stage_path" "$test_root/unrelated-publication-file"
+printf 'unrelated publication content\n' > "$publish_stage_path"
+chmod 0600 "$publish_stage_path"
+: > "$publish_continue"
+set +e
+wait "$publish_install_pid"
+publish_replace_status=$?
+set -e
+(( publish_replace_status != 0 )) || fail_test 'publication replacement fixture unexpectedly passed'
+grep -Fqx -- 'install-trusted-launcher: publication staging file was replaced' "$test_root/publish-replace/install.out" ||
+  fail_test 'publication replacement fixture emitted the wrong diagnostic'
+[[ -f "$publish_stage_path" && "$(< "$publish_stage_path")" == 'unrelated publication content' ]] ||
+  fail_test 'failed publication removed an unrelated replacement path'
 
 if [[ "$(id -u)" != 0 ]]; then
   echo "SKIP: root-gated launcher privilege-drop tests (root unavailable; uid=$(id -u))."

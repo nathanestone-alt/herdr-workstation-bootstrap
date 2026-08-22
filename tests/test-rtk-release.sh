@@ -217,4 +217,64 @@ if wait "$race_pid"; then
 fi
 [[ ! -e "$race_target" && ! -L "$race_target" ]] || exit 1
 
+# A target replacement after publication staging is bound must fail with the
+# existing diagnostic and leave the attacker's replacement untouched.
+target_race_target="$(new_target target-replacement-race)"
+write_rtk_binary "$target_race_target" "$version"
+target_race_ready="$test_root/target-race-ready"
+target_race_continue="$test_root/target-race-continue"
+rtk_release_target_race_pause() {
+  local phase="$1"
+  if [[ "$phase" == before-rtk-publish ]]; then
+    : > "$target_race_ready"
+    while [[ ! -e "$target_race_continue" ]]; do
+      /usr/bin/sleep 0.01
+    done
+  fi
+}
+rtk_release_install_archive "$valid_archive" "$valid_sha" "$version" "$target_race_target" \
+  rtk_release_target_race_pause > "$test_root/target-replacement-race.log" 2>&1 &
+target_race_pid=$!
+for _ in $(seq 1 2000); do
+  [[ -e "$target_race_ready" ]] && break
+  /usr/bin/sleep 0.01
+done
+if [[ ! -e "$target_race_ready" ]]; then
+  : > "$target_race_continue"
+  kill "$target_race_pid" 2>/dev/null || true
+  wait "$target_race_pid" 2>/dev/null || true
+  echo 'RTK target replacement fixture did not reach its publish pause.' >&2
+  exit 1
+fi
+mv -- "$target_race_target" "$target_race_target.original"
+write_rtk_binary "$target_race_target" 'attacker'
+target_race_attacker_id="$(stat -Lc '%d:%i' -- "$target_race_target")"
+target_race_attacker_hash="$(/usr/bin/sha256sum -- "$target_race_target" | /usr/bin/gawk '{print $1}')"
+: > "$target_race_continue"
+set +e
+wait "$target_race_pid"
+target_race_status=$?
+set -e
+(( target_race_status != 0 )) || {
+  echo 'RTK release fixture accepted a target replacement race.' >&2
+  exit 1
+}
+grep -Fqx -- 'RTK release install: RTK target was replaced during publication' \
+  "$test_root/target-replacement-race.log" || {
+  cat "$test_root/target-replacement-race.log" >&2
+  echo 'RTK target replacement race emitted the wrong diagnostic.' >&2
+  exit 1
+}
+[[ -f "$target_race_target" && ! -L "$target_race_target" &&
+  "$(stat -Lc '%d:%i' -- "$target_race_target")" == "$target_race_attacker_id" &&
+  "$(/usr/bin/sha256sum -- "$target_race_target" | /usr/bin/gawk '{print $1}')" == "$target_race_attacker_hash" &&
+  "$("$target_race_target" --version)" == 'rtk attacker' ]] || {
+  echo 'RTK target replacement race did not preserve the attacker replacement.' >&2
+  exit 1
+}
+[[ -z "$(find "${target_race_target%/*}" -maxdepth 1 -name '.rtk-release.*' -print -quit)" ]] || {
+  echo 'RTK target replacement race leaked a publication staging file.' >&2
+  exit 1
+}
+
 printf '%s\n' 'RTK release fixtures passed.'

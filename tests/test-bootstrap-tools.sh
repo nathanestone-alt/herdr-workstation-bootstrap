@@ -23,7 +23,24 @@ transport="$fixture_root/transport.git"
 mkdir -p -- "$fixture_root" "$fixture_home"
 cp -a -- "$repo_root/." "$source_fixture/"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex" "$source_fixture/.git"
-head -n -9 "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
+dispatch_sentinel='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
+dispatch_counts="$(/usr/bin/awk -v sentinel="$dispatch_sentinel" '
+  index($0, "if [[ \"${BASH_SOURCE[0]}\"") == 1 {
+    candidates++
+    if ($0 == sentinel) exact++
+  }
+  END { printf "%d %d\n", candidates + 0, exact + 0 }
+' "$source_fixture/scripts/ubuntu/bootstrap.sh")"
+read -r dispatch_candidate_count dispatch_sentinel_count <<< "$dispatch_counts"
+[[ "$dispatch_candidate_count" == 1 && "$dispatch_sentinel_count" == 1 ]] || {
+  echo 'Bootstrap tools fixture dispatch sentinel is missing or malformed.' >&2
+  exit 1
+}
+/usr/bin/awk -v sentinel="$dispatch_sentinel" '
+  $0 == sentinel { found++; exit }
+  { print }
+  END { exit(found == 1 ? 0 : 1) }
+' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
 mv -T -- "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
 cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
 fixture_tools_root="${HOME%/home}"
@@ -244,8 +261,8 @@ tar -C "$test_root/rtk-root" -czf "$fixture_root/rtk-official-fixture.tar.gz" rt
 chmod 0600 "$fixture_root/rtk-official-fixture.tar.gz"
 
 run_tools() {
-  /usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \\
-    BASH_ENV= ENV= LC_ALL=C TZ=UTC \\
+  /usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    BASH_ENV= ENV= LC_ALL=C TZ=UTC \
     "$launcher" --entrypoint bootstrap -- --phase tools
 }
 

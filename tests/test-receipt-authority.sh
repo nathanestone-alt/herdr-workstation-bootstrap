@@ -343,7 +343,17 @@ chmod 0755 "$role_stage_race_hostile"
   run_authority_with_pause --install
 ) > "$test_root/role-stage-race-output" 2>&1 &
 role_stage_race_pid=$!
-while [[ ! -e "$role_stage_race_ready" ]]; do sleep 0.01; done
+for attempt in $(seq 1 2000); do
+  [[ -e "$role_stage_race_ready" ]] && break
+  sleep 0.01
+done
+if [[ ! -e "$role_stage_race_ready" ]]; then
+  : > "$role_stage_race_continue"
+  kill "$role_stage_race_pid" 2>/dev/null || true
+  wait "$role_stage_race_pid" 2>/dev/null || true
+  echo 'Receipt staged-role race did not reach its proof pause.' >&2
+  exit 1
+fi
 role_stage_race_replaced=0
 for role_stage_dir in /tmp/herdr-receipt-exec.*; do
   [[ -f "$role_stage_dir/rtk" ]] || continue

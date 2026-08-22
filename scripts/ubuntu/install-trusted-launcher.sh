@@ -22,6 +22,8 @@ Usage: install-trusted-launcher.sh --origin HTTPS_URL --commit SHA
   [--fixture-entry-ready PATH --fixture-entry-continue PATH]
   [--fixture-receipt-pause-phase NAME --fixture-receipt-pause-ready PATH
    --fixture-receipt-pause-continue PATH]
+  [--fixture-publish-pause-ready PATH --fixture-publish-pause-continue PATH
+   --fixture-publish-fail-after-stage]
 EOF
   exit 2
 }
@@ -30,6 +32,7 @@ fixture_root=''; fixture_transport=''; fixture_home=''
 fixture_runtime_uid=''; fixture_runtime_gid=''
 policy_ready=''; policy_continue=''; entry_ready=''; entry_continue=''
 fixture_receipt_pause_phase=''; fixture_receipt_pause_ready=''; fixture_receipt_pause_continue=''
+fixture_publish_pause_ready=''; fixture_publish_pause_continue=''; fixture_publish_fail_after_stage=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --origin) [[ $# -ge 2 ]] || usage; origin="$2"; shift 2 ;;
@@ -48,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     --fixture-receipt-pause-phase) [[ $# -ge 2 ]] || usage; fixture_receipt_pause_phase="$2"; shift 2 ;;
     --fixture-receipt-pause-ready) [[ $# -ge 2 ]] || usage; fixture_receipt_pause_ready="$2"; shift 2 ;;
     --fixture-receipt-pause-continue) [[ $# -ge 2 ]] || usage; fixture_receipt_pause_continue="$2"; shift 2 ;;
+    --fixture-publish-pause-ready) [[ $# -ge 2 ]] || usage; fixture_publish_pause_ready="$2"; shift 2 ;;
+    --fixture-publish-pause-continue) [[ $# -ge 2 ]] || usage; fixture_publish_pause_continue="$2"; shift 2 ;;
+    --fixture-publish-fail-after-stage) fixture_publish_fail_after_stage=1; shift ;;
     *) usage ;;
   esac
 done
@@ -62,7 +68,7 @@ done
   fail 'fixture receipt pause phase is not canonical'
 [[ -x "$awk_bin" ]] ||
   fail 'gawk is required before provisioning; install and verify /usr/bin/gawk out of band'
-for value in "$fixture_root" "$fixture_transport" "$fixture_home" "$policy_ready" "$policy_continue" "$entry_ready" "$entry_continue" "$fixture_receipt_pause_ready" "$fixture_receipt_pause_continue"; do
+for value in "$fixture_root" "$fixture_transport" "$fixture_home" "$policy_ready" "$policy_continue" "$entry_ready" "$entry_continue" "$fixture_receipt_pause_ready" "$fixture_receipt_pause_continue" "$fixture_publish_pause_ready" "$fixture_publish_pause_continue"; do
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *"'"* && "$value" != *'\'* ]] ||
     fail 'path contains unsupported characters'
 done
@@ -97,7 +103,9 @@ if [[ -z "$fixture_root" ]]; then
   [[ -z "$fixture_transport" && -z "$policy_ready" && -z "$policy_continue" &&
     -z "$entry_ready" && -z "$entry_continue" && -z "$fixture_runtime_uid" &&
     -z "$fixture_runtime_gid" && -z "$fixture_receipt_pause_phase" &&
-    -z "$fixture_receipt_pause_ready" && -z "$fixture_receipt_pause_continue" ]] ||
+    -z "$fixture_receipt_pause_ready" && -z "$fixture_receipt_pause_continue" &&
+    -z "$fixture_publish_pause_ready" && -z "$fixture_publish_pause_continue" &&
+    "$fixture_publish_fail_after_stage" == 0 ]] ||
     fail 'fixture-only options are not permitted in production'
   prefix=''; expected_uid=0; expected_gid=0; system_uid=0; system_gid=0
   runtime_uid="$($id_bin -u "$run_as_user" 2>/dev/null || true)"
@@ -151,7 +159,7 @@ assert_components "$runtime_home" || fail 'runtime home has a symlinked componen
 [[ -d "$runtime_home" && ! -L "$runtime_home" &&
   "$($stat_bin -c '%u:%g' -- "$runtime_home")" == "$runtime_uid:$runtime_gid" ]] ||
   fail 'runtime home is not owned by the selected account'
-for path_value in "$policy_ready" "$policy_continue" "$entry_ready" "$entry_continue" "$fixture_receipt_pause_ready" "$fixture_receipt_pause_continue"; do
+for path_value in "$policy_ready" "$policy_continue" "$entry_ready" "$entry_continue" "$fixture_receipt_pause_ready" "$fixture_receipt_pause_continue" "$fixture_publish_pause_ready" "$fixture_publish_pause_continue"; do
   [[ -z "$path_value" || ( "$path_value" == "$prefix/"* && "$path_value" == /* ) ]] ||
     fail 'fixture pause paths must be inside fixture root'
 done
@@ -161,6 +169,17 @@ if [[ -n "$fixture_receipt_pause_phase" ]]; then
 else
   [[ -z "$fixture_receipt_pause_ready" && -z "$fixture_receipt_pause_continue" ]] ||
     fail 'fixture receipt pause paths require a phase'
+fi
+if [[ -n "$fixture_publish_pause_ready" || -n "$fixture_publish_pause_continue" ||
+  "$fixture_publish_fail_after_stage" == 1 ]]; then
+  [[ -n "$fixture_root" ]] || fail 'fixture publication controls require fixture mode'
+  if [[ -n "$fixture_publish_pause_ready" || -n "$fixture_publish_pause_continue" ]]; then
+    [[ -n "$fixture_publish_pause_ready" && -n "$fixture_publish_pause_continue" ]] ||
+      fail 'fixture publication pause requires both synchronization paths'
+  fi
+else
+  [[ -z "$fixture_publish_pause_ready" && -z "$fixture_publish_pause_continue" ]] ||
+    fail 'fixture publication pause paths require publication controls'
 fi
 
 policy_dir="$(path /etc/herdr-workstation)"
@@ -191,9 +210,20 @@ else
 fi
 
 provision_root="$($mktemp_bin -d "$stage_root/.provision.XXXXXX")"
+publish_tmp=''
+publish_tmp_id=''
+cleanup_publish_tmp() {
+  if [[ -n "${publish_tmp:-}" && -n "${publish_tmp_id:-}" &&
+    -f "$publish_tmp" && ! -L "$publish_tmp" &&
+    "$($stat_bin -Lc '%d:%i' -- "$publish_tmp" 2>/dev/null || true)" == "$publish_tmp_id" &&
+    "$($realpath_bin -e -- "$publish_tmp" 2>/dev/null || true)" == "$publish_tmp" ]]; then
+    "$rm_bin" -f -- "$publish_tmp"
+  fi
+}
 cleanup() {
   local status="$1"
   set +e
+  cleanup_publish_tmp
   [[ -n "${provision_root:-}" && -d "$provision_root" ]] && "$rm_bin" -rf -- "$provision_root"
   return "$status"
 }
@@ -278,10 +308,30 @@ publish() {
   parent="${target%/*}"
   [[ "$parent" != "$target" ]] || parent=/
   tmp="$($mktemp_bin "$parent/.herdr-bootstrap-publish.XXXXXX")"
+  publish_tmp="$tmp"
+  publish_tmp_id="$($stat_bin -Lc '%d:%i' -- "$tmp" 2>/dev/null || true)"
+  [[ "$publish_tmp_id" =~ ^[0-9]+:[0-9]+$ ]] ||
+    fail 'publication staging identity is invalid'
   "$cp_bin" -- "$source" "$tmp"
   "$chmod_bin" "$mode" -- "$tmp"
+  [[ -f "$tmp" && ! -L "$tmp" &&
+    "$($stat_bin -Lc '%d:%i' -- "$tmp" 2>/dev/null || true)" == "$publish_tmp_id" ]] ||
+    fail 'publication staging file was replaced'
+  if [[ -n "$fixture_publish_pause_ready" ]]; then
+    : > "$fixture_publish_pause_ready"
+    while [[ ! -e "$fixture_publish_pause_continue" ]]; do
+      /usr/bin/sleep 0.01
+    done
+  fi
+  [[ -f "$tmp" && ! -L "$tmp" &&
+    "$($stat_bin -Lc '%d:%i' -- "$tmp" 2>/dev/null || true)" == "$publish_tmp_id" ]] ||
+    fail 'publication staging file was replaced'
+  [[ "$fixture_publish_fail_after_stage" == 0 ]] ||
+    fail 'fixture publication failure after staging'
   [[ -n "$fixture_root" ]] || "$chown_bin" 0:0 -- "$tmp"
   "$mv_bin" -T -- "$tmp" "$target"
+  publish_tmp=''
+  publish_tmp_id=''
   [[ -f "$target" && ! -L "$target" ]] || fail "atomic publication failed: $target"
 }
 
