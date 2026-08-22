@@ -625,11 +625,8 @@ source_root="$repo_root"
 user_home="${HOME:-}"
 authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 receipt_path='/etc/stmodel/issue-961/receipt.json'
-rtk_source_root=''
 source_manifest=''
-rtk_source_manifest=''
 source_manifest_supplied=0
-rtk_source_manifest_supplied=0
 payload_root=''
 payload_manifest_arg=''
 source_commit_binding=''
@@ -650,9 +647,7 @@ Options:
   --user-home PATH         Managed user home whose tools are attested.
   --authority-path PATH    Authority envelope path (production default is /etc/stmodel/issue-961/receipt-authority.json).
   --receipt-path PATH      Receipt body path (production default is /etc/stmodel/issue-961/receipt.json).
-  --rtk-source-root PATH   Canonical RTK source checkout (default is USER_HOME/src/rtk).
   --source-manifest PATH   Exact committed source snapshot manifest.
-  --rtk-source-manifest PATH Exact committed RTK snapshot manifest.
   --payload-root PATH      Root of the root-owned verified payload staging tree.
   --payload-manifest PATH  Verified payload manifest within PAYLOAD_ROOT.
   --payload-manifest-sha256 SHA256  Internal root-stage payload manifest binding.
@@ -669,9 +664,7 @@ while [[ $# -gt 0 ]]; do
     --user-home) [[ $# -ge 2 ]] || { usage; exit 2; }; user_home="$2"; shift 2 ;;
     --authority-path) [[ $# -ge 2 ]] || { usage; exit 2; }; authority_path="$2"; shift 2 ;;
     --receipt-path) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_path="$2"; shift 2 ;;
-    --rtk-source-root) [[ $# -ge 2 ]] || { usage; exit 2; }; rtk_source_root="$2"; shift 2 ;;
     --source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; source_manifest="$2"; shift 2 ;;
-    --rtk-source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; rtk_source_manifest="$2"; shift 2 ;;
     --payload-root) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_root="$2"; shift 2 ;;
     --payload-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_manifest_arg="$2"; shift 2 ;;
     --payload-manifest-sha256) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_prelude_payload_hash="$2"; shift 2 ;;
@@ -681,7 +674,6 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
-[[ -n "$rtk_source_manifest" ]] && rtk_source_manifest_supplied=1
 
 fail() {
   echo "receipt authority: $*" >&2
@@ -700,9 +692,7 @@ receipt_test_pause() {
 
 [[ "$mode" == install || "$mode" == check ]] || fail "unsupported mode '$mode'"
 [[ "$source_root" == /* && "$user_home" == /* && "$authority_path" == /* && "$receipt_path" == /* \
-  && ( -z "$rtk_source_root" || "$rtk_source_root" == /* ) \
   && ( -z "$source_manifest" || "$source_manifest" == /* ) \
-  && ( -z "$rtk_source_manifest" || "$rtk_source_manifest" == /* ) \
   && ( -z "$payload_root" || "$payload_root" == /* ) \
   && ( -z "$payload_manifest_arg" || "$payload_manifest_arg" == /* ) ]] || {
   fail 'source, home, authority, and receipt paths must be absolute'
@@ -763,7 +753,6 @@ if [[ -n "$payload_root" || -n "$payload_manifest_arg" ]]; then
   attestation_verify_payload_manifest "$payload_root" "$payload_manifest_arg" "$receipt_prelude_payload_hash" || fail 'payload manifest is invalid or externally unbound'
 fi
 [[ "$source_manifest_supplied" == 0 || -n "$payload_root" ]] || fail 'a supplied source manifest requires an externally bound payload'
-[[ "$rtk_source_manifest_supplied" == 0 || -n "$payload_root" ]] || fail 'a supplied RTK manifest requires an externally bound payload'
 
 user_home="$(/usr/bin/realpath -e -- "$user_home" 2>/dev/null || true)"
 [[ -n "$user_home" && -d "$user_home" ]] || fail 'managed user home does not exist'
@@ -773,9 +762,6 @@ receipt_user_gid="$(/usr/bin/stat -c '%g' -- "$user_home" 2>/dev/null || true)"
 if [[ -z "$fixture_root" ]]; then
   [[ "$(/usr/bin/id -u)" == 0 && "$(/usr/bin/stat -c '%u' -- "$receipt_setpriv_bin")" == 0 ]] || fail 'root Python probes require a root-owned setpriv boundary'
 fi
-if [[ -z "$rtk_source_root" ]]; then rtk_source_root="$user_home/src/rtk"; fi
-rtk_source_root="$(/usr/bin/realpath -e -- "$rtk_source_root" 2>/dev/null || true)"
-[[ -n "$rtk_source_root" && -d "$rtk_source_root" ]] || fail 'RTK source checkout does not exist'
 [[ "$(/usr/bin/uname -s)" == 'Linux' && "$(/usr/bin/uname -m)" == 'x86_64' ]] || fail 'receipt authority requires Ubuntu x86_64 Linux'
 if [[ -z "$fixture_root" ]]; then
   # shellcheck disable=SC1091
@@ -798,30 +784,8 @@ reject_symlink_components() {
   done
 }
 
-validate_rtk_source_checkout() {
-  local source_path="${1:-}"
-  local expected_url="${2:-}"
-  local expected_ref="${3:-}"
-  if [[ -n "$rtk_source_manifest" ]]; then
-    rtk_source_manifest="$(/usr/bin/realpath -e -- "$rtk_source_manifest" 2>/dev/null || true)"
-    [[ "$rtk_source_manifest" == "$source_path/.source-attestation" ]] || fail 'RTK source manifest is not bound to the RTK snapshot'
-    attestation_verify_snapshot "$source_path" "$rtk_source_manifest" "$expected_ref" "$expected_url" || fail 'RTK source snapshot manifest is invalid'
-  else
-    attestation_create_git_snapshot "$source_path" "$expected_url" "$expected_ref" || return 1
-    source_path="$attestation_snapshot_dir"
-    rtk_source_manifest="$attestation_snapshot_manifest"
-  fi
-  rtk_snapshot_path="$source_path"
-  rtk_snapshot_manifest="$rtk_source_manifest"
-  rtk_snapshot_commit="$attestation_snapshot_commit"
-  rtk_snapshot_url="$attestation_snapshot_url"
-  rtk_snapshot_manifest_sha256="$(attestation_hash_file "$rtk_snapshot_manifest")" || return 1
-}
-
 reject_symlink_components "$user_home" || fail "managed user home contains a symlink: $user_home"
 [[ "$(/usr/bin/realpath -e -- "$user_home" 2>/dev/null || true)" == "$user_home" ]] || fail "managed user home is not lexically canonical: $user_home"
-reject_symlink_components "$rtk_source_root" || fail "RTK source checkout contains a symlink: $rtk_source_root"
-[[ "$(/usr/bin/realpath -e -- "$rtk_source_root" 2>/dev/null || true)" == "$rtk_source_root" ]] || fail "RTK source checkout is not lexically canonical: $rtk_source_root"
 
 lock_file="$source_root/config/ubuntu-toolchain.lock"
 allowlist_file="$source_root/config/receipt-authority-role-allowlist.txt"
@@ -830,8 +794,10 @@ payload_manifest="$source_root/config/payload-manifest.sha256"
 # shellcheck disable=SC1090
 source "$lock_file"
 
-[[ "${RTK_REPO_URL:-}" =~ ^https://[^[:space:]]+$ ]] || fail 'RTK_REPO_URL is not a valid locked HTTPS URL'
-[[ "${RTK_REF:-}" =~ ^[0-9a-f]{40}$ ]] || fail 'RTK_REF is not a full locked commit'
+[[ "${RTK_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'RTK_VERSION is not a locked semantic version'
+[[ "${RTK_URL:-}" == "https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION/rtk-x86_64-unknown-linux-musl.tar.gz" ]] ||
+  fail 'RTK_URL is not the locked official x86-64 Linux release URL'
+[[ "${RTK_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || fail 'RTK_SHA256 is not a lowercase SHA-256 value'
 
 repo_commit="$source_commit"
 [[ "$repo_commit" =~ ^[0-9a-f]{40}$ ]] || fail 'source snapshot commit is not a full commit'
@@ -839,12 +805,6 @@ repo_commit="$source_commit"
 payload_manifest_sha256="$(/usr/bin/sha256sum "$payload_manifest" | /usr/bin/gawk '{print $1}')"
 allowlist_sha256="$(/usr/bin/sha256sum "$allowlist_file" | /usr/bin/gawk '{print $1}')"
 script_sha256="$expected_script_sha256"
-
-validate_rtk_source_checkout "$rtk_source_root" "$RTK_REPO_URL" "$RTK_REF" || fail 'RTK source checkout failed hardened source attestation'
-receipt_test_pause after-rtk-snapshot
-rtk_source_url="$rtk_snapshot_url"
-rtk_source_commit="$rtk_snapshot_commit"
-rtk_source_clean=true
 
 declare -A role_registry role_names role_argv role_implementation
 roles=()
@@ -1162,27 +1122,15 @@ for role in "${roles[@]}"; do
     --arg version_output_sha256 "${role_version_hash[$role]}" \
     --arg implementation "${role_implementation[$role]}" \
     '{($role): {executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation}}')"
-  if [[ "$role" == rtk ]]; then
-    role_json="$(printf '%s' "$role_json" | "$jq_bin" -cS \
-      --arg source_commit_sha "$rtk_source_commit" \
-      --arg repository_url "$rtk_source_url" \
-      --arg locked_ref "$RTK_REF" \
-      --arg snapshot_manifest_sha256 "$rtk_snapshot_manifest_sha256" \
-      --argjson clean "$rtk_source_clean" \
-      'with_entries(.value.source_commit_sha = $source_commit_sha | .value.source_attestation += {repository_url:$repository_url, locked_ref:$locked_ref, source_commit_sha:$source_commit_sha, snapshot_manifest_sha256:$snapshot_manifest_sha256, clean:$clean})')"
-  fi
   printf '%s\n' "$role_json" >> "$role_fragments"
 done
 role_manifest_json="$("$jq_bin" -sc 'add' "$role_fragments" | "$jq_bin" -cS .)" || fail 'role manifest is not valid JSON'
 role_manifest_sha256="$(printf '%s' "$role_manifest_json" | /usr/bin/sha256sum | /usr/bin/gawk '{print $1}')"
-rtk_source_json="$("$jq_bin" -cSn \
-  --arg repository_url "$rtk_source_url" \
-  --arg locked_ref "$RTK_REF" \
-  --arg commit_sha "$rtk_source_commit" \
-  --arg checkout_path "snapshot://$rtk_snapshot_commit/$rtk_snapshot_manifest_sha256" \
-  --arg snapshot_manifest_sha256 "$rtk_snapshot_manifest_sha256" \
-  --argjson clean "$rtk_source_clean" \
-  '{repository_url:$repository_url, locked_ref:$locked_ref, commit_sha:$commit_sha, checkout_path:$checkout_path, snapshot_manifest_sha256:$snapshot_manifest_sha256, clean:$clean}')"
+rtk_release_json="$("$jq_bin" -cSn \
+  --arg version "$RTK_VERSION" \
+  --arg url "$RTK_URL" \
+  --arg sha256 "$RTK_SHA256" \
+  '{version:$version, url:$url, sha256:$sha256, archive:($url | split("/") | last)}')"
 
 issued_at_utc="$(/usr/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
 expires_at_utc="$(/usr/bin/date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1194,7 +1142,7 @@ build_receipt() {
     --arg receipt_id "$receipt_id" \
     --arg verification_status 'verified' \
     --arg source_commit_sha "$repo_commit" \
-    --argjson clean "$rtk_source_clean" \
+    --argjson clean true \
     --argjson python313_lock_verified true \
     --arg payload_manifest_sha256 "$payload_manifest_sha256" \
     --arg bridge_allowlist_sha256 "$allowlist_sha256" \
@@ -1204,11 +1152,11 @@ build_receipt() {
     --arg expires_at_utc "$expires_at_utc" \
     --argjson python313 "$python_json" \
     --argjson role_identities "$role_manifest_json" \
-    --argjson rtk_source "$rtk_source_json" \
+    --argjson rtk_release "$rtk_release_json" \
     --arg role_manifest_sha256 "$role_manifest_sha256" \
     --arg source_root "$source_root" \
     --arg script_sha256 "$script_sha256" \
-    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expires_at_utc:$expires_at_utc, python313:$python313, role_identities:$role_identities, rtk_source:$rtk_source, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
+    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expires_at_utc:$expires_at_utc, python313:$python313, role_identities:$role_identities, rtk_release:$rtk_release, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
 }
 
 validate_parent_chain() {
@@ -1281,8 +1229,8 @@ validate_installed_authority() {
   validate_output_file_security "$authority_path"
   validate_parent_chain "${receipt_path%/*}"
   validate_parent_chain "${authority_path%/*}"
-  validate_json_field "$receipt_path" '.schema_version == 1 and .verification_status == "verified" and .clean == true and .python313_lock_verified == true and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.role_identities|type == "object") and ((.role_identities|keys) == ["bash","gh","git","node","pwsh","rtk"])'
-  validate_json_field "$authority_path" '.schema_version == 1 and .authority_id == "#961-installation-authority-v1" and .verification_status == "verified" and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64"'
+  validate_json_field "$receipt_path" '.schema_version == 1 and .verification_status == "verified" and .clean == true and .python313_lock_verified == true and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.role_identities|type == "object") and ((.role_identities|keys) == ["bash","gh","git","node","pwsh","rtk"]) and (.rtk_release|type == "object")'
+  validate_json_field "$authority_path" '.schema_version == 1 and .authority_id == "#961-installation-authority-v1" and .verification_status == "verified" and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.rtk_release|type == "object")'
   local stored_receipt_path stored_receipt_sha stored_role_hash stored_source stored_payload stored_allowlist stored_python stored_roles stored_receipt_id
   stored_receipt_path="$("$jq_bin" -r '.receipt_path // empty' "$authority_path")"
   [[ "$stored_receipt_path" == "$receipt_path" ]] || fail 'authority receipt_path does not match the installed receipt'
@@ -1298,7 +1246,7 @@ validate_installed_authority() {
   [[ "$stored_allowlist" == "$allowlist_sha256" ]] || fail 'receipt role allowlist hash differs from source'
   stored_role_hash="$("$jq_bin" -r '.role_manifest_sha256' "$receipt_path")"
   [[ "$stored_role_hash" == "$role_manifest_sha256" ]] || fail 'receipt role manifest hash differs from live roles'
-  [[ "$("$jq_bin" -cS '.rtk_source' "$receipt_path")" == "$rtk_source_json" ]] || fail 'receipt RTK source provenance differs from the locked checkout'
+  [[ "$("$jq_bin" -cS '.rtk_release' "$receipt_path")" == "$rtk_release_json" ]] || fail 'receipt RTK release provenance differs from the lock'
   stored_python="$("$jq_bin" -cS '.python313' "$receipt_path")"
   [[ "$stored_python" == "$python_json" ]] || fail 'receipt Python identity differs from the live regular executable'
   stored_roles="$("$jq_bin" -cS '.role_identities' "$receipt_path")"
@@ -1308,7 +1256,7 @@ validate_installed_authority() {
   [[ "$("$jq_bin" -r '.payload_manifest_sha256' "$authority_path")" == "$payload_manifest_sha256" ]] || fail 'authority payload hash differs from source'
   [[ "$("$jq_bin" -r '.bridge_allowlist_sha256' "$authority_path")" == "$allowlist_sha256" ]] || fail 'authority allowlist hash differs from source'
   [[ "$("$jq_bin" -r '.role_manifest_sha256' "$authority_path")" == "$role_manifest_sha256" ]] || fail 'authority role manifest hash differs from receipt'
-  [[ "$("$jq_bin" -cS '.rtk_source' "$authority_path")" == "$rtk_source_json" ]] || fail 'authority RTK source provenance differs from the locked checkout'
+  [[ "$("$jq_bin" -cS '.rtk_release' "$authority_path")" == "$rtk_release_json" ]] || fail 'authority RTK release provenance differs from the lock'
   [[ "$("$jq_bin" -cS '.python313' "$authority_path")" == "$python_json" ]] || fail 'authority Python identity differs from receipt'
   [[ "$("$jq_bin" -r '.provenance.receipt_authority_script_sha256 // empty' "$authority_path")" == "$script_sha256" ]] || fail 'authority script provenance differs from source'
   local expires_epoch
@@ -1333,11 +1281,11 @@ if [[ "$mode" == install ]]; then
     --arg platform 'Ubuntu' \
     --arg architecture 'x86_64' \
     --argjson python313 "$python_json" \
-    --argjson rtk_source "$rtk_source_json" \
+    --argjson rtk_release "$rtk_release_json" \
     --arg role_manifest_sha256 "$role_manifest_sha256" \
     --arg source_root "$source_root" \
     --arg script_sha256 "$script_sha256" \
-    '{schema_version:$schema_version, authority_id:$authority_id, receipt_path:$receipt_path, receipt_sha256:$receipt_sha256, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, python313:$python313, rtk_source:$rtk_source, role_manifest_sha256:$role_manifest_sha256, provenance:{source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, secrets_excluded:true}}' > "$authority_tmp"
+    '{schema_version:$schema_version, authority_id:$authority_id, receipt_path:$receipt_path, receipt_sha256:$receipt_sha256, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, python313:$python313, rtk_release:$rtk_release, role_manifest_sha256:$role_manifest_sha256, provenance:{source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, secrets_excluded:true}}' > "$authority_tmp"
   atomic_install_json "$authority_tmp" "$authority_path"
 fi
 

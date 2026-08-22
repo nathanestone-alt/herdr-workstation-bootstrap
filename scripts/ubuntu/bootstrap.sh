@@ -519,6 +519,10 @@ bootstrap_source_snapshot="$attestation_snapshot_dir"
 # private snapshot; the live helper pathname is never sourced.
 # shellcheck disable=SC1090
 source "$bootstrap_source_snapshot/scripts/ubuntu/source-attestation.sh"
+# The release installer is sourced only from the same private, committed
+# snapshot whose complete tree was just attested.
+# shellcheck disable=SC1090
+source "$bootstrap_source_snapshot/scripts/ubuntu/rtk-release.sh"
 attestation_snapshot_dir="$bootstrap_source_snapshot"
 attestation_snapshot_manifest="$bootstrap_source_snapshot/.source-attestation"
 repo_root="$bootstrap_source_snapshot"
@@ -542,7 +546,7 @@ source "$lock_file"
 required_lock_keys=(
   UV_VERSION UV_PLATFORM UV_URL UV_SHA256
   PYTHON_VERSION PYTHON_RELEASE PYTHON_PLATFORM PYTHON_ARCHIVE PYTHON_URL PYTHON_SHA256
-  RTK_REPO_URL RTK_REF
+  RTK_VERSION RTK_URL RTK_SHA256
   POWERSHELL_VERSION POWERSHELL_URL POWERSHELL_SHA256
   TAILSCALE_VERSION TAILSCALE_INSTALLER_URL TAILSCALE_INSTALLER_SHA256
   RUSTUP_VERSION RUSTUP_INIT_URL RUSTUP_INIT_SHA256 RUST_TOOLCHAIN
@@ -552,7 +556,7 @@ required_lock_keys=(
 for key in "${required_lock_keys[@]}"; do
   [[ -n "${!key:-}" ]] || { echo "Lock key '$key' is empty." >&2; exit 22; }
 done
-for key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
+for key in UV_SHA256 PYTHON_SHA256 RTK_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
   [[ "${!key}" =~ ^[0-9a-f]{64}$ ]] || { echo "Lock key '$key' is not a lowercase SHA-256 value." >&2; exit 22; }
 done
 
@@ -578,172 +582,18 @@ validate_cargo_roots() {
   export CARGO_INSTALL_ROOT="$expected_root"
 }
 
-trusted_git_command() {
-  /usr/bin/env -i \
-    HOME="$HOME" \
-    PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
-    LC_ALL=C \
-    TZ=UTC \
-    GIT_CONFIG_NOSYSTEM=1 \
-    GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_CONFIG_COUNT=0 \
-    GIT_OPTIONAL_LOCKS=0 \
-    /usr/bin/git --no-replace-objects \
-    -c core.attributesfile=/dev/null \
-    -c core.excludesfile=/dev/null \
-    -c core.hooksPath=/dev/null \
-    -c core.filemode=true \
-    "$@"
-}
-
-validate_rtk_source_checkout() {
-  local source_path="${1:-}"
-  local expected_url="${2:-}"
-  local expected_ref="${3:-}"
-  attestation_create_git_snapshot "$source_path" "$expected_url" "$expected_ref" || return 1
-  rtk_snapshot_path="$attestation_snapshot_dir"
-  rtk_snapshot_manifest="$attestation_snapshot_manifest"
-  rtk_snapshot_commit="$attestation_snapshot_commit"
-  rtk_snapshot_url="$attestation_snapshot_url"
-  rtk_snapshot_manifest_sha256="$attestation_snapshot_manifest_sha256"
-}
-
-install_rtk_from_source() {
-  local source_path="$1"
-  local expected_url="$2"
-  local expected_ref="$3"
-  validate_rtk_source_checkout "$source_path" "$expected_url" "$expected_ref" || return 1
-  install_rtk_snapshot
-}
-
-install_rtk_snapshot() {
-  local cargo_real cargo_real_after cargo_hash_before cargo_hash_after cargo_identity_before cargo_identity_after
-  local cargo_mode cargo_stage_dir cargo_stage cargo_stage_mode cargo_stage_hash
-  local rustc_path rustc_real rustc_mode rustc_hash_before rustc_hash_after rustc_identity_before rustc_identity_after
-  local cargo_target_dir cargo_status cargo_fd cargo_stage_fd rustc_fd cargo_owner_pid
-  local cargo_fd_id cargo_stage_fd_id cargo_stage_fd_hash cargo_stage_live_id cargo_stage_live_hash rustc_fd_id cargo_live_id rustc_live_id
-  local cargo_exec_path rustc_exec_path
-  cargo_real="$(attestation_canonical_cargo "$HOME")" || {
-    echo 'Canonical Cargo executable is unavailable under the managed Cargo root.' >&2
-    return 1
-  }
-  cargo_fd=200
-  eval "exec ${cargo_fd}<&-" 2>/dev/null || true
-  exec 200<"$cargo_real" || { echo 'Could not open Cargo as a stable descriptor.' >&2; return 1; }
-  cargo_owner_pid="$BASHPID"
-  cargo_fd_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "/proc/$cargo_owner_pid/fd/$cargo_fd" 2>/dev/null || true)"
-  cargo_mode="$(bootstrap_exec_system /usr/bin/stat -c '%a' -- "/proc/$cargo_owner_pid/fd/$cargo_fd" 2>/dev/null || true)"
-  cargo_hash_before="$(bootstrap_exec_system /usr/bin/sha256sum -- "/proc/$cargo_owner_pid/fd/$cargo_fd" | /usr/bin/gawk '{print $1}')"
-  cargo_identity_before="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
-  cargo_live_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
-  [[ "$cargo_fd_id" =~ ^[0-9]+:[0-9]+$ && "$cargo_mode" =~ ^[0-7]+$ && \
-    $((8#$cargo_mode & 022)) == 0 && "$cargo_hash_before" =~ ^[0-9a-f]{64}$ && \
-    "$cargo_live_id" == "$cargo_fd_id" ]] || {
-    close_fence_fd "$cargo_fd"
-    echo 'Cargo descriptor identity changed before staging.' >&2
-    return 1
-  }
-  cargo_stage_dir="$(/usr/bin/mktemp -d /tmp/herdr-cargo-exec.XXXXXX)"
-  bootstrap_register_cleanup "$cargo_stage_dir"
-  cargo_stage="$cargo_stage_dir/cargo"
-  bootstrap_exec_system /usr/bin/cp -p -- "/proc/$cargo_owner_pid/fd/$cargo_fd" "$cargo_stage"
-  bootstrap_exec_system /usr/bin/chmod "$cargo_mode" -- "$cargo_stage"
-  cargo_stage_mode="$(bootstrap_exec_system /usr/bin/stat -c '%a' -- "$cargo_stage" 2>/dev/null || true)"
-  cargo_stage_hash="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_stage" | /usr/bin/gawk '{print $1}')"
-  [[ -f "$cargo_stage" && ! -L "$cargo_stage" && \
-    "$cargo_stage_mode" == "$cargo_mode" && "$cargo_stage_hash" == "$cargo_hash_before" ]] || {
-    close_fence_fd "$cargo_fd"
-    echo 'Private Cargo staging identity does not match the validated executable.' >&2
-    return 1
-  }
-  cargo_stage_fd=201
-  eval "exec ${cargo_stage_fd}<&-" 2>/dev/null || true
-  exec 201<"$cargo_stage" || { close_fence_fd "$cargo_fd"; return 1; }
-  cargo_exec_path="/proc/$cargo_owner_pid/fd/$cargo_stage_fd"
-  cargo_stage_fd_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_exec_path" 2>/dev/null || true)"
-  cargo_stage_fd_hash="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_exec_path" | /usr/bin/gawk '{print $1}')"
-  [[ "$cargo_stage_fd_id" =~ ^[0-9]+:[0-9]+$ && "$cargo_stage_fd_hash" == "$cargo_stage_hash" ]] || {
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    echo 'Cargo execution descriptor does not match the staged bytes.' >&2
-    return 1
-  }
-  cargo_identity_after="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real" 2>/dev/null || true)"
-  cargo_hash_after="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_real" | /usr/bin/gawk '{print $1}')"
-  [[ "$cargo_identity_after" == "$cargo_identity_before" && "$cargo_hash_after" == "$cargo_hash_before" ]] || {
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    echo 'Cargo executable changed during private staging.' >&2
-    return 1
-  }
-  rustc_path="$HOME/.cargo/bin/rustc"
-  rustc_real="$(/usr/bin/realpath -e -- "$rustc_path" 2>/dev/null || true)"
-  rustc_mode="$(bootstrap_exec_system /usr/bin/stat -c '%a' -- "$rustc_real" 2>/dev/null || true)"
-  rustc_identity_before="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$rustc_real" 2>/dev/null || true)"
-  rustc_hash_before="$(bootstrap_exec_system /usr/bin/sha256sum -- "$rustc_real" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
-  [[ -n "$rustc_real" && -f "$rustc_real" && ! -L "$rustc_real" && -x "$rustc_real" && \
-    ( "$rustc_real" == "$HOME/.cargo/"* || "$rustc_real" == "$HOME/.rustup/"* ) && \
-    "$rustc_mode" =~ ^[0-7]+$ && $((8#$rustc_mode & 022)) == 0 && \
-    "$rustc_identity_before" =~ ^[0-9]+:[0-9]+$ && "$rustc_hash_before" =~ ^[0-9a-f]{64}$ ]] || {
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    echo 'Rustc executable is outside the approved managed toolchain identity.' >&2
-    return 1
-  }
-  rustc_fd=202
-  eval "exec ${rustc_fd}<&-" 2>/dev/null || true
-  exec 202<"$rustc_real" || {
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    return 1
-  }
-  rustc_fd_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "/proc/$cargo_owner_pid/fd/$rustc_fd" 2>/dev/null || true)"
-  rustc_live_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$rustc_real" 2>/dev/null || true)"
-  [[ "$rustc_fd_id" == "$rustc_identity_before" && "$rustc_live_id" == "$rustc_identity_before" ]] || {
-    close_fence_fd "$rustc_fd"
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    echo 'Rustc descriptor identity changed before the Cargo seam.' >&2
-    return 1
-  }
-  rustc_exec_path="/proc/$cargo_owner_pid/fd/$rustc_fd"
-  cargo_target_dir="$(/usr/bin/mktemp -d /tmp/herdr-cargo-target.XXXXXX)"
-  bootstrap_register_cleanup "$cargo_target_dir"
-  bootstrap_test_pause before-cargo-exec
-  cargo_stage_live_id="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_stage" 2>/dev/null || true)"
-  cargo_stage_live_hash="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_stage" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
-  [[ "$cargo_stage_live_id" == "$cargo_stage_fd_id" && "$cargo_stage_live_hash" == "$cargo_stage_fd_hash" ]] || {
-    close_fence_fd "$rustc_fd"
-    close_fence_fd "$cargo_stage_fd"
-    close_fence_fd "$cargo_fd"
-    echo 'Cargo staging path changed after its stable descriptor was opened.' >&2
-    return 1
-  }
-  # Cargo and rustc execute through descriptors opened and hashed before the
-  # pause.  No pathname is used as an execution authority.
-  if CARGO_TARGET_DIR="$cargo_target_dir" RUSTC="$rustc_exec_path" \
-    bootstrap_exec_cargo "$cargo_exec_path" install --path "$rtk_snapshot_path" --locked --force; then
-    cargo_status=0
-  else
-    cargo_status=$?
-  fi
-  bootstrap_exec_system /usr/bin/rm -rf -- "$cargo_target_dir"
-  rustc_hash_after="$(bootstrap_exec_system /usr/bin/sha256sum -- "$rustc_real" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
-  rustc_identity_after="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$rustc_real" 2>/dev/null || true)"
-  cargo_real_after="$(/usr/bin/realpath -e -- "$HOME/.cargo/bin/cargo" 2>/dev/null || true)"
-  cargo_hash_after="$(bootstrap_exec_system /usr/bin/sha256sum -- "$cargo_real_after" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
-  cargo_identity_after="$(bootstrap_exec_system /usr/bin/stat -Lc '%d:%i' -- "$cargo_real_after" 2>/dev/null || true)"
-  close_fence_fd "$rustc_fd"
-  close_fence_fd "$cargo_stage_fd"
-  close_fence_fd "$cargo_fd"
-  (( cargo_status == 0 )) || return "$cargo_status"
-  [[ "$cargo_real_after" == "$cargo_real" && "$cargo_identity_after" == "$cargo_identity_before" && \
-    "$cargo_hash_after" == "$cargo_hash_before" && "$rustc_identity_after" == "$rustc_identity_before" && \
-    "$rustc_hash_after" == "$rustc_hash_before" ]] || {
-    echo 'Canonical Cargo executable changed across the build seam.' >&2
-    return 1
-  }
+install_rtk_release() {
+  local download_dir archive
+  validate_toolchain_lock || exit 22
+  download_dir="$(/usr/bin/mktemp -d /tmp/herdr-rtk-download.XXXXXX)"
+  bootstrap_register_cleanup "$download_dir"
+  /usr/bin/chmod 0700 -- "$download_dir"
+  archive="$download_dir/rtk-x86_64-unknown-linux-musl.tar.gz"
+  download_verified "$RTK_URL" "$RTK_SHA256" "$archive"
+  /usr/bin/chmod 0600 -- "$archive"
+  rtk_release_install_archive "$archive" "$RTK_SHA256" "$RTK_VERSION" \
+    "$HOME/.cargo/bin/rtk" bootstrap_test_pause
+  /usr/bin/rm -rf -- "$download_dir"
 }
 
 install_receipt_from_snapshots() {
@@ -752,9 +602,8 @@ install_receipt_from_snapshots() {
   payload_root="$(/usr/bin/mktemp -d /tmp/herdr-receipt-payload.XXXXXX)"
   bootstrap_register_cleanup "$payload_root"
   /usr/bin/chmod 0700 -- "$payload_root"
-  /usr/bin/mkdir -p -- "$payload_root/source" "$payload_root/rtk"
+  /usr/bin/mkdir -p -- "$payload_root/source"
   /usr/bin/cp -a -- "$bootstrap_source_snapshot/." "$payload_root/source/"
-  /usr/bin/cp -a -- "$rtk_snapshot_path/." "$payload_root/rtk/"
   payload_manifest="$payload_root/.payload-manifest"
   expected_source_helper_sha="$(attestation_snapshot_file_digest \
     "$bootstrap_source_snapshot/.source-attestation" scripts/ubuntu/source-attestation.sh)"
@@ -889,8 +738,6 @@ install_receipt_from_snapshots() {
       --install \
       --source-root "$stage/source" \
       --source-manifest "$stage/source/.source-attestation" \
-      --rtk-source-root "$stage/rtk" \
-      --rtk-source-manifest "$stage/rtk/.source-attestation" \
       --payload-root "$stage" \
       --payload-manifest "$stage/.payload-manifest" \
       --payload-manifest-sha256 "$expected_payload_sha" \
@@ -1316,7 +1163,7 @@ fence_remove_managed_link() {
 }
 
 validate_toolchain_lock() {
-  for lock_hash_key in UV_SHA256 PYTHON_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
+  for lock_hash_key in UV_SHA256 PYTHON_SHA256 RTK_SHA256 POWERSHELL_SHA256 TAILSCALE_INSTALLER_SHA256 RUSTUP_INIT_SHA256 NODE_SHA256 HERDR_SHA256; do
     [[ "${!lock_hash_key:-}" =~ ^[0-9a-f]{64}$ ]] || {
       echo "Lock key '$lock_hash_key' is not a lowercase SHA-256 value." >&2
       return 1
@@ -1347,6 +1194,12 @@ validate_toolchain_lock() {
   expected_python_url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/${PYTHON_ARCHIVE//+/%2B}"
   [[ "$PYTHON_URL" == "$expected_python_url" ]] || {
     echo 'PYTHON_URL does not identify the pinned official CPython artifact.' >&2; return 1;
+  }
+  [[ "$RTK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'RTK_VERSION is not a pinned semantic version.' >&2; return 1;
+  }
+  [[ "$RTK_URL" == "https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION/rtk-x86_64-unknown-linux-musl.tar.gz" ]] || {
+    echo 'RTK_URL does not identify the pinned official x86-64 Linux release artifact.' >&2; return 1;
   }
   [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
     echo 'TAILSCALE_VERSION is not a pinned semantic version.' >&2; return 1;
@@ -1942,8 +1795,6 @@ install_tools() {
   local state_fd
   local bin_fd
   local state_anchor
-  local src_fd
-  local src_anchor
   local profile_dir_fd
   local profile_dir_anchor
   local node_fd
@@ -1954,10 +1805,11 @@ install_tools() {
   ps_bin="$(bootstrap_command_path ps)"
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
+  validate_toolchain_lock || exit 22
   validate_cargo_roots || exit 24
   validate_managed_paths \
     "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
-    "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" "$HOME/src" \
+    "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" \
     "$HOME/.cargo" "$HOME/.cargo/bin" "$HOME/.cargo/bin/rtk" \
     "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" || {
       echo 'Managed bootstrap paths are unsafe.' >&2
@@ -1966,17 +1818,14 @@ install_tools() {
   fence_open_directory "$state_dir" state_fd
   fence_open_directory "$bin_dir" bin_fd
   fence_open_directory "$profile_dir" profile_dir_fd
-  fence_open_directory "$HOME/src" src_fd
   fence_open_directory "$node_dir" node_fd
   fence_open_directory "$HOME/code" code_fd
   state_anchor="/proc/self/fd/$state_fd"
-  src_anchor="/proc/self/fd/$src_fd"
   profile_dir_anchor="/proc/self/fd/$profile_dir_fd"
   node_anchor="/proc/self/fd/$node_fd"
   fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
   fence_require_directory "$bin_dir" "$bin_fd" 'tools bin directory'
   fence_require_directory "$profile_dir" "$profile_dir_fd" 'profile directory'
-  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
   fence_require_directory "$node_dir" "$node_fd" 'Node directory'
   bootstrap_test_pause before-tools-directory-mutations
   if [[ "$("$ps_bin" -p 1 -o comm=)" != "systemd" ]]; then
@@ -2017,29 +1866,7 @@ install_tools() {
     echo "rustup version changed after toolchain installation ($RUSTUP_VERSION)." >&2; exit 24;
   }
 
-  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
-  [[ ! -L "$src_anchor/rtk" ]] || {
-    echo 'RTK source checkout path must not be a symlink.' >&2
-    exit 24
-  }
-  if [[ ! -d "$src_anchor/rtk/.git" ]]; then
-    trusted_git_command clone --no-checkout --no-tags -- "$RTK_REPO_URL" "$HOME/src/rtk"
-  else
-    validate_rtk_source_checkout "$HOME/src/rtk" "$RTK_REPO_URL" "$RTK_REF" || exit 24
-  fi
-  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
-  trusted_git_command -C "$HOME/src/rtk" fetch --force --no-tags "$RTK_REPO_URL" "$RTK_REF"
-  fence_require_directory "$HOME/src" "$src_fd" 'source directory'
-  attestation_create_git_snapshot "$HOME/src/rtk" "$RTK_REPO_URL" "$RTK_REF" false || {
-    echo 'RTK locked commit could not be materialized without a worktree checkout.' >&2
-    exit 24
-  }
-  rtk_snapshot_path="$attestation_snapshot_dir"
-  rtk_snapshot_manifest="$attestation_snapshot_manifest"
-  rtk_snapshot_commit="$attestation_snapshot_commit"
-  rtk_snapshot_url="$attestation_snapshot_url"
-  rtk_snapshot_manifest_sha256="$attestation_snapshot_manifest_sha256"
-  install_rtk_snapshot || exit 24
+  install_rtk_release || exit 24
   for executable in rustup cargo rustc; do
     executable_path="$HOME/.cargo/bin/$executable"
     [[ -x "$executable_path" ]] || {
@@ -2048,15 +1875,15 @@ install_tools() {
     }
     fence_replace_link "$executable_path" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
-  [[ -x "$cargo_install_root/bin/rtk" ]] || {
-    echo "cargo installed RTK outside the expected '$cargo_install_root/bin' directory. Set CARGO_INSTALL_ROOT explicitly and retry." >&2
+  [[ -x "$HOME/.cargo/bin/rtk" ]] || {
+    echo "RTK was not published to the expected canonical path '$HOME/.cargo/bin/rtk'." >&2
     exit 24
   }
-  [[ -f "$cargo_install_root/bin/rtk" && ! -L "$cargo_install_root/bin/rtk" ]] || {
-    echo 'Canonical cargo RTK is not a regular executable.' >&2
+  [[ -f "$HOME/.cargo/bin/rtk" && ! -L "$HOME/.cargo/bin/rtk" ]] || {
+    echo 'Canonical RTK is not a regular executable.' >&2
     exit 24
   }
-  fence_remove_managed_link "$cargo_install_root/bin/rtk" "$bin_dir/rtk" before-rtk-alias-removal "$bin_fd"
+  fence_remove_managed_link "$HOME/.cargo/bin/rtk" "$bin_dir/rtk" before-rtk-alias-removal "$bin_fd"
 
   profile_script_tmp="$(mktemp)"
   bootstrap_register_cleanup "$profile_script_tmp"
@@ -2144,6 +1971,10 @@ install_tools() {
     printf 'python3.13_sha256=%s\n' "$(/usr/bin/sha256sum "$bin_dir/python3.13" | /usr/bin/gawk '{print $1}')"
     printf 'python3.13_pyvenv_cfg=%s\n' "$HOME/.local/pyvenv.cfg"
     printf 'py_path=%s\n' "$bin_dir/py"
+    printf 'rtk_path=%s\n' "$HOME/.cargo/bin/rtk"
+    printf 'rtk_version=%s\n' "$("$HOME/.cargo/bin/rtk" --version 2>&1)"
+    printf 'rtk_url=%s\n' "$RTK_URL"
+    printf 'rtk_sha256=%s\n' "$RTK_SHA256"
     printf 'uv_version=%s\n' "$("$bin_dir/uv" --version)"
     printf 'uv_url=%s\n' "$UV_URL"
     printf 'uv_sha256=%s\n' "$UV_SHA256"
@@ -2184,7 +2015,6 @@ install_tools() {
   close_fence_fd "$state_fd"
   close_fence_fd "$bin_fd"
   close_fence_fd "$profile_dir_fd"
-  close_fence_fd "$src_fd"
   close_fence_fd "$node_fd"
   close_fence_fd "$code_fd"
   echo "Tool installation complete. Resolved manifest: $manifest"

@@ -137,7 +137,12 @@ done
 # Preserve the already-resolved fencing invariants in this end-to-end guard.
 ! /usr/bin/grep -Fq '.cargo/env' "$repo_root/scripts/ubuntu/bootstrap.sh" ||
   { echo 'Bootstrap still sources .cargo/env.' >&2; exit 1; }
-/usr/bin/grep -Fq 'install_rtk_snapshot' "$repo_root/scripts/ubuntu/bootstrap.sh"
+/usr/bin/grep -Fq 'rtk_release_install_archive' "$repo_root/scripts/ubuntu/bootstrap.sh"
+/usr/bin/grep -Fq 'RTK_SHA256' "$repo_root/scripts/ubuntu/bootstrap.sh"
+! /usr/bin/grep -Fq 'RTK_REPO_URL' "$repo_root/scripts/ubuntu/bootstrap.sh" || {
+  echo 'Bootstrap still contains the retired RTK repository lock.' >&2
+  exit 1
+}
 /usr/bin/grep -Fq 'proc/${BASHPID}/fd' "$repo_root/scripts/ubuntu/bootstrap.sh"
 /usr/bin/grep -Fq 'attestation_cleanup_temporary_paths' "$repo_root/scripts/ubuntu/source-attestation.sh"
 

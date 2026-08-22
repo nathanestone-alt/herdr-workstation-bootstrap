@@ -6,16 +6,15 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
 
-# The authority deliberately validates the same source/RTK relationships as
-# production. Build a small clean source checkout and a clean locked RTK
-# checkout rather than weakening those predicates for fixture mode.
+# The authority deliberately validates the same source and release-lock
+# relationships as production. Build a small clean source checkout and a
+# canonical release-shaped RTK executable for fixture mode.
 source "$repo_root/config/ubuntu-toolchain.lock"
 fixture_root="$test_root/fixture"
 fixture_home="$fixture_root/home"
 authority_path="$fixture_root/etc/stmodel/issue-961/receipt-authority.json"
 receipt_path="$fixture_root/etc/stmodel/issue-961/receipt.json"
 source_root="$test_root/source"
-rtk_source_root="$fixture_home/src/rtk"
 runtime_root="$fixture_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 stdlib_root="$runtime_root/lib/python3.13"
 entrypoint_root="$test_root/entrypoint"
@@ -26,8 +25,7 @@ mkdir -p \
   "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin" \
   "$fixture_home/.cargo/bin" \
   "$stdlib_root" \
-  "$runtime_root/bin" \
-  "$rtk_source_root"
+  "$runtime_root/bin"
 
 make_tool() {
   local path="$1"
@@ -48,7 +46,7 @@ make_tool "$fixture_root/bin/git" 'git version 2.43.0'
 make_tool "$fixture_root/bin/gh" 'gh version 2.45.0 (fixture)'
 make_tool "$fixture_root/bin/pwsh" 'PowerShell 7.6.5'
 make_tool "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin/node" "v$NODE_VERSION"
-make_tool "$fixture_home/.cargo/bin/rtk" 'rtk 0.42.4'
+make_tool "$fixture_home/.cargo/bin/rtk" "rtk $RTK_VERSION"
 
 cat > "$fixture_home/.local/bin/python3.13" <<EOF
 #!/usr/bin/env bash
@@ -72,16 +70,6 @@ include-system-site-packages = false
 version = $PYTHON_VERSION
 EOF
 
-git -C "$rtk_source_root" init -q
-git -C "$rtk_source_root" config user.email fixture@example.invalid
-git -C "$rtk_source_root" config user.name fixture
-printf 'locked RTK source\n' > "$rtk_source_root/README"
-chmod 0644 "$rtk_source_root/README"
-git -C "$rtk_source_root" add README
-git -C "$rtk_source_root" commit -qm 'fixture RTK source'
-rtk_commit="$(git -C "$rtk_source_root" rev-parse HEAD)"
-git -C "$rtk_source_root" remote add origin "$RTK_REPO_URL"
-
 mkdir -p "$source_root/config" "$source_root/scripts/ubuntu"
 cp "$repo_root/scripts/ubuntu/receipt-authority.sh" "$source_root/scripts/ubuntu/receipt-authority.sh"
 cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$source_root/scripts/ubuntu/source-attestation.sh"
@@ -98,7 +86,6 @@ chmod 0755 "$source_root/scripts/ubuntu/launcher-capability.sh" \
   "$source_root/scripts/ubuntu/receipt-authority.sh" \
   "$source_root/scripts/ubuntu/source-attestation.sh" \
   "$source_root/scripts/ubuntu/trusted-launcher.sh"
-sed -i "s/^RTK_REF=.*/RTK_REF=$rtk_commit/" "$source_root/config/ubuntu-toolchain.lock"
 git -C "$source_root" init -q
 git -C "$source_root" config user.email fixture@example.invalid
 git -C "$source_root" config user.name fixture
@@ -193,7 +180,6 @@ run_authority() {
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
     --receipt-path "$receipt_path" \
-    --rtk-source-root "$rtk_source_root" \
     --fixture-root "$fixture_root"
 }
 
@@ -209,7 +195,6 @@ run_authority_with_pause() {
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
     --receipt-path "$receipt_path" \
-    --rtk-source-root "$rtk_source_root" \
     --fixture-root "$fixture_root"
 }
 
@@ -228,8 +213,9 @@ run_authority --check
 [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || exit 1
 [[ "$(jq -r '.authority_id' "$authority_path")" == '#961-installation-authority-v1' ]] || exit 1
 [[ "$(jq -r '.role_identities.rtk.executable' "$receipt_path")" == "$fixture_home/.cargo/bin/rtk" ]] || exit 1
-[[ "$(jq -r '.rtk_source.locked_ref' "$receipt_path")" == "$rtk_commit" ]] || exit 1
-[[ "$(jq -r '.rtk_source.clean' "$receipt_path")" == true ]] || exit 1
+[[ "$(jq -r '.rtk_release.version' "$receipt_path")" == "$RTK_VERSION" ]] || exit 1
+[[ "$(jq -r '.rtk_release.url' "$receipt_path")" == "$RTK_URL" ]] || exit 1
+[[ "$(jq -r '.rtk_release.sha256' "$receipt_path")" == "$RTK_SHA256" ]] || exit 1
 [[ "$(jq -r '.python313.venv.home' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.base_prefix' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.stdlib' "$receipt_path")" == "$stdlib_root" ]] || exit 1
@@ -297,30 +283,6 @@ if ! (export GIT_COMMON_DIR="$test_root/external-common"; run_authority --check 
   exit 1
 fi
 
-# The receipt is built from the same stable RTK snapshot after the live
-# checkout is changed at the validation-to-receipt seam.
-receipt_race_ready="$fixture_root/receipt-race-ready"
-receipt_race_continue="$fixture_root/receipt-race-continue"
-repin_launcher_pause after-rtk-snapshot "$receipt_race_ready" "$receipt_race_continue"
-(
-  export HERDR_RECEIPT_TEST_PAUSE_PHASE=after-rtk-snapshot
-  export HERDR_RECEIPT_TEST_READY_FILE="$receipt_race_ready"
-  export HERDR_RECEIPT_TEST_CONTINUE_FILE="$receipt_race_continue"
-  run_authority_with_pause --install
-) > "$test_root/receipt-race-output" 2>&1 &
-receipt_race_pid=$!
-while [[ ! -e "$receipt_race_ready" ]]; do sleep 0.01; done
-printf 'receipt validation race\n' > "$rtk_source_root/README"
-: > "$receipt_race_continue"
-wait "$receipt_race_pid"
-[[ "$(jq -r '.clean' "$receipt_path")" == true ]] || exit 1
-[[ "$(jq -r '.rtk_source.checkout_path' "$receipt_path")" != "$rtk_source_root" ]] || {
-  echo 'Receipt retained the mutable RTK checkout path.' >&2
-  exit 1
-}
-printf 'locked RTK source\n' > "$rtk_source_root/README"
-chmod 0644 "$rtk_source_root/README"
-
 # A same-user replacement of a staged role executable must fail closed without
 # executing the replacement. The pause survives the trusted entrypoint
 # re-exec because it is explicitly carried only through this test adapter.
@@ -332,7 +294,7 @@ repin_launcher_pause after-rtk-staging "$role_stage_race_ready" "$role_stage_rac
 cat > "$role_stage_race_hostile" <<EOF
 #!/usr/bin/bash
 : > '$role_stage_race_marker'
-printf 'rtk 0.42.4\n'
+printf 'rtk %s\n' '$RTK_VERSION'
 EOF
 chmod 0755 "$role_stage_race_hostile"
 (
@@ -382,7 +344,7 @@ expect_failure 'unsigned source manifest' /usr/bin/env -i \
   "$launcher" --entrypoint receipt-authority -- --check \
   --source-root "$unbound_source_snapshot" --source-manifest "$unbound_source_manifest" \
   --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+  --fixture-root "$fixture_root"
 payload_probe="$test_root/payload-probe"
 mkdir -p "$payload_probe/source"
 cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
@@ -401,7 +363,7 @@ expect_payload_failure() {
     --payload-root "$payload_probe" \
     --payload-manifest "$payload_probe_manifest" \
     --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-    --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+    --fixture-root "$fixture_root"
 }
 expect_payload_failure 'unsigned payload source commit'
 expect_payload_failure 'unsigned payload manifest hash' --source-commit "$attestation_snapshot_commit"
@@ -440,7 +402,7 @@ expect_failure 'coherent payload with non-policy source commit' /usr/bin/env -i 
   --payload-manifest-sha256 "$alternate_payload_hash" \
   --source-commit "$alternate_source_commit" \
   --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+  --fixture-root "$fixture_root"
 printf 'payload tamper\n' >> "$payload_probe/source/README"
 expect_failure 'tampered payload tree' /usr/bin/env -i \
   HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
@@ -449,7 +411,7 @@ expect_failure 'tampered payload tree' /usr/bin/env -i \
   --payload-root "$payload_probe" --payload-manifest "$payload_probe_manifest" \
   --payload-manifest-sha256 "$payload_probe_hash" --source-commit "$attestation_snapshot_commit" \
   --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
-  --rtk-source-root "$rtk_source_root" --fixture-root "$fixture_root"
+  --fixture-root "$fixture_root"
 attestation_cleanup_temporary_paths
 
 # The race run intentionally produced a new content-bound receipt pair.  Make
@@ -468,61 +430,6 @@ cp "$fixture_home/.cargo/bin/rtk" "$test_root/rtk.good"
 printf 'tampered\n' >> "$fixture_home/.cargo/bin/rtk"
 expect_failure 'tampered RTK executable' run_authority --check
 cp "$test_root/rtk.good" "$fixture_home/.cargo/bin/rtk"
-
-printf 'tampered\n' >> "$rtk_source_root/README"
-expect_failure 'dirty RTK source checkout' run_authority --check
-git -C "$rtk_source_root" checkout -- README
-chmod 0644 "$rtk_source_root/README"
-printf 'staged tamper\n' >> "$rtk_source_root/README"
-git -C "$rtk_source_root" add README
-expect_failure 'staged RTK source checkout' run_authority --check
-git -C "$rtk_source_root" reset -q HEAD -- README
-git -C "$rtk_source_root" checkout -- README
-chmod 0644 "$rtk_source_root/README"
-printf 'untracked tamper\n' > "$rtk_source_root/untracked"
-expect_failure 'untracked RTK source checkout' run_authority --check
-rm -- "$rtk_source_root/untracked"
-
-printf 'ignored-input\n' >> "$rtk_source_root/.git/info/exclude"
-printf 'ignored RTK build input\n' > "$rtk_source_root/ignored-input"
-[[ -z "$(git -C "$rtk_source_root" status --porcelain --untracked-files=all)" ]] || {
-  echo 'Ignored RTK fixture is not hidden from ordinary status.' >&2
-  exit 1
-}
-expect_failure 'ignored untracked RTK source checkout' run_authority --check
-rm -- "$rtk_source_root/ignored-input"
-
-git -C "$rtk_source_root" update-index --assume-unchanged README
-assume_flag_before="$(git -C "$rtk_source_root" ls-files -v -- README)"
-printf 'assume-unchanged tamper\n' > "$rtk_source_root/README"
-expect_failure 'assume-unchanged RTK source checkout' run_authority --check
-assume_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
-[[ "$assume_flag_after" == "$assume_flag_before" ]] || {
-  echo 'RTK assume-unchanged index flag was mutated.' >&2
-  exit 1
-}
-git -C "$rtk_source_root" update-index --no-assume-unchanged README
-git -C "$rtk_source_root" checkout -- README
-chmod 0644 "$rtk_source_root/README"
-
-git -C "$rtk_source_root" update-index --skip-worktree README
-skip_flag_before="$(git -C "$rtk_source_root" ls-files -v -- README)"
-printf 'skip-worktree tamper\n' > "$rtk_source_root/README"
-expect_failure 'skip-worktree RTK source checkout' run_authority --check
-skip_flag_after="$(git -C "$rtk_source_root" ls-files -v -- README)"
-[[ "$skip_flag_after" == "$skip_flag_before" ]] || {
-  echo 'RTK skip-worktree index flag was mutated.' >&2
-  exit 1
-}
-git -C "$rtk_source_root" update-index --no-skip-worktree README
-git -C "$rtk_source_root" checkout -- README
-chmod 0644 "$rtk_source_root/README"
-run_authority --check
-[[ "$(jq -r '.clean' "$receipt_path")" == true ]] || exit 1
-
-git -C "$rtk_source_root" remote set-url origin https://example.invalid/rtk.git
-expect_failure 'RTK source URL mismatch' run_authority --check
-git -C "$rtk_source_root" remote set-url origin "$RTK_REPO_URL"
 
 jq '.python313.sha256 = ("0" * 64)' "$receipt_path" > "$test_root/receipt.tampered"
 mv -- "$test_root/receipt.tampered" "$receipt_path"

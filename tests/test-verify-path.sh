@@ -143,10 +143,15 @@ cat > "$managed_bin/herdr" <<EOF
 printf 'herdr %s\\n' '$HERDR_VERSION'
 EOF
 chmod 0755 "$managed_bin"/*
-for managed_stub in cargo rtk; do
+for managed_stub in cargo; do
   printf '#!/usr/bin/bash\nexit 0\n' > "$managed_bin/$managed_stub"
   chmod 0755 "$managed_bin/$managed_stub"
 done
+cat > "$fixture_home/.cargo/bin/rtk" <<EOF
+#!/usr/bin/bash
+printf 'rtk %s\\n' '$RTK_VERSION'
+EOF
+chmod 0755 "$fixture_home/.cargo/bin/rtk"
 node_bin="$fixture_home/.local/lib/node-v${NODE_VERSION}-linux-x64/bin"
 mkdir -p "$node_bin"
 for node_tool in node npm codex claude bun; do
@@ -190,6 +195,10 @@ chmod 0755 "$source_fixture/scripts/ubuntu/verify.sh"
   printf 'uv_path=%s\n' "$fixture_home/.local/bin/uv"
   printf 'python3.13_path=%s\n' "$fixture_home/.local/bin/python3.13"
   printf 'py_path=%s\n' "$fixture_home/.local/bin/py"
+  printf 'rtk_path=%s\n' "$fixture_home/.cargo/bin/rtk"
+  printf 'rtk_version=rtk %s\n' "$RTK_VERSION"
+  printf 'rtk_url=%s\n' "$RTK_URL"
+  printf 'rtk_sha256=%s\n' "$RTK_SHA256"
   printf 'uv_version=uv %s (%s)\n' "$UV_VERSION" "$UV_PLATFORM"
   printf 'python3.13_version=Python %s\n' "$PYTHON_VERSION"
   printf 'py_3.13_version=Python %s\n' "$PYTHON_VERSION"

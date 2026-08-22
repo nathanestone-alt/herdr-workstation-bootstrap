@@ -18,6 +18,7 @@ prepare_fixture() {
   local trusted_apt="$trusted_bin/apt-get"
   mkdir -p "$source_root/scripts/ubuntu" "$source_root/config" "$fixture_home" "$fake_bin" "$trusted_bin"
   cp "$repo_root/scripts/ubuntu/bootstrap.sh" "$source_root/scripts/ubuntu/bootstrap.sh"
+  cp "$repo_root/scripts/ubuntu/rtk-release.sh" "$source_root/scripts/ubuntu/rtk-release.sh"
   cp "$repo_root/scripts/ubuntu/source-attestation.sh" "$source_root/scripts/ubuntu/source-attestation.sh"
   cp "$repo_root/scripts/ubuntu/launcher-capability.sh" "$source_root/scripts/ubuntu/launcher-capability.sh"
   cp "$repo_root/scripts/ubuntu/trusted-launcher.sh" "$source_root/scripts/ubuntu/trusted-launcher.sh"

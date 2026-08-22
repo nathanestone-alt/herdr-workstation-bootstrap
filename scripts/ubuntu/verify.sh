@@ -379,6 +379,7 @@ check_managed_command_target py "$HOME/.local/bin/py" || :
 for managed_tool in rustup rustc herdr; do
   check_managed_command_target "$managed_tool" "$HOME/.local/bin/$managed_tool" || :
 done
+check_managed_command_target rtk "$HOME/.cargo/bin/rtk" || :
 for managed_tool in node npm codex claude bun; do
   check_managed_node_command_target "$managed_tool"
 done
@@ -451,6 +452,9 @@ validate_locked_receipt_value() {
     rustc)
       escaped_version="${RUST_TOOLCHAIN//./\\.}"
       [[ "$value" =~ ^rustc[[:space:]]${escaped_version}([[:space:]]\([^[:space:]]+[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}\))?$ ]] || { echo "FAIL receipt locked contract $key"; return 1; }
+      ;;
+    rtk)
+      [[ "$value" == "rtk $RTK_VERSION" ]] || { echo "FAIL receipt locked contract $key"; return 1; }
       ;;
     node)
       [[ "$value" == "v$NODE_VERSION" ]] || { echo "FAIL receipt locked contract $key"; return 1; }
@@ -535,7 +539,7 @@ validate_runtime_receipt() {
   local receipt_failures=0
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
-    uv_path python3.13_path py_path uv_version python3.13_version
+    uv_path python3.13_path py_path rtk_path rtk_version rtk_url rtk_sha256 uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
     rustup rustc node npm codex claude bun herdr powershell
@@ -550,6 +554,10 @@ validate_runtime_receipt() {
   expected_by_key[uv_path]="$HOME/.local/bin/uv"
   expected_by_key[python3.13_path]="$HOME/.local/bin/python3.13"
   expected_by_key[py_path]="$HOME/.local/bin/py"
+  expected_by_key[rtk_path]="$HOME/.cargo/bin/rtk"
+  expected_by_key[rtk_version]="rtk $RTK_VERSION"
+  expected_by_key[rtk_url]="$RTK_URL"
+  expected_by_key[rtk_sha256]="$RTK_SHA256"
   expected_by_key[uv_version]="uv $UV_VERSION ($UV_PLATFORM)"
   expected_by_key[python3.13_version]="Python $PYTHON_VERSION"
   expected_by_key[py_3.13_version]="Python $PYTHON_VERSION"
@@ -572,6 +580,7 @@ validate_runtime_receipt() {
   local runtime_probe_failed=0
   record_receipt_first_line rustup rustup --version || runtime_probe_failed=1
   record_receipt_command rustc rustc --version || runtime_probe_failed=1
+  record_receipt_command rtk rtk --version || runtime_probe_failed=1
   record_receipt_command node node --version || runtime_probe_failed=1
   record_receipt_command npm npm --version || runtime_probe_failed=1
   record_receipt_command codex codex --version || runtime_probe_failed=1
@@ -582,7 +591,7 @@ validate_runtime_receipt() {
   if (( runtime_probe_failed )); then
     return 1
   fi
-  for runtime_key in rustup rustc node npm codex claude bun herdr powershell; do
+  for runtime_key in rustup rustc rtk node npm codex claude bun herdr powershell; do
     if ! validate_locked_receipt_value "$runtime_key"; then
       receipt_failures=$((receipt_failures + 1))
     fi

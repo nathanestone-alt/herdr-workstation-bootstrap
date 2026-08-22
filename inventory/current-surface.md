@@ -18,15 +18,17 @@ Captured 2026-08-16. These versions document the working ARM64 environment; AMD6
 | Python | 3.12.10 and 3.13.12 ARM64 |
 | uv | 0.11.19 |
 
-## Pinned RTK customization
+## Pinned RTK release
 
-The installed RTK binary was built from a clean worktree:
+The Ubuntu bootstrap installs the official upstream Linux release and keeps
+customization in configuration and hooks:
 
-- Repository: `https://github.com/nathanestone-alt/rtk.git`
-- Branch: `fix/native-fallback-current`
-- Commit: `c1819ceff1ab8d75b88c1ff7a63f497914e8fe99`
+- Version: `0.45.0`
+- Asset: `rtk-x86_64-unknown-linux-musl.tar.gz`
+- SHA-256: `c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4`
 
-The Ubuntu bootstrap pins this exact commit by default. Change it only after verifying a released/upstream build includes the required native fallback and session behavior.
+Forking or source-building is deferred until a concrete upstream gap is
+proven.
 
 ## Installed Codex plugins
 

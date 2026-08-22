@@ -8,7 +8,7 @@
 # Provenance: https://static.rust-lang.org/dist/channel-rust-stable.toml
 # Provenance: https://nodejs.org/dist/index.json
 # Provenance: https://nodejs.org/dist/v24.19.0/SHASUMS256.txt
-# Provenance: https://api.github.com/repos/nathanestone-alt/rtk/commits?per_page=1
+# Provenance: https://github.com/rtk-ai/rtk/releases/tag/v0.45.0
 # Provenance: https://registry.npmjs.org/@openai%2Fcodex/latest
 # Provenance: https://registry.npmjs.org/@anthropic-ai%2Fclaude-code/latest
 # Provenance: https://registry.npmjs.org/bun/latest
@@ -23,8 +23,9 @@ PYTHON_PLATFORM=x86_64-unknown-linux-gnu
 PYTHON_ARCHIVE=cpython-3.13.15+20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
 PYTHON_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.13.15%2B20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
 PYTHON_SHA256=aaca2af2ab4d7b68a712660d1334c0cfd5ec13c0312ccd30c29122d8d0342320
-RTK_REPO_URL=https://github.com/nathanestone-alt/rtk.git
-RTK_REF=5d32d0736f686b69d1e8b9dc45c007d4eb77a0a2
+RTK_VERSION=0.45.0
+RTK_URL=https://github.com/rtk-ai/rtk/releases/download/v0.45.0/rtk-x86_64-unknown-linux-musl.tar.gz
+RTK_SHA256=c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4
 POWERSHELL_VERSION=7.6.5
 POWERSHELL_URL=https://packages.microsoft.com/repos/microsoft-ubuntu-noble-prod/pool/main/p/powershell/powershell_7.6.5-1.deb_amd64.deb
 POWERSHELL_SHA256=dd683d29a5c95ed43e426f4fe1679469d8b89e78ea955455f6238a0b0e6f1a24

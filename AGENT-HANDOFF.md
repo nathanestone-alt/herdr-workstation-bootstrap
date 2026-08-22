@@ -89,7 +89,7 @@ sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --pha
 sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint bootstrap --phase tools
 ~~~
 
-This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust/RTK, Node, Codex, Claude, Herdr, and Bun toolchain.
+This installs native PowerShell 7, CIFS support, systemd services and SSH, plus the checksum-verified/version-locked Tailscale, Rust, official RTK release, Node, Codex, Claude, Herdr, and Bun toolchain.
 The tools phase also installs the pinned x86-64 uv/CPython 3.13 runtime under
 user-owned managed paths, exposes `python3.13`, and provides the narrow
 fail-closed `py -3.13` compatibility command. Archive
