@@ -422,8 +422,10 @@ else
     --fixture-root "$fixture_root"
   payload_probe="$test_root/payload-probe"
   mkdir -p "$payload_probe/source"
+  # The source snapshot manifest binds each committed file's digest and mode.
+  # Preserve those hardened modes while staging the payload; root can still
+  # mutate the tree for the later tamper probe without widening the fixture.
   cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
-  chmod -R u+w "$payload_probe"
   payload_probe_manifest="$payload_probe/.payload-manifest"
   attestation_build_payload_manifest "$payload_probe" "$payload_probe_manifest"
   payload_probe_hash="$(attestation_hash_file "$payload_probe_manifest")"
@@ -499,7 +501,6 @@ else
   alternate_payload_probe="$test_root/alternate-payload-probe"
   mkdir -p "$alternate_payload_probe/source"
   cp -a -- "$attestation_snapshot_dir/." "$alternate_payload_probe/source/"
-  chmod -R u+w "$alternate_payload_probe"
   alternate_payload_manifest="$alternate_payload_probe/.payload-manifest"
   attestation_build_payload_manifest "$alternate_payload_probe" "$alternate_payload_manifest"
   alternate_payload_hash="$(attestation_hash_file "$alternate_payload_manifest")"
