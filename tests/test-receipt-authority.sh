@@ -402,6 +402,11 @@ else
     unset "$receipt_test_git_var"
   done < <(compgen -e | /usr/bin/grep '^GIT_')
   source "$repo_root/scripts/ubuntu/source-attestation.sh"
+  # Capability entrypoints must be executable before the source snapshot
+  # manifest is built; the staged source must not be chmod-mutated afterward.
+  chmod 0755 \
+    "$source_root/scripts/ubuntu/launcher-capability.sh" \
+    "$source_root/scripts/ubuntu/receipt-authority.sh"
   attestation_create_git_snapshot "$source_root" '' ''
   unbound_source_snapshot="$attestation_snapshot_dir"
   unbound_source_manifest="$attestation_snapshot_manifest"
@@ -423,7 +428,7 @@ else
   payload_probe="$test_root/payload-probe"
   mkdir -p "$payload_probe/source"
   # The source snapshot manifest binds each committed file's digest and mode.
-  # Preserve those hardened modes while staging the payload; root can still
+  # Preserve those attested modes while staging the payload. Root can still
   # mutate the tree for the later tamper probe without widening the fixture.
   cp -a -- "$unbound_source_snapshot/." "$payload_probe/source/"
   payload_probe_manifest="$payload_probe/.payload-manifest"
