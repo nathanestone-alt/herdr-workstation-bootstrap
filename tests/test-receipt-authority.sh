@@ -473,6 +473,29 @@ else
       --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
       "${fixture_args[@]}"
   }
+  # The hardened source snapshot strips every write bit, so the real payload
+  # entrypoint and capability helper are root-owned 0555.  Payload receipt
+  # capability must accept exactly that mode and must still reject the
+  # writable-by-owner 0755 mode that only an installed-launcher stage may use.
+  payload_capability_entry="$payload_probe/source/scripts/ubuntu/receipt-authority.sh"
+  payload_capability_helper="$payload_probe/source/scripts/ubuntu/launcher-capability.sh"
+  for payload_capability_path in "$payload_capability_entry" "$payload_capability_helper"; do
+    [[ "$(stat -c '%u:%g:%a' -- "$payload_capability_path")" == 0:0:555 ]] || {
+      echo "Hardened payload capability blob is not root-owned 0555: $payload_capability_path" >&2
+      exit 1
+    }
+  done
+  chmod 0755 "$payload_capability_entry"
+  expect_failure_diagnostic production-payload-writable-entrypoint-mode \
+    'herdr launcher capability: entrypoint owner or mode is unsafe' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+  chmod 0555 "$payload_capability_entry"
+  chmod 0755 "$payload_capability_helper"
+  expect_failure_diagnostic production-payload-writable-helper-mode \
+    'herdr launcher capability: capability helper owner or mode is unsafe' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$attestation_snapshot_commit" production
+  chmod 0555 "$payload_capability_helper"
+
   payload_stage_writable_entry="$payload_probe/source/config/ubuntu-toolchain.lock"
   payload_stage_writable_mode="$(stat -c '%a' -- "$payload_stage_writable_entry")"
   chmod 0664 "$payload_stage_writable_entry"

@@ -39,6 +39,24 @@ launcher_capability_owner_mode() {
   [[ "$uid" == "$expected_uid" && "$gid" == "$expected_gid" && "$mode" == "$expected_mode" ]]
 }
 
+# The two execution roles materialize the committed 100755 capability blobs
+# differently.  An installed-launcher stage is a live checkout that stays
+# writable by its owner, so its entrypoint and helper are 0755.  A payload
+# receipt executes the hardened source-attestation snapshot instead: every
+# snapshot file has its write bits stripped after materialization, so the real
+# root-owned payload entrypoint and helper are 0555 and are recorded that way
+# in .source-attestation.  Each role therefore has exactly one accepted mode.
+# The result is published through a global rather than command substitution so
+# an invalid selector aborts the real process instead of a subshell.
+launcher_capability_expected_entry_mode() {
+  launcher_capability_entry_mode=''
+  case "${1:-}" in
+    0) launcher_capability_entry_mode=755 ;;
+    1) launcher_capability_entry_mode=555 ;;
+    *) launcher_capability_fail 'payload mode selector is invalid' ;;
+  esac
+}
+
 launcher_capability_capture_readonly() {
   local variable="$1" expected="$2"
   if [[ -v "$variable" ]]; then
@@ -245,8 +263,13 @@ launcher_capability_bind() {
   local policy_size payload_root_value
   local staging_root stage_dir stage_identity entry_path repo_root
   local prefix expected_launcher expected_staging helper_identity
-  local policy_uid policy_gid policy_mode stage_mode
+  local policy_uid policy_gid policy_mode stage_mode entry_expected_mode
   local git_dir git_entry git_mode
+
+  launcher_capability_expected_entry_mode "$payload_mode"
+  entry_expected_mode="$launcher_capability_entry_mode"
+  [[ "$entry_expected_mode" == 755 || "$entry_expected_mode" == 555 ]] ||
+    launcher_capability_fail 'entrypoint mode contract is unresolved'
 
   entry_source="${BASH_SOURCE[2]:-${BASH_SOURCE[1]:-}}"
   entry_source="${launcher_capability_entry_source:-$entry_source}"
@@ -334,13 +357,13 @@ launcher_capability_bind() {
     [[ "$entry_path" == "$stage_dir/scripts/ubuntu/$expected_entry.sh" ]] ||
       launcher_capability_fail 'entrypoint escaped its stage'
   fi
-  launcher_capability_owner_mode "$entry_path" "$policy_uid" "$policy_gid" 755 ||
+  launcher_capability_owner_mode "$entry_path" "$policy_uid" "$policy_gid" "$entry_expected_mode" ||
     launcher_capability_fail 'entrypoint owner or mode is unsafe'
   helper_path="$repo_root/scripts/ubuntu/launcher-capability.sh"
   helper_path="$(launcher_capability_realpath "$helper_path")"
   [[ "$helper_path" == "$repo_root/scripts/ubuntu/launcher-capability.sh" ]] ||
     launcher_capability_fail 'capability helper escaped its stage'
-  launcher_capability_owner_mode "$helper_path" "$policy_uid" "$policy_gid" 755 ||
+  launcher_capability_owner_mode "$helper_path" "$policy_uid" "$policy_gid" "$entry_expected_mode" ||
     launcher_capability_fail 'capability helper owner or mode is unsafe'
 
   launcher_capability_parse_policy "$policy_size"

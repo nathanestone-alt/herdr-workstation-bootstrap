@@ -305,6 +305,57 @@ run_parent_capability_fixture substituted-file-for-receipt root-receipt "$parent
 run_parent_capability_fixture substituted-directory-for-launcher installed-launcher "$parent_capability_directory" 0
 echo 'parent capability positive, missing, substituted, and role-distinction tests passed.'
 
+# The capability entrypoint/helper mode contract is role-specific.  An
+# installed-launcher stage is a live checkout that keeps its committed 100755
+# blobs writable by their owner (0755).  A payload receipt instead executes the
+# hardened source-attestation snapshot, whose files have every write bit
+# stripped after materialization (0555).  Each role must accept exactly its own
+# mode and reject the other role's mode, any writable-by-group/other variant,
+# and any foreign owner.
+capability_mode_root="$test_root/capability-mode"
+mkdir -p "$capability_mode_root"
+chmod 0755 "$capability_mode_root"
+capability_mode_entry="$capability_mode_root/receipt-authority.sh"
+: > "$capability_mode_entry"
+run_capability_mode_fixture() {
+  local label="$1" payload_mode="$2" file_mode="$3" expected_uid="$4" should_pass="$5"
+  local output status
+  chmod "$file_mode" -- "$capability_mode_entry"
+  set +e
+  output="$(
+    (
+      set -euo pipefail
+      # shellcheck disable=SC1090
+      source "$helper_definitions"
+      launcher_capability_expected_entry_mode "$payload_mode"
+      launcher_capability_owner_mode "$capability_mode_entry" \
+        "$expected_uid" "$(/usr/bin/id -g)" "$launcher_capability_entry_mode"
+    ) 2>&1
+  )"
+  status=$?
+  set -e
+  if [[ "$should_pass" == 1 ]]; then
+    (( status == 0 )) || { printf '%s\n' "$output" >&2; fail_test "$label capability mode contract rejected the attested mode"; }
+  else
+    (( status != 0 )) || fail_test "$label capability mode contract unexpectedly passed"
+  fi
+}
+capability_mode_uid="$(/usr/bin/id -u)"
+capability_mode_foreign_uid=$(( capability_mode_uid + 1 ))
+run_capability_mode_fixture payload-hardened 1 0555 "$capability_mode_uid" 1
+run_capability_mode_fixture payload-owner-writable 1 0755 "$capability_mode_uid" 0
+run_capability_mode_fixture payload-group-writable 1 0575 "$capability_mode_uid" 0
+run_capability_mode_fixture payload-world-writable 1 0557 "$capability_mode_uid" 0
+run_capability_mode_fixture payload-foreign-owner 1 0555 "$capability_mode_foreign_uid" 0
+run_capability_mode_fixture launcher-owner-writable 0 0755 "$capability_mode_uid" 1
+run_capability_mode_fixture launcher-hardened 0 0555 "$capability_mode_uid" 0
+run_capability_mode_fixture launcher-group-writable 0 0775 "$capability_mode_uid" 0
+run_capability_mode_fixture launcher-world-writable 0 0757 "$capability_mode_uid" 0
+run_capability_mode_fixture launcher-foreign-owner 0 0755 "$capability_mode_foreign_uid" 0
+run_capability_mode_fixture invalid-selector 2 0755 "$capability_mode_uid" 0
+run_capability_mode_fixture empty-selector '' 0755 "$capability_mode_uid" 0
+echo 'capability entrypoint payload/installed-launcher mode contract tests passed.'
+
 forged_root="$test_root/forged"; forged_marker="$test_root/forged-entrypoint-reached"
 mkdir -p "$forged_root/scripts/ubuntu"
 cp -- "$source_root/scripts/ubuntu/trusted-launcher.sh" "$forged_root/scripts/ubuntu/trusted-launcher.sh"
