@@ -21,6 +21,7 @@ entrypoint_root="$test_root/entrypoint"
 
 mkdir -p \
   "$fixture_root/bin" \
+  "$fixture_root/opt/microsoft/powershell/7" \
   "$fixture_home/.local/bin" \
   "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin" \
   "$fixture_home/.cargo/bin" \
@@ -44,26 +45,35 @@ EOF
 make_tool "$fixture_root/bin/bash" 'GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)'
 make_tool "$fixture_root/bin/git" 'git version 2.43.0'
 make_tool "$fixture_root/bin/gh" 'gh version 2.45.0 (fixture)'
-make_tool "$fixture_root/bin/pwsh" 'PowerShell 7.6.5'
+make_tool "$fixture_root/opt/microsoft/powershell/7/pwsh" 'PowerShell 7.6.5'
+printf '%s\n' 'fixture PowerShell companion' > "$fixture_root/opt/microsoft/powershell/7/pwsh.dll"
+printf '%s\n' '{}' > "$fixture_root/opt/microsoft/powershell/7/pwsh.deps.json"
+printf '%s\n' '{}' > "$fixture_root/opt/microsoft/powershell/7/pwsh.runtimeconfig.json"
+chmod 0644 "$fixture_root/opt/microsoft/powershell/7/pwsh.dll" \
+  "$fixture_root/opt/microsoft/powershell/7/pwsh.deps.json" \
+  "$fixture_root/opt/microsoft/powershell/7/pwsh.runtimeconfig.json"
 make_tool "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin/node" "v$NODE_VERSION"
 make_tool "$fixture_home/.cargo/bin/rtk" "rtk $RTK_VERSION"
 
 cat > "$fixture_home/.local/bin/python3.13" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+fixture_path="\$(readlink -f "\$0")"
+fixture_prefix="\${fixture_path%/bin/python3.13}"
+fixture_runtime_root="\$fixture_prefix/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 if [[ "\${1:-}" == '--version' ]]; then
   printf 'Python 3.13.15\n'
 elif [[ "\${1:-}" == '-c' ]]; then
-  printf '{"version":"3.13.15","version_info":[3,13,15,"final",0],"implementation":"CPython","executable":"%s","prefix":"%s/.local","base_prefix":"%s","stdlib":"%s/lib/python3.13"}\n' \
-    "\$(readlink -f "\$0")" "$fixture_home" "$runtime_root" "$runtime_root"
+  printf '{"version":"3.13.15","version_info":[3,13,15,"final",0],"implementation":"CPython","executable":"%s","prefix":"%s","base_prefix":"%s","stdlib":"%s/lib/python3.13"}\n' \
+    "\$fixture_path" "\$fixture_prefix" "\$fixture_runtime_root" "\$fixture_runtime_root"
 else
   exit 2
 fi
 EOF
 chmod 0755 "$fixture_home/.local/bin/python3.13"
 printf 'runtime executable\n' > "$runtime_root/bin/python3.13"
+printf 'runtime libpython\n' > "$runtime_root/lib/libpython3.13.so.1.0"
 printf 'stdlib fixture\n' > "$stdlib_root/fixture.py"
-ln -s fixture.py "$stdlib_root/fixture-link.py"
 cat > "$fixture_home/.local/pyvenv.cfg" <<EOF
 home = $runtime_root
 include-system-site-packages = false
@@ -239,6 +249,100 @@ expect_failure_diagnostic() {
   }
 }
 
+run_bundle_stage_mutation() {
+  local label="$1"
+  local ready="$fixture_root/$label.ready"
+  local continue_file="$fixture_root/$label.continue"
+  local output="$test_root/$label.output"
+  local pid status stage_root stage_stdlib stage_runtime active_stage_parent
+  rm -f -- "$ready" "$continue_file"
+  repin_launcher_pause after-python313-staging "$ready" "$continue_file"
+  (
+    run_authority --check
+  ) > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 500); do
+    [[ -e "$ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$ready" ]] || {
+    : > "$continue_file"
+    wait "$pid" 2>/dev/null || true
+    repin_launcher_pause '' '' ''
+    echo "Bundle mutation test did not reach its staging pause: $label" >&2
+    cat "$output" >&2
+    exit 1
+  }
+  stage_root=''
+  active_stage_parent="$(/usr/bin/find /tmp -maxdepth 1 -type d -name 'herdr-receipt-exec.*' \
+    -printf '%T@ %p\n' 2>/dev/null | /usr/bin/sort -nr | /usr/bin/head -n 1 | /usr/bin/cut -d' ' -f2- || true)"
+  if [[ -n "$active_stage_parent" && -d "$active_stage_parent/python313/.local" ]]; then
+    stage_root="$active_stage_parent/python313/.local"
+  fi
+  [[ -n "$stage_root" ]] || {
+    : > "$continue_file"
+    wait "$pid" 2>/dev/null || true
+    repin_launcher_pause '' '' ''
+    echo "Bundle mutation test could not locate the sealed Python tree: $label" >&2
+    exit 1
+  }
+  stage_runtime="$stage_root/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+  stage_stdlib="$stage_runtime/lib/python3.13"
+  /usr/bin/chmod u+w -- "$stage_root" "$stage_root/bin" "$stage_root/lib" \
+    "$stage_root/lib/herdr-workstation" "$stage_root/lib/herdr-workstation/python" \
+    "$stage_runtime" "$stage_runtime/lib" "$stage_stdlib"
+  /usr/bin/chmod u+w -- "$stage_stdlib/fixture.py"
+  case "$label" in
+    bundle-extra-file)
+      printf '%s\n' extra > "$stage_stdlib/extra.py"
+      ;;
+    bundle-omitted-file)
+      rm -- "$stage_stdlib/fixture.py"
+      ;;
+    bundle-path-traversal)
+      mv -- "$stage_stdlib" "$stage_runtime/stdlib-original"
+      ln -s -- /tmp "$stage_stdlib"
+      ;;
+    bundle-mode-substitution)
+      /usr/bin/chmod 0644 -- "$stage_stdlib/fixture.py"
+      ;;
+    bundle-digest-substitution)
+      printf '%s\n' digest-tamper > "$stage_stdlib/fixture.py"
+      ;;
+    bundle-owner-substitution)
+      [[ "$(/usr/bin/id -u)" == 0 ]] || {
+        : > "$continue_file"
+        wait "$pid" 2>/dev/null || true
+        repin_launcher_pause '' '' ''
+        echo 'SKIP: bundle owner substitution requires root.' >&2
+        return 0
+      }
+      /usr/bin/chown 65534:65534 -- "$stage_stdlib/fixture.py"
+      ;;
+    bundle-symlink-substitution)
+      mv -- "$stage_stdlib/fixture.py" "$stage_stdlib/fixture-original.py"
+      ln -s -- /etc/passwd "$stage_stdlib/fixture.py"
+      ;;
+    *)
+      : > "$continue_file"
+      wait "$pid" 2>/dev/null || true
+      echo "Unknown bundle mutation label: $label" >&2
+      exit 1
+      ;;
+  esac
+  : > "$continue_file"
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  repin_launcher_pause '' '' ''
+  (( status != 0 )) || {
+    cat "$output" >&2
+    echo "Bundle mutation unexpectedly passed: $label" >&2
+    exit 1
+  }
+}
+
 run_authority --install
 run_authority --check
 [[ -f "$authority_path" && ! -L "$authority_path" ]] || exit 1
@@ -251,6 +355,23 @@ run_authority --check
 [[ "$(jq -r '.python313.venv.home' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.base_prefix' "$receipt_path")" == "$runtime_root" ]] || exit 1
 [[ "$(jq -r '.python313.runtime.stdlib' "$receipt_path")" == "$stdlib_root" ]] || exit 1
+[[ "$(jq -r '.role_identities.pwsh.bundle.kind' "$receipt_path")" == sealed-directory-v1 ]] || exit 1
+[[ "$(jq -r '.python313.bundle.kind' "$receipt_path")" == sealed-directory-v1 ]] || exit 1
+(( $(jq -r '.role_identities.pwsh.bundle.file_count' "$receipt_path") > 1 )) || exit 1
+(( $(jq -r '.python313.bundle.file_count' "$receipt_path") > 1 )) || exit 1
+[[ "$(jq -r '.python313.execution_path' "$receipt_path")" == sealed://python313/.local/bin/python3.13 ]] || exit 1
+run_bundle_stage_mutation bundle-extra-file
+run_bundle_stage_mutation bundle-omitted-file
+run_bundle_stage_mutation bundle-path-traversal
+run_bundle_stage_mutation bundle-mode-substitution
+run_bundle_stage_mutation bundle-digest-substitution
+run_bundle_stage_mutation bundle-owner-substitution
+run_bundle_stage_mutation bundle-symlink-substitution
+cp -- "$receipt_path" "$test_root/receipt.bundle-good"
+jq '.python313.bundle.manifest_sha256 = ("0" * 64)' "$receipt_path" > "$test_root/receipt.bundle-tampered"
+mv -- "$test_root/receipt.bundle-tampered" "$receipt_path"
+expect_failure 'tampered Python bundle manifest' run_authority --check
+cp -- "$test_root/receipt.bundle-good" "$receipt_path"
 
 mv -- "$fixture_home/.cargo/bin/rtk" "$test_root/rtk-good"
 make_tool "$fixture_home/.cargo/bin/rtk" 'rtk 0.0.0'

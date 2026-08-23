@@ -17,6 +17,9 @@ readonly receipt_sha256_bin='/usr/bin/sha256sum'
 readonly receipt_awk_bin='/usr/bin/gawk'
 readonly receipt_head_bin='/usr/bin/head'
 readonly receipt_cp_bin='/usr/bin/cp'
+readonly receipt_sort_bin='/usr/bin/sort'
+readonly receipt_readlink_bin='/usr/bin/readlink'
+readonly receipt_cmp_bin='/usr/bin/cmp'
 readonly receipt_rm_bin='/usr/bin/rm'
 readonly receipt_chown_bin='/usr/bin/chown'
 readonly receipt_setpriv_bin='/usr/bin/setpriv'
@@ -135,7 +138,8 @@ for receipt_trusted_binary in \
   "$receipt_env_bin" "$receipt_realpath_bin" "$receipt_dirname_bin" \
   "$receipt_find_bin" "$receipt_mktemp_bin" "$receipt_chmod_bin" \
   "$receipt_stat_bin" "$receipt_sha256_bin" "$receipt_awk_bin" \
-  "$receipt_head_bin" "$receipt_cp_bin" "$receipt_rm_bin" "$receipt_chown_bin" \
+  "$receipt_head_bin" "$receipt_cp_bin" "$receipt_sort_bin" "$receipt_readlink_bin" "$receipt_cmp_bin" \
+  "$receipt_rm_bin" "$receipt_chown_bin" \
   "$receipt_getent_bin" "$receipt_id_bin" "$receipt_setpriv_bin"; do
   receipt_trust_assert_binary "$receipt_trusted_binary"
 done
@@ -527,7 +531,12 @@ receipt_cleanup() {
   set +e
   local cleanup_path
   for cleanup_path in "${receipt_cleanup_paths[@]:-}"; do
-    [[ -n "$cleanup_path" ]] && "$receipt_rm_bin" -rf -- "$cleanup_path"
+    if [[ -n "$cleanup_path" ]]; then
+      if [[ "$cleanup_path" == /tmp/herdr-receipt-exec.* ]]; then
+        "$receipt_chmod_bin" -R u+w -- "$cleanup_path" 2>/dev/null || true
+      fi
+      "$receipt_rm_bin" -rf -- "$cleanup_path"
+    fi
   done
   if declare -F attestation_cleanup_temporary_paths >/dev/null 2>&1; then
     attestation_cleanup_temporary_paths
@@ -836,7 +845,7 @@ role_path[git]="$system_bin/git"
 role_path[gh]="$system_bin/gh"
 role_path[bash]="$system_bin/bash"
 if [[ -n "$fixture_root" ]]; then
-  role_path[pwsh]="$system_bin/pwsh"
+  role_path[pwsh]="$fixture_root/opt/microsoft/powershell/7/pwsh"
 else
   if [[ -x /opt/microsoft/powershell/7/pwsh ]]; then
     role_path[pwsh]='/opt/microsoft/powershell/7/pwsh'
@@ -872,9 +881,477 @@ canonical_executable() {
 }
 
 declare -A role_execution_path role_execution_command_path role_execution_fd role_execution_owner role_source_identity role_source_hash role_execution_hash
+declare -A role_bundle_kind role_bundle_source_root role_bundle_source_entry role_bundle_execution_root
+declare -A role_bundle_manifest_file role_bundle_manifest_sha256 role_bundle_file_count role_bundle_directory_count
+declare -A role_bundle_source_owner_uid role_bundle_source_owner_gid role_bundle_stage_root role_bundle_snapshot_file
+declare -A role_bundle_stage_hash
 receipt_exec_stage_dir=''
 
-receipt_stage_executable() {
+readonly receipt_bundle_manifest_header='herdr-role-bundle-manifest-v1'
+readonly receipt_bundle_snapshot_header='herdr-role-bundle-snapshot-v1'
+
+receipt_bundle_safe_relative_path() {
+  local relative="$1"
+  local component
+  local -a components=()
+  [[ "$relative" == '.' ]] && return 0
+  [[ -n "$relative" && "$relative" != /* && "$relative" != *$'\n'* && "$relative" != *$'\t'* ]] || return 1
+  IFS='/' read -r -a components <<< "$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != '.' && "$component" != '..' && \
+      "$component" =~ ^[A-Za-z0-9._+@=-]+$ ]] || return 1
+  done
+}
+
+receipt_bundle_stage_mode() {
+  local mode="$1"
+  local value
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  value=$((8#$mode & 0555))
+  printf '%03o' "$value"
+}
+
+receipt_bundle_add_source_dir() {
+  local source_root="$1"
+  local relative="$2"
+  local normal_raw="$3"
+  local snapshot_raw="$4"
+  local expected_uid="$5"
+  local expected_gid="$6"
+  local full owner group mode identity
+  if [[ "$relative" == '.' ]]; then
+    full="$source_root"
+  else
+    receipt_bundle_safe_relative_path "$relative" || fail "runtime bundle path is unsafe: $relative"
+    full="$source_root/$relative"
+  fi
+  [[ -n "${bundle_seen_dirs[$relative]+x}" ]] && return 0
+  bundle_seen_dirs["$relative"]=1
+  reject_symlink_components "$full" || fail "runtime bundle directory contains a symlinked component: $full"
+  [[ -d "$full" && ! -L "$full" ]] || fail "runtime bundle directory is not a regular directory: $full"
+  owner="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$full" 2>/dev/null || true)"
+  group="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$full" 2>/dev/null || true)"
+  mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$full" 2>/dev/null || true)"
+  identity="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$full" 2>/dev/null || true)"
+  [[ "$owner" == "$expected_uid" && "$group" == "$expected_gid" && \
+    "$mode" =~ ^[0-7]{3,4}$ && "$identity" =~ ^[0-9]+:[0-9]+$ ]] || {
+    fail "runtime bundle directory owner, mode, or identity is unsafe: $full"
+  }
+  printf 'D\t%s\t%s\t%s\t%s\n' "$relative" "$mode" "$owner" "$group" >> "$normal_raw"
+  printf 'D\t%s\t%s\t%s\t%s\t%s\n' "$relative" "$mode" "$owner" "$group" "$identity" >> "$snapshot_raw"
+}
+
+receipt_bundle_add_source_file() {
+  local source_root="$1"
+  local relative="$2"
+  local normal_raw="$3"
+  local snapshot_raw="$4"
+  local expected_uid="$5"
+  local expected_gid="$6"
+  local transform="${7:-copy}"
+  local full owner group mode identity source_fd descriptor_path source_id source_hash live_id
+  receipt_bundle_safe_relative_path "$relative" || fail "runtime bundle file path is unsafe: $relative"
+  full="$source_root/$relative"
+  reject_symlink_components "$full" || fail "runtime bundle file contains a symlinked component: $full"
+  [[ -f "$full" && ! -L "$full" ]] || fail "runtime bundle file is not a regular file: $full"
+  owner="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$full" 2>/dev/null || true)"
+  group="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$full" 2>/dev/null || true)"
+  mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$full" 2>/dev/null || true)"
+  identity="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$full" 2>/dev/null || true)"
+  [[ "$owner" == "$expected_uid" && "$group" == "$expected_gid" && \
+    "$mode" =~ ^[0-7]{3,4}$ && "$identity" =~ ^[0-9]+:[0-9]+$ ]] || {
+    fail "runtime bundle file owner, mode, or identity is unsafe: $full"
+  }
+  exec {source_fd}<"$full" || fail "could not open runtime bundle file: $full"
+  descriptor_path="/proc/self/fd/$source_fd"
+  source_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$descriptor_path" 2>/dev/null || true)"
+  source_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$descriptor_path" | "$receipt_awk_bin" '{print $1}')"
+  live_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$full" 2>/dev/null || true)"
+  if [[ "$source_id" != "$identity" || "$source_id" != "$live_id" || ! "$source_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    eval "exec ${source_fd}<&-" 2>/dev/null || true
+    [[ "$source_hash" =~ ^[0-9a-f]{64}$ ]] || fail "runtime bundle file digest is invalid: $full"
+    fail "runtime bundle file changed while being attested: $full"
+  fi
+  eval "exec ${source_fd}<&-" 2>/dev/null || true
+  printf 'F\t%s\t%s\t%s\t%s\t%s\t%s\n' "$relative" "$mode" "$owner" "$group" "$source_hash" "$transform" >> "$normal_raw"
+  printf 'F\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$relative" "$mode" "$owner" "$group" "$identity" "$source_hash" "$transform" >> "$snapshot_raw"
+}
+
+receipt_bundle_finalize_source_manifests() {
+  local normal="$1"
+  local snapshot="$2"
+  local normal_raw="$3"
+  local snapshot_raw="$4"
+  {
+    printf '%s\n' "$receipt_bundle_manifest_header"
+    "$receipt_sort_bin" -t $'\t' -k2,2 -- "$normal_raw"
+  } > "$normal"
+  {
+    printf '%s\n' "$receipt_bundle_snapshot_header"
+    "$receipt_sort_bin" -t $'\t' -k2,2 -- "$snapshot_raw"
+  } > "$snapshot"
+}
+
+receipt_bundle_build_pwsh_source_manifest() {
+  local source_root="$1"
+  local normal="$2"
+  local snapshot="$3"
+  local normal_raw snapshot_raw entry base target
+  local expected_uid expected_gid
+  declare -A bundle_seen_dirs=()
+  normal_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-normal.XXXXXX)"
+  snapshot_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  receipt_register_cleanup "$normal_raw"
+  receipt_register_cleanup "$snapshot_raw"
+  : > "$normal_raw"
+  : > "$snapshot_raw"
+  # The Ubuntu PowerShell package's bounded apphost closure is the package
+  # root's regular files.  Modules, schemas, localization, and ref assemblies
+  # are outside the --version closure; the two legacy OpenSSL aliases are
+  # explicitly checked and excluded rather than copied as symlinks.
+  expected_uid="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "${role_path[pwsh]}" 2>/dev/null || true)"
+  expected_gid="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "${role_path[pwsh]}" 2>/dev/null || true)"
+  receipt_bundle_add_source_dir "$source_root" '.' "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  while IFS= read -r -d '' entry; do
+    base="${entry##*/}"
+    case "$base" in
+      Modules|Schemas|en-US|ref)
+        reject_symlink_components "$entry" || fail "PowerShell optional directory contains a symlinked component: $entry"
+        [[ -d "$entry" && ! -L "$entry" ]] || fail "PowerShell optional entry is not a directory: $entry"
+        ;;
+      libcrypto.so.1.0.0|libssl.so.1.0.0)
+        [[ -L "$entry" ]] || fail "PowerShell compatibility entry is not the expected symlink: $entry"
+        target="$($receipt_readlink_bin -- "$entry" 2>/dev/null || true)"
+        case "$base" in
+          libcrypto.so.1.0.0) [[ "$target" == /lib64/libcrypto.so.10 ]] || fail "PowerShell compatibility symlink target is unsafe: $entry -> $target" ;;
+          libssl.so.1.0.0) [[ "$target" == /lib64/libssl.so.10 ]] || fail "PowerShell compatibility symlink target is unsafe: $entry -> $target" ;;
+        esac
+        ;;
+      *)
+        [[ -f "$entry" && ! -L "$entry" ]] || fail "PowerShell closure contains an unsupported entry: $entry"
+        receipt_bundle_add_source_file "$source_root" "$base" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+        ;;
+    esac
+  done < <("$receipt_find_bin" -P "$source_root" -mindepth 1 -maxdepth 1 -print0 | "$receipt_sort_bin" -z)
+  receipt_bundle_finalize_source_manifests "$normal" "$snapshot" "$normal_raw" "$snapshot_raw"
+}
+
+receipt_bundle_build_python_source_manifest() {
+  local source_root="$1"
+  local normal="$2"
+  local snapshot="$3"
+  local normal_raw snapshot_raw full relative runtime_relative stdlib_relative
+  local expected_uid expected_gid
+  declare -A bundle_seen_dirs=()
+  normal_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-normal.XXXXXX)"
+  snapshot_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  receipt_register_cleanup "$normal_raw"
+  receipt_register_cleanup "$snapshot_raw"
+  : > "$normal_raw"
+  : > "$snapshot_raw"
+  # Keep the Python closure bounded to the venv launcher/config, the selected
+  # runtime binary and libpython, and the standard library.  Other files under
+  # the managed prefix (pip, headers, terminfo, and symlink aliases) are not
+  # needed by the locked identity probe and are never staged.
+  expected_uid="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "${role_path[python313]}" 2>/dev/null || true)"
+  expected_gid="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "${role_path[python313]}" 2>/dev/null || true)"
+  runtime_relative="${python_runtime_root#"$source_root/"}"
+  [[ "$runtime_relative" != "$python_runtime_root" ]] || fail 'Python runtime closure root is not inside the managed prefix'
+  receipt_bundle_safe_relative_path "$runtime_relative" || fail 'Python runtime closure root is not safely relative to the managed prefix'
+  stdlib_relative="$runtime_relative/lib/python3.13"
+  receipt_bundle_safe_relative_path "$stdlib_relative" || fail 'Python standard library closure path is unsafe'
+  receipt_bundle_add_source_dir "$source_root" '.' "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" bin "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_file "$source_root" bin/python3.13 "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_file "$source_root" pyvenv.cfg "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid" pyvenv-home-sealed-runtime-v1
+  receipt_bundle_add_source_dir "$source_root" lib "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" lib/herdr-workstation "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" lib/herdr-workstation/python "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" "$runtime_relative" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" "$runtime_relative/bin" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_file "$source_root" "$runtime_relative/bin/python3.13" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" "$runtime_relative/lib" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_file "$source_root" "$runtime_relative/lib/libpython3.13.so.1.0" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  receipt_bundle_add_source_dir "$source_root" "$stdlib_relative" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+  while IFS= read -r -d '' full; do
+    relative="${full#"$source_root/"}"
+    receipt_bundle_safe_relative_path "$relative" || fail "Python standard library path is unsafe: $relative"
+    if [[ -L "$full" ]]; then
+      fail "Python runtime closure rejects a symlink: $full"
+    elif [[ -d "$full" ]]; then
+      receipt_bundle_add_source_dir "$source_root" "$relative" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+    elif [[ -f "$full" ]]; then
+      receipt_bundle_add_source_file "$source_root" "$relative" "$normal_raw" "$snapshot_raw" "$expected_uid" "$expected_gid"
+    else
+      fail "Python runtime closure contains an unsupported entry: $full"
+    fi
+  done < <("$receipt_find_bin" -P "$python_stdlib_root" -mindepth 1 -print0 | "$receipt_sort_bin" -z)
+  receipt_bundle_finalize_source_manifests "$normal" "$snapshot" "$normal_raw" "$snapshot_raw"
+}
+
+receipt_bundle_build_source_manifest() {
+  local role="$1"
+  local normal="$2"
+  local snapshot="$3"
+  local source_root="${role_bundle_source_root[$role]}"
+  [[ -d "$source_root" && ! -L "$source_root" ]] || fail "$role runtime bundle source root is not a real directory: $source_root"
+  reject_symlink_components "$source_root" || fail "$role runtime bundle source root contains a symlinked component: $source_root"
+  case "$role" in
+    pwsh) receipt_bundle_build_pwsh_source_manifest "$source_root" "$normal" "$snapshot" ;;
+    python313) receipt_bundle_build_python_source_manifest "$source_root" "$normal" "$snapshot" ;;
+    *) fail "unsupported directory-backed runtime role: $role" ;;
+  esac
+}
+
+receipt_bundle_copy_from_snapshot() {
+  local role="$1"
+  local source_root="${role_bundle_source_root[$role]}"
+  local stage_root="${role_bundle_stage_root[$role]}"
+  local snapshot="${role_bundle_snapshot_file[$role]}"
+  local kind relative mode owner group identity expected_hash transform source_full stage_full
+  local source_fd descriptor_path source_id live_id live_hash live_owner live_group live_mode stage_mode stage_hash
+  local stage_parent
+  stage_parent="${stage_root%/*}"
+  [[ "$stage_parent" != "$stage_root" ]] || stage_parent='/tmp'
+  /usr/bin/mkdir -p -- "$stage_root"
+  "$receipt_chmod_bin" 0700 -- "$stage_root"
+  while IFS=$'\t' read -r kind relative mode owner group identity source_hash transform; do
+    [[ "$kind" == "$receipt_bundle_snapshot_header" ]] && continue
+    receipt_bundle_safe_relative_path "$relative" || fail "$role runtime bundle snapshot path is unsafe: $relative"
+    if [[ "$relative" == '.' ]]; then
+      source_full="$source_root"
+      stage_full="$stage_root"
+    else
+      source_full="$source_root/$relative"
+      stage_full="$stage_root/$relative"
+    fi
+    if [[ "$kind" == D ]]; then
+      [[ -d "$source_full" && ! -L "$source_full" ]] || fail "$role runtime bundle source directory changed during staging: $source_full"
+      live_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$source_full" 2>/dev/null || true)"
+      live_owner="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$source_full" 2>/dev/null || true)"
+      live_group="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$source_full" 2>/dev/null || true)"
+      live_mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$source_full" 2>/dev/null || true)"
+      [[ "$live_id" == "$identity" && "$live_owner" == "$owner" && "$live_group" == "$group" && "$live_mode" == "$mode" ]] || {
+        fail "$role runtime bundle source directory changed during staging: $source_full"
+      }
+      if [[ -e "$stage_full" || -L "$stage_full" ]]; then
+        [[ -d "$stage_full" && ! -L "$stage_full" ]] || fail "$role runtime bundle stage path is not a directory: $stage_full"
+      else
+        /usr/bin/mkdir -p -- "$stage_full"
+      fi
+      "$receipt_chmod_bin" 0700 -- "$stage_full"
+      continue
+    fi
+    [[ "$kind" == F ]] || fail "$role runtime bundle snapshot has an unsupported entry type: $kind"
+    [[ -f "$source_full" && ! -L "$source_full" ]] || fail "$role runtime bundle source file changed during staging: $source_full"
+    [[ -d "${stage_full%/*}" && ! -L "${stage_full%/*}" ]] || fail "$role runtime bundle stage parent is unsafe: ${stage_full%/*}"
+    exec {source_fd}<"$source_full" || fail "could not open stable $role runtime bundle file: $source_full"
+    descriptor_path="/proc/self/fd/$source_fd"
+    source_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$descriptor_path" 2>/dev/null || true)"
+    [[ "$source_id" == "$identity" ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle source file changed while opening: $source_full"
+    }
+    expected_hash="$source_hash"
+    source_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$descriptor_path" | "$receipt_awk_bin" '{print $1}')"
+    [[ "$source_hash" == "$expected_hash" && "$source_hash" =~ ^[0-9a-f]{64}$ ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle source digest differs from its source manifest: $source_full"
+    }
+    if [[ "$transform" == pyvenv-home-sealed-runtime-v1 ]]; then
+      receipt_exec_system "$receipt_awk_bin" -v staged_home="$python_bundle_stage_runtime_root" '
+        BEGIN { home_count = 0 }
+        /^[[:space:]]*home[[:space:]]*=/ {
+          home_count++
+          print "home = " staged_home
+          next
+        }
+        { print }
+        END { exit(home_count == 1 ? 0 : 1) }
+      ' < "/proc/$BASHPID/fd/$source_fd" > "$stage_full" || {
+        eval "exec ${source_fd}<&-" 2>/dev/null || true
+        fail 'Python venv configuration could not be sealed to the staged runtime'
+      }
+    else
+      receipt_exec_system "$receipt_cp_bin" -- "$descriptor_path" "$stage_full" || {
+        eval "exec ${source_fd}<&-" 2>/dev/null || true
+        fail "$role runtime bundle file could not be copied from its stable descriptor: $source_full"
+      }
+    fi
+    live_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$source_full" 2>/dev/null || true)"
+    live_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$source_full" 2>/dev/null | "$receipt_awk_bin" '{print $1}' || true)"
+    live_owner="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$source_full" 2>/dev/null || true)"
+    live_group="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$source_full" 2>/dev/null || true)"
+    live_mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$source_full" 2>/dev/null || true)"
+    [[ "$live_id" == "$identity" && "$live_hash" == "$source_hash" && "$live_owner" == "$owner" && "$live_group" == "$group" && "$live_mode" == "$mode" ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle source file changed during staging: $source_full"
+    }
+    stage_mode="$(receipt_bundle_stage_mode "$mode" || true)"
+    [[ -n "$stage_mode" ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle source mode is not safe: $source_full"
+    }
+    "$receipt_chmod_bin" "$stage_mode" -- "$stage_full"
+    [[ -f "$stage_full" && ! -L "$stage_full" ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle staged file is not regular: $stage_full"
+    }
+    stage_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$stage_full" | "$receipt_awk_bin" '{print $1}')"
+    [[ "$stage_hash" =~ ^[0-9a-f]{64}$ ]] || {
+      eval "exec ${source_fd}<&-" 2>/dev/null || true
+      fail "$role runtime bundle staged digest is invalid: $stage_full"
+    }
+    role_bundle_stage_hash["$role|$relative"]="$stage_hash"
+    eval "exec ${source_fd}<&-" 2>/dev/null || true
+  done < "$snapshot"
+  if [[ -z "$fixture_root" && "$stage_parent" != "$receipt_exec_stage_dir" ]]; then
+    receipt_exec_system "$receipt_chown_bin" -R --no-dereference 0:0 -- "$stage_root"
+    receipt_exec_system "$receipt_chown_bin" 0:0 -- "$stage_parent"
+  fi
+  while IFS=$'\t' read -r kind relative mode owner group identity source_hash transform; do
+    [[ "$kind" == "$receipt_bundle_snapshot_header" ]] && continue
+    [[ "$kind" == D ]] || continue
+    if [[ "$relative" == '.' ]]; then stage_full="$stage_root"; else stage_full="$stage_root/$relative"; fi
+    stage_mode="$(receipt_bundle_stage_mode "$mode" || true)"
+    [[ -n "$stage_mode" ]] || fail "$role runtime bundle stage directory mode is invalid: $stage_full"
+    "$receipt_chmod_bin" "$stage_mode" -- "$stage_full"
+  done < "$snapshot"
+  if [[ "$stage_parent" != "$receipt_exec_stage_dir" ]]; then
+    "$receipt_chmod_bin" 0555 -- "$stage_parent"
+  fi
+}
+
+receipt_bundle_assert_stage() {
+  local role="$1"
+  local source_root="${role_bundle_source_root[$role]}"
+  local stage_root="${role_bundle_stage_root[$role]}"
+  local normal="${role_bundle_manifest_file[$role]}"
+  local expected actual full relative kind mode owner group stage_full stage_owner stage_mode stage_hash stage_parent
+  local expected_uid expected_gid
+  expected_uid="$(receipt_exec_system "$receipt_id_bin" -u)"
+  expected_gid="$(receipt_exec_system "$receipt_id_bin" -g)"
+  stage_parent="${stage_root%/*}"
+  if [[ "$stage_parent" != "$stage_root" && "$stage_parent" != "$receipt_exec_stage_dir" ]]; then
+    [[ -d "$stage_parent" && ! -L "$stage_parent" ]] || fail "$role runtime bundle stage parent is unsafe: $stage_parent"
+    [[ "$(receipt_exec_system "$receipt_stat_bin" -c '%u:%g:%a' -- "$stage_parent" 2>/dev/null || true)" == "$expected_uid:$expected_gid:555" ]] || {
+      fail "$role runtime bundle stage parent owner or mode changed: $stage_parent"
+    }
+  fi
+  expected="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-expected.XXXXXX)"
+  actual="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-actual.XXXXXX)"
+  receipt_register_cleanup "$expected"
+  receipt_register_cleanup "$actual"
+  "$receipt_awk_bin" -F $'\t' 'NR > 1 { print $1 "\t" $2 }' "$normal" > "$expected"
+  : > "$actual"
+  printf 'D\t.\n' >> "$actual"
+  while IFS= read -r -d '' full; do
+    relative="${full#"$stage_root/"}"
+    receipt_bundle_safe_relative_path "$relative" || fail "$role runtime bundle staged path is unsafe: $relative"
+    if [[ -L "$full" ]]; then
+      fail "$role runtime bundle staged closure contains a symlink: $full"
+    elif [[ -d "$full" ]]; then
+      kind=D
+    elif [[ -f "$full" ]]; then
+      kind=F
+    else
+      fail "$role runtime bundle staged closure contains an unsupported entry: $full"
+    fi
+    printf '%s\t%s\n' "$kind" "$relative" >> "$actual"
+  done < <("$receipt_find_bin" -P "$stage_root" -mindepth 1 -print0 | "$receipt_sort_bin" -z)
+  "$receipt_sort_bin" -t $'\t' -k2,2 -o "$expected" -- "$expected"
+  "$receipt_sort_bin" -t $'\t' -k2,2 -o "$actual" -- "$actual"
+  "$receipt_cmp_bin" -s -- "$expected" "$actual" || fail "$role runtime bundle staged closure has an extra or omitted entry"
+  stage_owner="${expected_uid}:${expected_gid}"
+  while IFS=$'\t' read -r kind relative mode owner group source_hash transform; do
+    [[ "$kind" == "$receipt_bundle_manifest_header" ]] && continue
+    if [[ "$relative" == '.' ]]; then stage_full="$stage_root"; else stage_full="$stage_root/$relative"; fi
+    stage_owner="$(receipt_exec_system "$receipt_stat_bin" -c '%u:%g' -- "$stage_full" 2>/dev/null || true)"
+    stage_mode="$(receipt_exec_system "$receipt_stat_bin" -c '%a' -- "$stage_full" 2>/dev/null || true)"
+    [[ "$stage_owner" == "$expected_uid:$expected_gid" ]] || fail "$role runtime bundle staged owner changed: $stage_full"
+    if [[ "$kind" == D ]]; then
+      [[ -d "$stage_full" && ! -L "$stage_full" ]] || fail "$role runtime bundle staged directory is unsafe: $stage_full"
+    else
+      [[ -f "$stage_full" && ! -L "$stage_full" ]] || fail "$role runtime bundle staged file is unsafe: $stage_full"
+      stage_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$stage_full" | "$receipt_awk_bin" '{print $1}')"
+      [[ "$stage_hash" == "${role_bundle_stage_hash[$role|$relative]:-}" ]] || fail "$role runtime bundle staged digest differs from its manifest: $stage_full"
+    fi
+    [[ "$stage_mode" == "$(receipt_bundle_stage_mode "$mode")" ]] || fail "$role runtime bundle staged mode differs from its manifest: $stage_full"
+  done < "$normal"
+}
+
+receipt_bundle_assert_source_snapshot() {
+  local role="$1"
+  local current_normal current_snapshot
+  current_normal="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-current-normal.XXXXXX)"
+  current_snapshot="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-current-snapshot.XXXXXX)"
+  receipt_register_cleanup "$current_normal"
+  receipt_register_cleanup "$current_snapshot"
+  receipt_bundle_build_source_manifest "$role" "$current_normal" "$current_snapshot"
+  "$receipt_cmp_bin" -s -- "$current_normal" "${role_bundle_manifest_file[$role]}" || fail "$role runtime bundle source manifest changed"
+  "$receipt_cmp_bin" -s -- "$current_snapshot" "${role_bundle_snapshot_file[$role]}" || fail "$role runtime bundle source identity changed during receipt authority execution"
+}
+
+receipt_stage_bundle() {
+  local role="$1"
+  local path="${role_path[$role]}"
+  local source_entry stable_entry source_hash source_identity stage_entry
+  local normal snapshot
+  case "$role" in
+    pwsh)
+      role_bundle_source_root["$role"]="${path%/*}"
+      source_entry="${path##*/}"
+      role_bundle_source_entry["$role"]="$source_entry"
+      role_bundle_execution_root["$role"]="sealed://pwsh"
+      role_bundle_stage_root["$role"]="$receipt_exec_stage_dir/$role"
+      stable_entry="$source_entry"
+      ;;
+    python313)
+      role_bundle_source_root["$role"]="$user_home/.local"
+      role_bundle_source_entry["$role"]='bin/python3.13'
+      role_bundle_execution_root["$role"]='sealed://python313/.local'
+      role_bundle_stage_root["$role"]="$receipt_exec_stage_dir/$role/.local"
+      stable_entry='bin/python3.13'
+      ;;
+    *) fail "unsupported directory-backed runtime role: $role" ;;
+  esac
+  role_bundle_kind["$role"]='sealed-directory-v1'
+  role_bundle_source_owner_uid["$role"]="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$path" 2>/dev/null || true)"
+  role_bundle_source_owner_gid["$role"]="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$path" 2>/dev/null || true)"
+  [[ "${role_bundle_source_owner_uid[$role]}" =~ ^[0-9]+$ && "${role_bundle_source_owner_gid[$role]}" =~ ^[0-9]+$ ]] || fail "$role runtime bundle executable owner is invalid"
+  normal="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-manifest.XXXXXX)"
+  snapshot="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  receipt_register_cleanup "$normal"
+  receipt_register_cleanup "$snapshot"
+  role_bundle_manifest_file["$role"]="$normal"
+  role_bundle_snapshot_file["$role"]="$snapshot"
+  receipt_bundle_build_source_manifest "$role" "$normal" "$snapshot"
+  role_bundle_manifest_sha256["$role"]="$(receipt_exec_system "$receipt_sha256_bin" -- "$normal" | "$receipt_awk_bin" '{print $1}')"
+  role_bundle_file_count["$role"]="$(receipt_exec_system "$receipt_awk_bin" -F $'\t' '$1 == "F" { count++ } END { print count + 0 }' "$normal")"
+  role_bundle_directory_count["$role"]="$(receipt_exec_system "$receipt_awk_bin" -F $'\t' '$1 == "D" { count++ } END { print count + 0 }' "$normal")"
+  [[ "${role_bundle_manifest_sha256[$role]}" =~ ^[0-9a-f]{64}$ ]] || fail "$role runtime bundle manifest digest is invalid"
+  if [[ "$role" == python313 ]]; then
+    python_bundle_source_prefix="${role_bundle_source_root[$role]}"
+    python_bundle_stage_runtime_root="${role_bundle_stage_root[$role]}/${python_runtime_root#"${role_bundle_source_root[$role]}/"}"
+  fi
+  receipt_bundle_copy_from_snapshot "$role"
+  receipt_bundle_assert_source_snapshot "$role"
+  receipt_bundle_assert_stage "$role"
+  source_identity="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
+  source_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$path" | "$receipt_awk_bin" '{print $1}')"
+  stage_entry="${role_bundle_stage_root[$role]}/$stable_entry"
+  role_source_identity["$role"]="$source_identity"
+  role_source_hash["$role"]="$source_hash"
+  role_execution_path["$role"]="${role_bundle_execution_root[$role]}/$stable_entry"
+  role_execution_command_path["$role"]="$stage_entry"
+  role_execution_fd["$role"]=''
+  role_execution_owner["$role"]="$(receipt_exec_system "$receipt_id_bin" -u):$(receipt_exec_system "$receipt_id_bin" -g)"
+  role_execution_hash["$role"]="${role_bundle_stage_hash[$role|$stable_entry]:-}"
+  [[ "${role_execution_hash[$role]}" =~ ^[0-9a-f]{64}$ ]] || fail "$role staged executable digest is invalid"
+  receipt_test_pause "after-$role-staging"
+}
+
+receipt_stage_single_file() {
   local role="$1"
   local path="${role_path[$role]}"
   local mode source_id live_id source_hash stage stage_fd stage_id stage_hash current_id current_hash owner_pid descriptor_path
@@ -928,10 +1405,21 @@ receipt_stage_executable() {
   receipt_test_pause "after-$role-staging"
 }
 
+receipt_stage_executable() {
+  case "$1" in
+    pwsh|python313) receipt_stage_bundle "$1" ;;
+    *) receipt_stage_single_file "$1" ;;
+  esac
+}
+
 receipt_assert_source_identity() {
   local role="$1"
   local path="${role_path[$role]}"
   local current_id current_hash
+  if [[ "${role_bundle_kind[$role]:-}" == sealed-directory-v1 ]]; then
+    receipt_bundle_assert_source_snapshot "$role"
+    receipt_bundle_assert_stage "$role"
+  fi
   current_id="$(receipt_exec_system "$receipt_stat_bin" -Lc '%d:%i' -- "$path" 2>/dev/null || true)"
   current_hash="$(receipt_exec_system "$receipt_sha256_bin" -- "$path" 2>/dev/null | "$receipt_awk_bin" '{print $1}' || true)"
   [[ "$current_id" == "${role_source_identity[$role]}" && "$current_hash" == "${role_source_hash[$role]}" ]] || {
@@ -991,6 +1479,10 @@ if [[ -z "$fixture_root" ]]; then
 fi
 for role in "${roles[@]}" python313; do
   receipt_stage_executable "$role"
+done
+receipt_exec_system "$receipt_chmod_bin" 0555 -- "$receipt_exec_stage_dir"
+for role in "${roles[@]}" python313; do
+  receipt_assert_source_identity "$role"
 done
 
 read_pyvenv_value() {
@@ -1081,15 +1573,29 @@ python_probe_executable="$(printf '%s' "$python_probe" | "$jq_bin" -r '.executab
 python_probe_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.prefix' 2>/dev/null || true)"
 python_probe_base_prefix="$(printf '%s' "$python_probe" | "$jq_bin" -r '.base_prefix' 2>/dev/null || true)"
 python_probe_stdlib="$(printf '%s' "$python_probe" | "$jq_bin" -r '.stdlib' 2>/dev/null || true)"
-[[ "$python_probe_executable" == "$(/usr/bin/realpath -e -- "${role_execution_command_path[python313]}" 2>/dev/null || true)" ]] || fail 'Python probe executable differs from the stable launcher'
-[[ "$python_probe_prefix" == "$user_home/.local" ]] || fail 'Python probe prefix differs from the managed user environment'
-[[ "$python_probe_base_prefix" == "$python_runtime_root" ]] || fail 'Python probe base_prefix differs from the locked managed runtime'
-[[ "$python_probe_stdlib" == "$python_stdlib_root" ]] || fail 'Python probe stdlib differs from the locked managed runtime'
+python_execution_prefix="${role_bundle_stage_root[python313]}"
+python_execution_runtime_root="$python_execution_prefix/${python_runtime_root#"${role_bundle_source_root[python313]}/"}"
+python_execution_stdlib_root="$python_execution_runtime_root/lib/python3.13"
+[[ "$python_probe_executable" == "$(/usr/bin/realpath -e -- "${role_execution_command_path[python313]}" 2>/dev/null || true)" ]] || fail 'Python probe executable differs from the sealed launcher'
+[[ "$python_probe_prefix" == "$python_execution_prefix" ]] || fail 'Python probe prefix differs from the sealed managed environment'
+[[ "$python_probe_base_prefix" == "$python_execution_runtime_root" ]] || fail 'Python probe base_prefix differs from the sealed managed runtime'
+[[ "$python_probe_stdlib" == "$python_execution_stdlib_root" ]] || fail 'Python probe stdlib differs from the sealed managed runtime'
+python_execution_runtime_label="${role_bundle_execution_root[python313]}/${python_runtime_root#"${role_bundle_source_root[python313]}/"}"
+python_execution_stdlib_label="$python_execution_runtime_label/lib/python3.13"
 python_json="$("$jq_bin" -n -cS \
   --arg executable "$python_path" \
   --arg sha256 "$($receipt_sha256_bin "$python_path" | /usr/bin/gawk '{print $1}')" \
   --arg execution_path "${role_execution_path[python313]}" \
   --arg execution_sha256 "${role_execution_hash[python313]}" \
+  --arg bundle_kind "${role_bundle_kind[python313]}" \
+  --arg bundle_source_root "${role_bundle_source_root[python313]}" \
+  --arg bundle_source_entry "${role_bundle_source_entry[python313]}" \
+  --arg bundle_execution_root "${role_bundle_execution_root[python313]}" \
+  --arg bundle_manifest_sha256 "${role_bundle_manifest_sha256[python313]}" \
+  --argjson bundle_file_count "${role_bundle_file_count[python313]}" \
+  --argjson bundle_directory_count "${role_bundle_directory_count[python313]}" \
+  --arg bundle_source_owner_uid "${role_bundle_source_owner_uid[python313]}" \
+  --arg bundle_source_owner_gid "${role_bundle_source_owner_gid[python313]}" \
   --arg version "$PYTHON_VERSION" \
   --arg implementation "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" \
   --argjson version_info "$(printf '%s' "$python_probe" | "$jq_bin" -c '.version_info')" \
@@ -1104,10 +1610,12 @@ python_json="$("$jq_bin" -n -cS \
   --arg stdlib_root "$python_stdlib_root" \
   --arg stdlib_manifest_sha256 "$stdlib_manifest_sha256" \
   --argjson stdlib_file_count "$stdlib_file_count" \
-  --arg prefix "$python_probe_prefix" \
-  --arg base_prefix "$python_probe_base_prefix" \
-  --arg stdlib "$python_probe_stdlib" \
-  '{executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, version:$version, version_info:$version_info, implementation:$implementation, venv:{path:$venv_path, sha256:$venv_sha256, home:$venv_home, include_system_site_packages:($venv_site == "true"), version:$venv_version}, runtime:{root:$runtime_root, manifest_sha256:$runtime_manifest_sha256, file_count:$runtime_file_count, stdlib_root:$stdlib_root, stdlib_manifest_sha256:$stdlib_manifest_sha256, stdlib_file_count:$stdlib_file_count, prefix:$prefix, base_prefix:$base_prefix, stdlib:$stdlib}}')" || fail 'Python identity probe was not valid JSON'
+  --arg prefix "$user_home/.local" \
+  --arg base_prefix "$python_runtime_root" \
+  --arg stdlib "$python_stdlib_root" \
+  --arg execution_runtime_root "$python_execution_runtime_label" \
+  --arg execution_stdlib_root "$python_execution_stdlib_label" \
+  '{executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, version:$version, version_info:$version_info, implementation:$implementation, venv:{path:$venv_path, sha256:$venv_sha256, home:$venv_home, include_system_site_packages:($venv_site == "true"), version:$venv_version}, runtime:{root:$runtime_root, manifest_sha256:$runtime_manifest_sha256, file_count:$runtime_file_count, stdlib_root:$stdlib_root, stdlib_manifest_sha256:$stdlib_manifest_sha256, stdlib_file_count:$stdlib_file_count, prefix:$prefix, base_prefix:$base_prefix, stdlib:$stdlib, execution_root:$execution_runtime_root, execution_stdlib_root:$execution_stdlib_root}, bundle:{kind:$bundle_kind, source_root:$bundle_source_root, source_entry:$bundle_source_entry, execution_root:$bundle_execution_root, manifest_sha256:$bundle_manifest_sha256, file_count:$bundle_file_count, directory_count:$bundle_directory_count, source_owner:{uid:$bundle_source_owner_uid, gid:$bundle_source_owner_gid}, stage_mode_policy:"write-bits-cleared"}}')" || fail 'Python identity probe was not valid JSON'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.version')" == "$PYTHON_VERSION" ]] || fail 'Python probe version mismatch'
 [[ "$(printf '%s' "$python_probe" | "$jq_bin" -r '.implementation')" == CPython ]] || fail 'Python implementation is not CPython'
 for role in "${roles[@]}" python313; do
@@ -1121,13 +1629,22 @@ for role in "${roles[@]}"; do
     --arg sha256 "$($receipt_sha256_bin "${role_path[$role]}" | /usr/bin/gawk '{print $1}')" \
     --arg execution_path "${role_execution_path[$role]}" \
     --arg execution_sha256 "${role_execution_hash[$role]}" \
+    --arg bundle_kind "${role_bundle_kind[$role]:-single-file-v1}" \
+    --arg bundle_source_root "${role_bundle_source_root[$role]:-}" \
+    --arg bundle_source_entry "${role_bundle_source_entry[$role]:-}" \
+    --arg bundle_execution_root "${role_bundle_execution_root[$role]:-}" \
+    --arg bundle_manifest_sha256 "${role_bundle_manifest_sha256[$role]:-}" \
+    --argjson bundle_file_count "${role_bundle_file_count[$role]:-0}" \
+    --argjson bundle_directory_count "${role_bundle_directory_count[$role]:-0}" \
+    --arg bundle_source_owner_uid "${role_bundle_source_owner_uid[$role]:-}" \
+    --arg bundle_source_owner_gid "${role_bundle_source_owner_gid[$role]:-}" \
     --arg registry_id "${role_registry[$role]}" \
     --arg source_commit_sha "$repo_commit" \
     --arg kind '#961-role-manifest-v1' \
     --arg version "${role_version[$role]}" \
     --arg version_output_sha256 "${role_version_hash[$role]}" \
     --arg implementation "${role_implementation[$role]}" \
-    '{($role): {executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation}}')"
+    '{($role): {executable:$executable, sha256:$sha256, execution_path:$execution_path, execution_sha256:$execution_sha256, registry_id:$registry_id, source_commit_sha:$source_commit_sha, source_attestation:{kind:$kind, canonical_path:$executable, file_sha256:$sha256}, version:$version, version_argv:["--version"], version_output_sha256:$version_output_sha256, implementation:$implementation, bundle:(if $bundle_kind == "sealed-directory-v1" then {kind:$bundle_kind, source_root:$bundle_source_root, source_entry:$bundle_source_entry, execution_root:$bundle_execution_root, manifest_sha256:$bundle_manifest_sha256, file_count:$bundle_file_count, directory_count:$bundle_directory_count, source_owner:{uid:$bundle_source_owner_uid, gid:$bundle_source_owner_gid}, stage_mode_policy:"write-bits-cleared"} else null end)}}')"
   printf '%s\n' "$role_json" >> "$role_fragments"
 done
 role_manifest_json="$("$jq_bin" -sc 'add' "$role_fragments" | "$jq_bin" -cS .)" || fail 'role manifest is not valid JSON'
@@ -1236,6 +1753,7 @@ validate_installed_authority() {
   validate_parent_chain "${receipt_path%/*}"
   validate_parent_chain "${authority_path%/*}"
   validate_json_field "$receipt_path" '.schema_version == 1 and .verification_status == "verified" and .clean == true and .python313_lock_verified == true and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.role_identities|type == "object") and ((.role_identities|keys) == ["bash","gh","git","node","pwsh","rtk"]) and (.rtk_release|type == "object")'
+  validate_json_field "$receipt_path" '.role_identities.pwsh.bundle.kind == "sealed-directory-v1" and (.role_identities.pwsh.bundle.manifest_sha256|test("^[0-9a-f]{64}$")) and (.python313.bundle.kind == "sealed-directory-v1") and (.python313.bundle.manifest_sha256|test("^[0-9a-f]{64}$")) and (.python313.bundle.file_count > 0)'
   validate_json_field "$authority_path" '.schema_version == 1 and .authority_id == "#961-installation-authority-v1" and .verification_status == "verified" and (.source_commit_sha|test("^[0-9a-f]{40}$")) and .platform == "Ubuntu" and .architecture == "x86_64" and (.rtk_release|type == "object")'
   local stored_receipt_path stored_receipt_sha stored_role_hash stored_source stored_payload stored_allowlist stored_python stored_roles stored_receipt_id
   stored_receipt_path="$("$jq_bin" -r '.receipt_path // empty' "$authority_path")"

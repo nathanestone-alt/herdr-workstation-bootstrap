@@ -285,7 +285,14 @@ fixture_tools_handoff_marker="$fixture_tools_root/receipt-handoff.complete"
 
 bootstrap_command_path() {
   case "$1" in
-    ps|pwsh|tailscale) printf '%s/bin/%s\n' "$fixture_tools_root" "$1" ;;
+    ps|tailscale) printf '%s/bin/%s\n' "$fixture_tools_root" "$1" ;;
+    pwsh)
+      if [[ "${bootstrap_root_mode:-0}" == 1 ]]; then
+        printf '%s\n' /opt/microsoft/powershell/7/pwsh
+      else
+        printf '%s\n' "$fixture_tools_root/opt/microsoft/powershell/7/pwsh"
+      fi
+      ;;
     *) echo "Unexpected production command lookup in tools fixture: $1" >&2; return 24 ;;
   esac
 }
@@ -375,30 +382,6 @@ if [[ "$root_tools_mode" == 1 ]]; then
   assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
     "receipt_path='$fixture_root/etc/stmodel/issue-961/receipt.json'" \
     'receipt path'
-  # Root mode drives the production receipt authority, so its PowerShell role
-  # resolves to the host binaries at /opt/microsoft/powershell/7/pwsh or
-  # /usr/bin/pwsh. The official PowerShell package ships an apphost that loads
-  # pwsh.dll from its own directory, so the authority's staged single-file
-  # execution object can never run it and the fixture would depend on whatever
-  # PowerShell the developer happens to have installed. Bind the role to the
-  # fixture's PowerShell instead; it is root-owned and 0755 under the sealed
-  # fixture root, so the authority's canonical, owner, mode, symlink, staging,
-  # and FD-anchoring checks all still run unchanged against it.
-  /usr/bin/sed -i \
-    -e "s#/opt/microsoft/powershell/7/pwsh#$fixture_root/bin/pwsh#g" \
-    -e "s#/usr/bin/pwsh#$fixture_root/bin/pwsh#g" \
-    "$source_fixture/scripts/ubuntu/receipt-authority.sh"
-  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
-    "role_path[pwsh]='$fixture_root/bin/pwsh'" \
-    'receipt authority PowerShell role path'
-  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
-    "\"\${role_path[pwsh]}\" == $fixture_root/bin/pwsh" \
-    'receipt authority PowerShell role allowlist'
-  if /usr/bin/grep -Eq -- '(/opt/microsoft/powershell/7/pwsh|/usr/bin/pwsh)' \
-    "$source_fixture/scripts/ubuntu/receipt-authority.sh"; then
-    echo 'Fixture rewrite left a host PowerShell path in the receipt authority.' >&2
-    exit 1
-  fi
 fi
 chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
 
@@ -465,13 +448,16 @@ make_version_tool "$fixture_root/bin/bash" 'GNU bash, version 5.2.15(1)-release 
 make_version_tool "$fixture_root/bin/git" 'git version 2.48.0'
 make_version_tool "$fixture_root/bin/gh" 'gh version 2.75.0'
 
-# Production probes the PowerShell role exactly twice: the receipt authority
-# runs '--version' through its staged execution object, and the toolchain
-# manifest runs the -NoProfile version expression. The fixture answers both
-# faithfully, records every invocation, and fails closed on any other argv so
-# that a future production probe change surfaces here instead of silently
-# writing an empty manifest value.
+# The tools phase probes PowerShell exactly twice: the receipt authority runs
+# '--version' through its staged execution object, and the toolchain manifest
+# runs the -NoProfile version expression. Non-root fixture mode answers both
+# through the package-shaped shim below; root mode uses the host package at
+# /opt/microsoft/powershell/7 and therefore exercises the production apphost.
+# The fixture shim records every invocation and fails closed on other argv so a
+# future production probe change surfaces here instead of writing an empty value.
 pwsh_invocation_log="$fixture_root/pwsh-invocations.log"
+fixture_pwsh_root="$fixture_root/opt/microsoft/powershell/7"
+mkdir -p -- "$fixture_pwsh_root"
 pwsh_version_probe='--version'
 pwsh_manifest_probe='-NoProfile -Command $PSVersionTable.PSVersion.ToString()'
 : > "$pwsh_invocation_log"
@@ -481,7 +467,7 @@ if [[ "$root_tools_mode" == 1 ]]; then
   # authority probe runs as root, so the log must belong to the runtime owner.
   /usr/bin/chown "$root_tools_uid:$root_tools_gid" "$pwsh_invocation_log"
 fi
-cat > "$fixture_root/bin/pwsh" <<EOF
+cat > "$fixture_pwsh_root/pwsh" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
 printf '%s\\n' "\$*" >> '$pwsh_invocation_log'
@@ -495,7 +481,11 @@ else
   exit 24
 fi
 EOF
-chmod 0755 "$fixture_root/bin/pwsh"
+chmod 0755 "$fixture_pwsh_root/pwsh"
+printf '%s\n' 'fixture PowerShell companion' > "$fixture_pwsh_root/pwsh.dll"
+printf '%s\n' '{}' > "$fixture_pwsh_root/pwsh.deps.json"
+printf '%s\n' '{}' > "$fixture_pwsh_root/pwsh.runtimeconfig.json"
+chmod 0644 "$fixture_pwsh_root/pwsh.dll" "$fixture_pwsh_root/pwsh.deps.json" "$fixture_pwsh_root/pwsh.runtimeconfig.json"
 cat > "$fixture_root/bin/tailscale" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
@@ -524,7 +514,7 @@ touch "$fixture_home/.local/state/herdr-workstation-bootstrap/base-complete"
 uv_dir="$fixture_home/.local/lib/herdr-workstation/uv/$UV_VERSION/$UV_PLATFORM"
 python_runtime_root="$fixture_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 python_stdlib_root="$python_runtime_root/lib/python3.13"
-mkdir -p -- "$uv_dir" "$python_runtime_root/bin" "$python_stdlib_root"
+mkdir -p -- "$uv_dir" "$python_runtime_root/bin" "$python_runtime_root/lib" "$python_stdlib_root"
 cat > "$uv_dir/uv" <<EOF
 #!/usr/bin/bash
 printf '%s\\n' 'uv $UV_VERSION ($UV_PLATFORM)'
@@ -538,6 +528,8 @@ fixture_user_home='$fixture_home'
 fixture_runtime_root='$python_runtime_root'
 fixture_python_version='$PYTHON_VERSION'
 self_path="\$(/usr/bin/realpath -e -- "\$0" 2>/dev/null || true)"
+fixture_prefix="\${self_path%/bin/python3.13}"
+fixture_runtime_root="\$fixture_prefix/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 if [[ "\$1" == '--version' ]]; then
   printf 'Python %s\\n' "\$fixture_python_version"
   exit 0
@@ -546,9 +538,9 @@ if [[ "\$1" == '-c' ]]; then
   code="\$2"
   if [[ "\$code" == *json.dumps* ]]; then
     IFS=. read -r major minor micro <<< "\$fixture_python_version"
-    printf '{"version":"%s","version_info":[%s,%s,%s,"final",0],"implementation":"CPython","executable":"%s","prefix":"%s/.local","base_prefix":"%s","stdlib":"%s/lib/python3.13"}\\n' \\
+    printf '{"version":"%s","version_info":[%s,%s,%s,"final",0],"implementation":"CPython","executable":"%s","prefix":"%s","base_prefix":"%s","stdlib":"%s/lib/python3.13"}\\n' \\
       "\$fixture_python_version" "\$major" "\$minor" "\$micro" "\$self_path" \\
-      "\$fixture_user_home" "\$fixture_runtime_root" "\$fixture_runtime_root"
+      "\$fixture_prefix" "\$fixture_runtime_root" "\$fixture_runtime_root"
   elif [[ "\$code" == *platform.machine* ]]; then
     printf '%s|x86_64|linux\\n' "\$fixture_python_version"
   else
@@ -557,6 +549,7 @@ if [[ "\$1" == '-c' ]]; then
 fi
 EOF
 chmod 0755 "$python_runtime_root/bin/python3.13"
+printf '%s\n' 'fixture libpython' > "$python_runtime_root/lib/libpython3.13.so.1.0"
 printf '%s\n' 'fixture stdlib' > "$python_stdlib_root/fixture.py"
 
 make_version_tool "$fixture_home/.cargo/bin/rustup" "rustup $RUSTUP_VERSION"
@@ -781,26 +774,41 @@ grep -Fqx "powershell=$POWERSHELL_VERSION" "$manifest" || {
   echo 'Receipt authority did not measure the fixture PowerShell version.' >&2
   exit 1
 }
-[[ "$(jq -r '.role_identities.pwsh.executable' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$fixture_root/bin/pwsh" ]] || {
-  echo 'Receipt authority bound the PowerShell role outside the fixture root.' >&2
-  exit 1
-}
-grep -Fqx -- "$pwsh_version_probe" "$pwsh_invocation_log" || {
-  cat "$pwsh_invocation_log" >&2
-  echo 'Receipt authority did not probe the fixture PowerShell with --version.' >&2
-  exit 1
-}
-grep -Fqx -- "$pwsh_manifest_probe" "$pwsh_invocation_log" || {
-  cat "$pwsh_invocation_log" >&2
-  echo 'Toolchain manifest did not probe the fixture PowerShell version expression.' >&2
-  exit 1
-}
-unexpected_pwsh_probe="$(grep -Fvx -e "$pwsh_version_probe" -e "$pwsh_manifest_probe" \
-  -- "$pwsh_invocation_log" | head -n 1 || true)"
-[[ -z "$unexpected_pwsh_probe" ]] || {
-  echo "Tools phase used an unrecorded PowerShell probe: $unexpected_pwsh_probe" >&2
-  exit 1
-}
+if [[ "$root_tools_mode" == 1 ]]; then
+  [[ "$(jq -r '.role_identities.pwsh.executable' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == /opt/microsoft/powershell/7/pwsh ]] || {
+    echo 'Root receipt authority did not bind the host PowerShell package.' >&2
+    exit 1
+  }
+  [[ "$(jq -r '.role_identities.pwsh.bundle.kind' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == sealed-directory-v1 ]] || {
+    echo 'Root receipt authority did not record a sealed PowerShell bundle.' >&2
+    exit 1
+  }
+  (( $(jq -r '.role_identities.pwsh.bundle.file_count' "$fixture_root/etc/stmodel/issue-961/receipt.json") > 1 )) || {
+    echo 'Root receipt authority staged only a single PowerShell file.' >&2
+    exit 1
+  }
+else
+  [[ "$(jq -r '.role_identities.pwsh.executable' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$fixture_pwsh_root/pwsh" ]] || {
+    echo 'Receipt authority bound the PowerShell role outside the fixture package root.' >&2
+    exit 1
+  }
+  grep -Fqx -- "$pwsh_version_probe" "$pwsh_invocation_log" || {
+    cat "$pwsh_invocation_log" >&2
+    echo 'Receipt authority did not probe the fixture PowerShell with --version.' >&2
+    exit 1
+  }
+  grep -Fqx -- "$pwsh_manifest_probe" "$pwsh_invocation_log" || {
+    cat "$pwsh_invocation_log" >&2
+    echo 'Toolchain manifest did not probe the fixture PowerShell version expression.' >&2
+    exit 1
+  }
+  unexpected_pwsh_probe="$(grep -Fvx -e "$pwsh_version_probe" -e "$pwsh_manifest_probe" \
+    -- "$pwsh_invocation_log" | head -n 1 || true)"
+  [[ -z "$unexpected_pwsh_probe" ]] || {
+    echo "Tools phase used an unrecorded PowerShell probe: $unexpected_pwsh_probe" >&2
+    exit 1
+  }
+fi
 
 good_rtk="$fixture_home/.cargo/bin/rtk-good"
 mv -- "$rtk_path" "$good_rtk"
