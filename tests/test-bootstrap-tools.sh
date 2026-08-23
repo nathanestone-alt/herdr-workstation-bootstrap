@@ -3,7 +3,7 @@ set -euo pipefail
 umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d)"
+test_root="$(/usr/bin/realpath -e -- "$(mktemp -d)")"
 trap 'rm -rf -- "$test_root"' EXIT
 
 # This fixture executes the real tools phase through the installed trusted
@@ -48,9 +48,12 @@ transport="$fixture_root/transport.git"
 mkdir -p -- "$fixture_root" "$fixture_home"
 if [[ "$root_tools_mode" == 1 ]]; then
   # The runtime child executes the launcher-staged entrypoint below this
-  # temporary root.  Keep the fixture isolated, but allow traversal of the
-  # temporary parent without exposing directory listings.
-  /usr/bin/chmod 0711 "$test_root" "$fixture_root"
+  # temporary root. Keep the temporary parent traversal-only, while making
+  # the fixture root satisfy the trusted launcher's canonical 0755 system
+  # prefix contract.
+  /usr/bin/chmod 0711 "$test_root"
+  /usr/bin/chmod 0755 "$fixture_root"
+  /usr/bin/chown "$(/usr/bin/id -u):$(/usr/bin/id -g)" "$fixture_root"
 else
   /usr/bin/chmod 0755 "$fixture_root"
 fi
@@ -366,6 +369,19 @@ source_commit="$(git -C "$source_fixture" rev-parse --verify HEAD^{commit})"
 if [[ "$root_tools_mode" == 1 ]]; then
   /usr/bin/chown "$root_tools_uid:$root_tools_gid" "$fixture_home"
 fi
+fixture_root_expected_uid="$(/usr/bin/id -u)"
+fixture_root_expected_gid="$(/usr/bin/id -g)"
+fixture_root_actual_uid="$(/usr/bin/stat -c '%u' -- "$fixture_root" 2>/dev/null || true)"
+fixture_root_actual_gid="$(/usr/bin/stat -c '%g' -- "$fixture_root" 2>/dev/null || true)"
+fixture_root_actual_mode="$(/usr/bin/stat -c '%a' -- "$fixture_root" 2>/dev/null || true)"
+fixture_root_actual_realpath="$(/usr/bin/realpath -e -- "$fixture_root" 2>/dev/null || true)"
+[[ "$fixture_root_actual_uid" == "$fixture_root_expected_uid" &&
+  "$fixture_root_actual_gid" == "$fixture_root_expected_gid" &&
+  "$fixture_root_actual_mode" == 755 &&
+  "$fixture_root_actual_realpath" == "$fixture_root" ]] || {
+  echo "Bootstrap tools fixture root contract failed: path=$fixture_root uid=$fixture_root_actual_uid gid=$fixture_root_actual_gid mode=$fixture_root_actual_mode realpath=$fixture_root_actual_realpath expected_uid=$fixture_root_expected_uid expected_gid=$fixture_root_expected_gid expected_mode=755 expected_realpath=$fixture_root" >&2
+  exit 1
+}
 fixture_runtime_args=()
 if [[ "$root_tools_mode" == 1 ]]; then
   fixture_runtime_args+=(--fixture-runtime-uid "$root_tools_uid" --fixture-runtime-gid "$root_tools_gid")
