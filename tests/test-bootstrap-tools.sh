@@ -21,8 +21,32 @@ fixture_root="$test_root/fixture"
 fixture_home="$fixture_root/home"
 transport="$fixture_root/transport.git"
 mkdir -p -- "$fixture_root" "$fixture_home"
+fixture_ambient_node_dir="$fixture_root/ambient-node"
+wrong_node_version='22.0.0'
+mkdir -p -- "$fixture_ambient_node_dir/bin"
+cat > "$fixture_ambient_node_dir/bin/node" <<EOF
+#!/usr/bin/bash
+set -euo pipefail
+if [[ "\${1:-}" == '--version' ]]; then
+  printf 'v%s\n' '$wrong_node_version'
+else
+  echo 'Ambient wrong-version Node shim was executed.' >&2
+  exit 24
+fi
+EOF
+chmod 0755 "$fixture_ambient_node_dir/bin/node"
 cp -a -- "$repo_root/." "$source_fixture/"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex" "$source_fixture/.git"
+/usr/bin/awk -v ambient_node_bin="$fixture_ambient_node_dir/bin" '
+  $0 ~ /^readonly bootstrap_trusted_path=/ {
+    printf "readonly bootstrap_trusted_path=\"%s:/usr/sbin:/usr/bin:/sbin:/bin\"\n", ambient_node_bin
+    found++
+    next
+  }
+  { print }
+  END { exit(found == 1 ? 0 : 1) }
+' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
+mv -T -- "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
 dispatch_sentinel='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
 dispatch_counts="$(/usr/bin/awk -v sentinel="$dispatch_sentinel" '
   index($0, "if [[ \"${BASH_SOURCE[0]}\"") == 1 {
@@ -242,6 +266,7 @@ cat > "$node_dir/bin/node" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
 fixture_node_dir='$node_dir'
+fixture_ambient_node_dir='$fixture_ambient_node_dir'
 fixture_npm_marker='$npm_invocation_marker'
 fixture_codex_marker='$codex_invocation_marker'
 case "\${1:-}" in
@@ -256,15 +281,31 @@ case "\${1:-}" in
     }
     case "\${2:-}" in
       install)
+        lifecycle_anchor_fd=''
+        if [[ "\$PATH" =~ ^/proc/self/fd/([0-9]+)/bin: ]]; then
+          lifecycle_anchor_fd="\${BASH_REMATCH[1]}"
+        fi
+        for lifecycle_fd_path in /proc/self/fd/*; do
+          lifecycle_fd="\${lifecycle_fd_path##*/}"
+          [[ "\$lifecycle_fd" =~ ^[0-9]+$ && "\$lifecycle_fd" -gt 2 ]] || continue
+          eval "exec \${lifecycle_fd}<&-" 2>/dev/null || true
+        done
+        if [[ -n "\$lifecycle_anchor_fd" ]]; then
+          exec {lifecycle_decoy_fd}<"\$fixture_ambient_node_dir"
+        fi
         lifecycle_node_path="\$(command -v node || true)"
-        lifecycle_node_real="\$(/usr/bin/realpath -e -- "\$lifecycle_node_path" 2>/dev/null || true)"
-        [[ "\$lifecycle_node_real" == "\$fixture_node_dir/bin/node" ]] || {
-          echo "Npm lifecycle resolved node to an unexpected path: \$lifecycle_node_real" >&2
+        [[ -n "\$lifecycle_node_path" ]] || {
+          echo 'Npm lifecycle could not resolve node.' >&2
           exit 24
         }
         lifecycle_node_version="\$(command "\$lifecycle_node_path" --version)"
         [[ "\$lifecycle_node_version" == "v$NODE_VERSION" ]] || {
           echo 'Npm lifecycle did not resolve the locked Node version.' >&2
+          exit 24
+        }
+        lifecycle_node_real="\$(/usr/bin/realpath -e -- "\$lifecycle_node_path" 2>/dev/null || true)"
+        [[ "\$lifecycle_node_real" == "\$fixture_node_dir/bin/node" ]] || {
+          echo "Npm lifecycle resolved node to an unexpected path: \$lifecycle_node_real" >&2
           exit 24
         }
         printf '%s\\n' 'pinned-node-executed-npm-install' > "\$fixture_npm_marker"

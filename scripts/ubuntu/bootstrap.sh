@@ -2004,6 +2004,10 @@ install_tools_transaction() {
   local profile_dir_anchor
   local node_fd
   local node_anchor
+  local node_lifecycle_dir
+  local node_lifecycle_fd
+  local node_lifecycle_node
+  local node_lifecycle_real
   local code_fd
   local manifest_tmp
   local ps_bin
@@ -2131,17 +2135,52 @@ install_tools_transaction() {
   for executable in node npm npx corepack; do
     executable_real="$(realpath -e -- "$node_anchor/bin/$executable" 2>/dev/null || true)"
     path_is_under "$executable_real" "$home_real" || { echo "Node executable escaped HOME: $executable" >&2; exit 24; }
+    if [[ "$executable" == node ]]; then
+      node_lifecycle_node="$executable_real"
+    fi
     fence_replace_link "$executable_real" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
+  [[ -x "$node_lifecycle_node" ]] || {
+    echo 'Pinned Node executable is missing from the managed Node directory.' >&2
+    exit 24
+  }
+  node_lifecycle_dir="$($bootstrap_mktemp_bin -d -- "$node_anchor/.herdr-node-lifecycle.XXXXXX")" || {
+    echo 'Could not create the Node lifecycle shim directory.' >&2
+    exit 24
+  }
+  node_lifecycle_dir="$(realpath -e -- "$node_lifecycle_dir" 2>/dev/null || true)"
+  path_is_under "$node_lifecycle_dir" "$home_real" || {
+    echo 'Node lifecycle shim directory escaped the managed HOME.' >&2
+    exit 24
+  }
+  bootstrap_register_cleanup "$node_lifecycle_dir"
+  fence_open_directory "$node_lifecycle_dir" node_lifecycle_fd
+  fence_require_directory "$node_lifecycle_dir" "$node_lifecycle_fd" 'Node lifecycle shim directory'
+  fence_replace_link "$node_lifecycle_node" "$node_lifecycle_dir/node" 'before-node-lifecycle-shim' "$node_lifecycle_fd"
+  [[ "$($bootstrap_find_bin "$node_lifecycle_dir" -mindepth 1 -maxdepth 1 -printf '%f\n')" == node ]] || {
+    echo 'Node lifecycle shim directory contains an unexpected entry.' >&2
+    exit 24
+  }
   # Keep the process PATH hermetic.  User-local tools are invoked below by
-  # their validated absolute paths; the npm lifecycle child gets only the
-  # validated pinned Node directory so the lifecycle node lookup cannot use ambient
-  # PATH state.
+  # their validated absolute paths; the npm lifecycle child gets only a
+  # dedicated shim directory containing the validated pinned Node executable
+  # so the lifecycle node lookup cannot use ambient PATH state.
   export PATH="$bootstrap_trusted_path"
   hash -r
   [[ "$("$node_anchor/bin/node" --version)" == "v$NODE_VERSION" ]] || { echo 'Node version does not match lock.' >&2; exit 24; }
 
-  PATH="$node_anchor/bin:$bootstrap_trusted_path" \
+  fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+  fence_require_directory "$node_lifecycle_dir" "$node_lifecycle_fd" 'Node lifecycle shim directory'
+  [[ "$($bootstrap_find_bin "$node_lifecycle_dir" -mindepth 1 -maxdepth 1 -printf '%f\n')" == node ]] || {
+    echo 'Node lifecycle shim directory changed unexpectedly.' >&2
+    exit 24
+  }
+  node_lifecycle_real="$(realpath -e -- "$node_lifecycle_dir/node" 2>/dev/null || true)"
+  [[ "$node_lifecycle_real" == "$node_lifecycle_node" && -x "$node_lifecycle_real" ]] || {
+    echo 'Node lifecycle shim does not resolve to the pinned Node executable.' >&2
+    exit 24
+  }
+  PATH="$node_lifecycle_dir:$bootstrap_trusted_path" \
     "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
@@ -2174,6 +2213,7 @@ install_tools_transaction() {
     close_fence_fd "$bin_fd"
     close_fence_fd "$profile_dir_fd"
     close_fence_fd "$node_fd"
+    close_fence_fd "$node_lifecycle_fd"
     close_fence_fd "$code_fd"
     return
   fi
@@ -2244,6 +2284,7 @@ install_tools_transaction() {
   close_fence_fd "$bin_fd"
   close_fence_fd "$profile_dir_fd"
   close_fence_fd "$node_fd"
+  close_fence_fd "$node_lifecycle_fd"
   close_fence_fd "$code_fd"
   echo "Tool installation complete. Resolved manifest: $manifest"
   echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile or .bash_login chain, makes them available in new Bash login shells."
