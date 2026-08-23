@@ -23,14 +23,17 @@ if [[ ! "$runtime_uid" =~ ^[1-9][0-9]*$ || ! "$runtime_gid" =~ ^[0-9]+$ ]]; then
 fi
 
 test_root="$(mktemp -d)"
-trap 'rm -rf -- "$test_root"' EXIT
+runtime_surface="$(mktemp -d)"
+trap 'rm -rf -- "$test_root" "$runtime_surface"' EXIT
 case_root="$test_root/case"
 source_root="$case_root/source"
 fixture_root="$case_root/fixture"
 fixture_home="$fixture_root/home"
 transport="$fixture_root/transport.git"
 mkdir -p "$source_root/scripts/ubuntu" "$source_root/config" "$fixture_home" "$case_root/bin"
+chmod 0711 "$test_root" "$case_root"
 chown "$runtime_uid:$runtime_gid" "$fixture_home"
+chown "$runtime_uid:$runtime_gid" "$runtime_surface"
 
 cp "$repo_root/scripts/ubuntu/bootstrap.sh" "$source_root/scripts/ubuntu/bootstrap.sh"
 cp "$repo_root/scripts/ubuntu/launcher-capability.sh" "$source_root/scripts/ubuntu/launcher-capability.sh"
@@ -41,17 +44,18 @@ cp "$repo_root/config/ubuntu-toolchain.lock" "$source_root/config/ubuntu-toolcha
 chmod 0755 "$source_root" "$source_root/scripts/ubuntu/"*.sh
 chmod 0644 "$source_root/config/ubuntu-toolchain.lock"
 
-cat > "$case_root/bin/sudo" <<EOF
+cat > "$case_root/bin/sudo" <<'EOF'
 #!/usr/bin/bash
 set -euo pipefail
-no_new_privs="\$(/usr/bin/awk '/^NoNewPrivs:/ { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }' /proc/self/status)"
-if [[ "\$no_new_privs" == 1 ]]; then
-  : > "$case_root/sudo-no-new-privs-failure"
+marker_root="${CASE_ROOT:?CASE_ROOT is required}"
+no_new_privs="$(/usr/bin/awk '/^NoNewPrivs:/ { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' /proc/self/status)"
+if [[ "$no_new_privs" == 1 ]]; then
+  : > "$marker_root/sudo-no-new-privs-failure"
   echo 'sudo: The "no new privileges" flag is set, which prevents sudo from running as root.' >&2
   exit 1
 fi
-: > "$case_root/sudo-invoked"
-exec "\$@"
+: > "$marker_root/sudo-invoked"
+exec "$@"
 EOF
 cat > "$case_root/bin/apt-get" <<EOF
 #!/usr/bin/bash
@@ -122,14 +126,15 @@ chmod 0700 "$transport"
 
 old_output="$case_root/old-setpriv-sudo.out"
 set +e
-/usr/bin/setpriv --reuid="$runtime_uid" --regid="$runtime_gid" --clear-groups --no-new-privs \
+/usr/bin/env CASE_ROOT="$runtime_surface" /usr/bin/setpriv \
+  --reuid="$runtime_uid" --regid="$runtime_gid" --clear-groups --no-new-privs \
   "$case_root/bin/sudo" /usr/bin/true > "$old_output" 2>&1
 old_status=$?
 set -e
 (( old_status != 0 )) || { cat "$old_output" >&2; echo 'setpriv/sudo failure probe unexpectedly passed.' >&2; exit 1; }
 grep -Fqx 'sudo: The "no new privileges" flag is set, which prevents sudo from running as root.' "$old_output" ||
   { cat "$old_output" >&2; echo 'setpriv/sudo failure probe did not reproduce the exact diagnostic.' >&2; exit 1; }
-rm -f "$case_root/sudo-no-new-privs-failure"
+rm -f "$runtime_surface/sudo-no-new-privs-failure"
 
 if [[ -x /usr/bin/sudo && "$(stat -c '%u:%a' /usr/bin/sudo 2>/dev/null || true)" == 0:4755 ]]; then
   actual_output="$case_root/actual-setpriv-sudo.out"
