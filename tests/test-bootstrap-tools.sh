@@ -375,6 +375,30 @@ if [[ "$root_tools_mode" == 1 ]]; then
   assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
     "receipt_path='$fixture_root/etc/stmodel/issue-961/receipt.json'" \
     'receipt path'
+  # Root mode drives the production receipt authority, so its PowerShell role
+  # resolves to the host binaries at /opt/microsoft/powershell/7/pwsh or
+  # /usr/bin/pwsh. The official PowerShell package ships an apphost that loads
+  # pwsh.dll from its own directory, so the authority's staged single-file
+  # execution object can never run it and the fixture would depend on whatever
+  # PowerShell the developer happens to have installed. Bind the role to the
+  # fixture's PowerShell instead; it is root-owned and 0755 under the sealed
+  # fixture root, so the authority's canonical, owner, mode, symlink, staging,
+  # and FD-anchoring checks all still run unchanged against it.
+  /usr/bin/sed -i \
+    -e "s#/opt/microsoft/powershell/7/pwsh#$fixture_root/bin/pwsh#g" \
+    -e "s#/usr/bin/pwsh#$fixture_root/bin/pwsh#g" \
+    "$source_fixture/scripts/ubuntu/receipt-authority.sh"
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
+    "role_path[pwsh]='$fixture_root/bin/pwsh'" \
+    'receipt authority PowerShell role path'
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
+    "\"\${role_path[pwsh]}\" == $fixture_root/bin/pwsh" \
+    'receipt authority PowerShell role allowlist'
+  if /usr/bin/grep -Eq -- '(/opt/microsoft/powershell/7/pwsh|/usr/bin/pwsh)' \
+    "$source_fixture/scripts/ubuntu/receipt-authority.sh"; then
+    echo 'Fixture rewrite left a host PowerShell path in the receipt authority.' >&2
+    exit 1
+  fi
 fi
 chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
 
@@ -440,7 +464,38 @@ chmod 0755 "$fixture_root/bin/ps"
 make_version_tool "$fixture_root/bin/bash" 'GNU bash, version 5.2.15(1)-release (x86_64-pc-linux-gnu)'
 make_version_tool "$fixture_root/bin/git" 'git version 2.48.0'
 make_version_tool "$fixture_root/bin/gh" 'gh version 2.75.0'
-make_version_tool "$fixture_root/bin/pwsh" "PowerShell $POWERSHELL_VERSION"
+
+# Production probes the PowerShell role exactly twice: the receipt authority
+# runs '--version' through its staged execution object, and the toolchain
+# manifest runs the -NoProfile version expression. The fixture answers both
+# faithfully, records every invocation, and fails closed on any other argv so
+# that a future production probe change surfaces here instead of silently
+# writing an empty manifest value.
+pwsh_invocation_log="$fixture_root/pwsh-invocations.log"
+pwsh_version_probe='--version'
+pwsh_manifest_probe='-NoProfile -Command $PSVersionTable.PSVersion.ToString()'
+: > "$pwsh_invocation_log"
+chmod 0644 "$pwsh_invocation_log"
+if [[ "$root_tools_mode" == 1 ]]; then
+  # The manifest probe runs inside the non-root runtime child while the receipt
+  # authority probe runs as root, so the log must belong to the runtime owner.
+  /usr/bin/chown "$root_tools_uid:$root_tools_gid" "$pwsh_invocation_log"
+fi
+cat > "$fixture_root/bin/pwsh" <<EOF
+#!/usr/bin/bash
+set -euo pipefail
+printf '%s\\n' "\$*" >> '$pwsh_invocation_log'
+if [[ "\$#" == 1 && "\${1:-}" == '--version' ]]; then
+  printf '%s\\n' 'PowerShell $POWERSHELL_VERSION'
+elif [[ "\$#" == 3 && "\${1:-}" == '-NoProfile' && "\${2:-}" == '-Command' &&
+  "\${3:-}" == '\$PSVersionTable.PSVersion.ToString()' ]]; then
+  printf '%s\\n' '$POWERSHELL_VERSION'
+else
+  printf 'Unexpected PowerShell probe in tools fixture: %s\\n' "\$*" >&2
+  exit 24
+fi
+EOF
+chmod 0755 "$fixture_root/bin/pwsh"
 cat > "$fixture_root/bin/tailscale" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
@@ -713,6 +768,39 @@ grep -Fqx 'pinned-node-lifecycle-node' "$npm_invocation_marker"
 grep -Fqx 'pinned-node-executed-npm-version' "$npm_invocation_marker"
 grep -Fqx "codex=codex-cli $CODEX_VERSION" "$manifest"
 grep -Fqx 'pinned-node-executed-codex-version' "$codex_invocation_marker"
+
+# Both PowerShell probes must have reached the fixture binary, and nothing else
+# may have. The receipt authority records the '--version' output it measured
+# through its staged execution object; the manifest records the -NoProfile
+# expression result.
+grep -Fqx "powershell=$POWERSHELL_VERSION" "$manifest" || {
+  echo 'Tools manifest did not record the fixture PowerShell version.' >&2
+  exit 1
+}
+[[ "$(jq -r '.role_identities.pwsh.version' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "PowerShell $POWERSHELL_VERSION" ]] || {
+  echo 'Receipt authority did not measure the fixture PowerShell version.' >&2
+  exit 1
+}
+[[ "$(jq -r '.role_identities.pwsh.executable' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$fixture_root/bin/pwsh" ]] || {
+  echo 'Receipt authority bound the PowerShell role outside the fixture root.' >&2
+  exit 1
+}
+grep -Fqx -- "$pwsh_version_probe" "$pwsh_invocation_log" || {
+  cat "$pwsh_invocation_log" >&2
+  echo 'Receipt authority did not probe the fixture PowerShell with --version.' >&2
+  exit 1
+}
+grep -Fqx -- "$pwsh_manifest_probe" "$pwsh_invocation_log" || {
+  cat "$pwsh_invocation_log" >&2
+  echo 'Toolchain manifest did not probe the fixture PowerShell version expression.' >&2
+  exit 1
+}
+unexpected_pwsh_probe="$(grep -Fvx -e "$pwsh_version_probe" -e "$pwsh_manifest_probe" \
+  -- "$pwsh_invocation_log" | head -n 1 || true)"
+[[ -z "$unexpected_pwsh_probe" ]] || {
+  echo "Tools phase used an unrecorded PowerShell probe: $unexpected_pwsh_probe" >&2
+  exit 1
+}
 
 good_rtk="$fixture_home/.cargo/bin/rtk-good"
 mv -- "$rtk_path" "$good_rtk"
