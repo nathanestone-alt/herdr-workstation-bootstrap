@@ -838,7 +838,7 @@ install_receipt_from_snapshots() {
       [[ "$root" == /* && -d "$root" && ! -L "$root" && "$manifest" == "$root/.payload-manifest" ]] || return 1
       [[ "$(/usr/bin/stat -c '%u' -- "$root")" == 0 && "$(/usr/bin/stat -c '%a' -- "$root")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$root") & 022)) == 0 ]] || return 1
       [[ "$(/usr/bin/stat -c '%u' -- "$manifest")" == 0 && "$(/usr/bin/stat -c '%a' -- "$manifest")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$manifest") & 022)) == 0 ]] || return 1
-      [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$(/usr/bin/sha256sum -- "$manifest" | /usr/bin/gawk '{print $1}')" == "$expected_hash" ]] || return 1
+      [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$(/usr/bin/sha256sum -- "$manifest" | /usr/bin/gawk "{print \$1}")" == "$expected_hash" ]] || return 1
       source_commit="$(/usr/bin/gawk -F= "{ if (\$1 == \"commit\") { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }" "$root/source/.source-attestation" 2>/dev/null || true)"
       [[ "$source_commit" == "$expected_commit" ]] || return 1
       declare -A payload_mode=() payload_sha=() payload_dirs=()

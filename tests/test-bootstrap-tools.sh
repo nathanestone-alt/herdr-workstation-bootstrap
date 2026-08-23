@@ -16,6 +16,19 @@ official_rtk_version="$RTK_VERSION"
 official_rtk_url="$RTK_URL"
 official_rtk_sha256="$RTK_SHA256"
 
+root_tools_mode=0
+root_tools_uid=''
+root_tools_gid=''
+if [[ "$(/usr/bin/id -u)" == 0 ]]; then
+  root_tools_uid="$(/usr/bin/id -u nobody 2>/dev/null || true)"
+  root_tools_gid="$(/usr/bin/id -g nobody 2>/dev/null || true)"
+  if [[ "$root_tools_uid" =~ ^[1-9][0-9]*$ && "$root_tools_gid" =~ ^[0-9]+$ ]]; then
+    root_tools_mode=1
+  else
+    echo 'SKIP: root trusted-launcher tools handoff fixture (nobody account unavailable).' >&2
+  fi
+fi
+
 source_fixture="$test_root/source"
 fixture_root="$test_root/fixture"
 fixture_home="$fixture_root/home"
@@ -66,6 +79,13 @@ read -r dispatch_candidate_count dispatch_sentinel_count <<< "$dispatch_counts"
   END { exit(found == 1 ? 0 : 1) }
 ' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
 mv -T -- "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
+if [[ "$root_tools_mode" == 1 ]]; then
+  /usr/bin/sed -i \
+    -e "s|/etc/herdr-workstation/bootstrap-policy.conf|$fixture_root/etc/herdr-workstation/bootstrap-policy.conf|g" \
+    -e "s|for policy_component in /etc /etc/herdr-workstation; do|for policy_component in \"$fixture_root/etc\" \"$fixture_root/etc/herdr-workstation\"; do|g" \
+    -e "s|/usr/local/libexec/herdr-workstation-bootstrap|$fixture_root/usr/local/libexec/herdr-workstation-bootstrap|g" \
+    "$source_fixture/scripts/ubuntu/bootstrap.sh"
+fi
 cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
 fixture_tools_root="${HOME%/home}"
 fixture_tools_home="$HOME"
@@ -102,31 +122,33 @@ download_verified() {
   esac
 }
 
-install_receipt_from_snapshots() {
-  local handoff_home="$HOME"
-  local handoff_uid handoff_gid
-  # Root keeps the tools in the fixture HOME, then hands that same tree to a
-  # non-root fixture owner. This exercises the production authority's
-  # non-root managed-home contract without changing a live account.
-  if [[ "$(/usr/bin/id -u)" == 0 ]]; then
-    handoff_uid="$(/usr/bin/id -u nobody 2>/dev/null || true)"
-    handoff_gid="$(/usr/bin/id -g nobody 2>/dev/null || true)"
-    [[ "$handoff_uid" =~ ^[0-9]+$ && "$handoff_uid" != 0 && "$handoff_gid" =~ ^[0-9]+$ ]] || {
-      echo 'Tools fixture requires a non-root nobody account for the receipt handoff.' >&2
-      return 24
-    }
-    /usr/bin/chown -R --no-dereference "$handoff_uid:$handoff_gid" "$handoff_home"
-  fi
-  /usr/bin/mkdir -p -- "$fixture_tools_receipt_dir"
-  /usr/bin/env -i HOME="$HOME" PATH=/usr/sbin:/usr/bin:/sbin:/bin BASH_ENV= ENV= \
-    "$fixture_tools_launcher" --entrypoint receipt-authority -- --install \
-    --source-root "$bootstrap_repo_root" \
-    --user-home "$handoff_home" \
-    --authority-path "$fixture_tools_authority" \
-    --receipt-path "$fixture_tools_receipt" \
-    --fixture-root "$fixture_tools_root"
-  printf '%s\n' "$handoff_home" > "$fixture_tools_handoff_marker"
-}
+if [[ "$bootstrap_root_mode" != 1 ]]; then
+  install_receipt_from_snapshots() {
+    local handoff_home="$HOME"
+    local handoff_uid handoff_gid
+    # Root keeps the tools in the fixture HOME, then hands that same tree to a
+    # non-root fixture owner. This exercises the production authority's
+    # non-root managed-home contract without changing a live account.
+    if [[ "$(/usr/bin/id -u)" == 0 ]]; then
+      handoff_uid="$(/usr/bin/id -u nobody 2>/dev/null || true)"
+      handoff_gid="$(/usr/bin/id -g nobody 2>/dev/null || true)"
+      [[ "$handoff_uid" =~ ^[0-9]+$ && "$handoff_uid" != 0 && "$handoff_gid" =~ ^[0-9]+$ ]] || {
+        echo 'Tools fixture requires a non-root nobody account for the receipt handoff.' >&2
+        return 24
+      }
+      /usr/bin/chown -R --no-dereference "$handoff_uid:$handoff_gid" "$handoff_home"
+    fi
+    /usr/bin/mkdir -p -- "$fixture_tools_receipt_dir"
+    /usr/bin/env -i HOME="$HOME" PATH=/usr/sbin:/usr/bin:/sbin:/bin BASH_ENV= ENV= \
+      "$fixture_tools_launcher" --entrypoint receipt-authority -- --install \
+      --source-root "$bootstrap_repo_root" \
+      --user-home "$handoff_home" \
+      --authority-path "$fixture_tools_authority" \
+      --receipt-path "$fixture_tools_receipt" \
+      --fixture-root "$fixture_tools_root"
+    printf '%s\n' "$handoff_home" > "$fixture_tools_handoff_marker"
+  }
+fi
 
 fixture_tools_main() {
   local fixture_rtk_sha256
@@ -140,14 +162,25 @@ fixture_tools_main() {
   export RTK_SHA256
   case "$phase" in
     tools) install_tools ;;
+    tools-prepare) bootstrap_tools_prepare_only=1; install_tools_transaction ;;
+    tools-finalize) install_tools_finalize ;;
     *) echo "Unsupported tools fixture phase: $phase" >&2; return 2 ;;
   esac
+  if [[ "$phase" == tools ]]; then
+    printf '%s\n' "$fixture_tools_home" > "$fixture_tools_handoff_marker"
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   fixture_tools_main
 fi
 EOF
+if [[ "$root_tools_mode" == 1 ]]; then
+  /usr/bin/sed -i \
+    -e "s|authority_path='/etc/stmodel/issue-961/receipt-authority.json'|authority_path='$fixture_root/etc/stmodel/issue-961/receipt-authority.json'|" \
+    -e "s|receipt_path='/etc/stmodel/issue-961/receipt.json'|receipt_path='$fixture_root/etc/stmodel/issue-961/receipt.json'|" \
+    "$source_fixture/scripts/ubuntu/receipt-authority.sh"
+fi
 chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
 
 git -C "$source_fixture" init -q
@@ -159,12 +192,20 @@ git clone -q --bare "$source_fixture" "$transport"
 chmod 0700 "$transport"
 source_commit="$(git -C "$source_fixture" rev-parse --verify HEAD^{commit})"
 
+if [[ "$root_tools_mode" == 1 ]]; then
+  /usr/bin/chown "$root_tools_uid:$root_tools_gid" "$fixture_home"
+fi
+fixture_runtime_args=()
+if [[ "$root_tools_mode" == 1 ]]; then
+  fixture_runtime_args+=(--fixture-runtime-uid "$root_tools_uid" --fixture-runtime-gid "$root_tools_gid")
+fi
 /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" \
   --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
   --commit "$source_commit" \
   --fixture-root "$fixture_root" \
   --fixture-transport "$transport" \
   --fixture-home "$fixture_home" \
+  "${fixture_runtime_args[@]}" \
   > "$test_root/launcher-install.out"
 launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
 
@@ -383,7 +424,15 @@ printf '%s\\n' 'rtk $official_rtk_version'
 EOF
 chmod 0755 "$test_root/rtk-root/rtk"
 tar -C "$test_root/rtk-root" -czf "$fixture_root/rtk-official-fixture.tar.gz" rtk
-chmod 0600 "$fixture_root/rtk-official-fixture.tar.gz"
+if [[ "$root_tools_mode" == 1 ]]; then
+  /usr/bin/chmod 0644 "$fixture_root/rtk-official-fixture.tar.gz"
+  /usr/bin/chown -R --no-dereference "$root_tools_uid:$root_tools_gid" "$fixture_home"
+  /usr/bin/mkdir -p -- "$fixture_root/etc/stmodel/issue-961"
+  /usr/bin/chmod 0755 "$fixture_root/etc/stmodel" "$fixture_root/etc/stmodel/issue-961"
+  /usr/bin/chown 0:0 "$fixture_root/etc/stmodel" "$fixture_root/etc/stmodel/issue-961"
+else
+  /usr/bin/chmod 0600 "$fixture_root/rtk-official-fixture.tar.gz"
+fi
 
 mkdir -p -- "$test_root/no-node-path"
 set +e
