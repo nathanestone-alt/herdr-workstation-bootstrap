@@ -2005,6 +2005,7 @@ install_tools_transaction() {
   local node_fd
   local node_anchor
   local node_lifecycle_dir
+  local node_lifecycle_tmp
   local node_lifecycle_fd
   local node_lifecycle_node
   local node_lifecycle_real
@@ -2144,16 +2145,17 @@ install_tools_transaction() {
     echo 'Pinned Node executable is missing from the managed Node directory.' >&2
     exit 24
   }
-  node_lifecycle_dir="$($bootstrap_mktemp_bin -d -- "$node_anchor/.herdr-node-lifecycle.XXXXXX")" || {
+  node_lifecycle_tmp="$($bootstrap_mktemp_bin -d -- "$node_anchor/.herdr-node-lifecycle.XXXXXX")" || {
     echo 'Could not create the Node lifecycle shim directory.' >&2
     exit 24
   }
-  node_lifecycle_dir="$(realpath -e -- "$node_lifecycle_dir" 2>/dev/null || true)"
-  path_is_under "$node_lifecycle_dir" "$home_real" || {
+  node_lifecycle_dir="$node_dir/${node_lifecycle_tmp##*/}"
+  bootstrap_register_cleanup "$node_lifecycle_dir"
+  node_lifecycle_real="$(realpath -e -- "$node_lifecycle_dir" 2>/dev/null || true)"
+  path_is_under "$node_lifecycle_real" "$home_real" || {
     echo 'Node lifecycle shim directory escaped the managed HOME.' >&2
     exit 24
   }
-  bootstrap_register_cleanup "$node_lifecycle_dir"
   fence_open_directory "$node_lifecycle_dir" node_lifecycle_fd
   fence_require_directory "$node_lifecycle_dir" "$node_lifecycle_fd" 'Node lifecycle shim directory'
   fence_replace_link "$node_lifecycle_node" "$node_lifecycle_dir/node" 'before-node-lifecycle-shim' "$node_lifecycle_fd"

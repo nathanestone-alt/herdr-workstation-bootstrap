@@ -291,8 +291,20 @@ case "\${1:-}" in
           eval "exec \${lifecycle_fd}<&-" 2>/dev/null || true
         done
         if [[ -n "\$lifecycle_anchor_fd" ]]; then
-          exec {lifecycle_decoy_fd}<"\$fixture_ambient_node_dir"
+          eval "exec \${lifecycle_anchor_fd}<\"\$fixture_ambient_node_dir\""
         fi
+        lifecycle_path0="\${PATH%%:*}"
+        [[ "\$lifecycle_path0" == "\$fixture_node_dir"/.herdr-node-lifecycle.* &&
+          "\$lifecycle_path0" != "\$fixture_node_dir/bin" &&
+          -d "\$lifecycle_path0" ]] || {
+          echo "Npm lifecycle PATH[0] is not the dedicated Node shim: \$lifecycle_path0" >&2
+          exit 24
+        }
+        lifecycle_entries="\$(find "\$lifecycle_path0" -mindepth 1 -maxdepth 1 -printf '%f\\n')"
+        [[ "\$lifecycle_entries" == node ]] || {
+          echo "Npm lifecycle Node shim contains unexpected entries: \$lifecycle_entries" >&2
+          exit 24
+        }
         lifecycle_node_path="\$(command -v node || true)"
         [[ -n "\$lifecycle_node_path" ]] || {
           echo 'Npm lifecycle could not resolve node.' >&2
@@ -395,6 +407,11 @@ if ! run_tools > "$test_root/tools.out" 2>&1; then
   cat "$test_root/tools.out" >&2
   exit 1
 fi
+lifecycle_shim_residue="$(find "$fixture_home" -type d -name '.herdr-node-lifecycle.*' -print -quit)"
+[[ -z "$lifecycle_shim_residue" ]] || {
+  echo "Tools phase left Node lifecycle shim residue: $lifecycle_shim_residue" >&2
+  exit 1
+}
 [[ -f "$fixture_home/.local/state/herdr-workstation-bootstrap/tools-complete" ]] || {
   cat "$test_root/tools.out" >&2
   echo 'Tools phase did not publish its completion marker.' >&2
