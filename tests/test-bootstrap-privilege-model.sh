@@ -109,6 +109,7 @@ fixture_base_user() {
 fixture_runtime_child() {
   local runtime_child_phase="\$1"
   printf '%s\n' "\$(/usr/bin/id -u)" > "\$HOME/\$runtime_child_phase-uid"
+  printf '%s\n' "\$HOME" > "\$HOME/\$runtime_child_phase-home"
   /usr/bin/awk '/^NoNewPrivs:/ { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }' \
     /proc/self/status > "\$HOME/\$runtime_child_phase-no-new-privs"
 }
@@ -216,6 +217,11 @@ for runtime_child_phase in runtime-child-1 runtime-child-2 runtime-child-3; do
   [[ "$(< "$fixture_home/$runtime_child_phase-uid")" == "$runtime_uid" ]] || {
     cat "$runtime_output" >&2
     echo "Runtime child '$runtime_child_phase' did not run as the selected runtime user." >&2
+    exit 1
+  }
+  [[ "$(< "$fixture_home/$runtime_child_phase-home")" == "$fixture_home" ]] || {
+    cat "$runtime_output" >&2
+    echo "Runtime child '$runtime_child_phase' did not retain the selected runtime HOME." >&2
     exit 1
   }
   [[ "$(< "$fixture_home/$runtime_child_phase-no-new-privs")" == 1 ]] || {

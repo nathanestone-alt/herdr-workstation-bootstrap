@@ -269,8 +269,10 @@ bootstrap_run_as_runtime_phase() {
       esac
       exec 13<&- 14<&- 15<&-
       shift
-      exec "$@"
-    ' _ "$runtime_capability_fd" "$bootstrap_script_path" --phase "$runtime_phase"
+      trusted_bash="$1"
+      shift
+      exec "$trusted_bash" "$@"
+    ' _ "$runtime_capability_fd" "$bootstrap_bash_bin" "$bootstrap_script_path" --phase "$runtime_phase"
 }
 
 bootstrap_prepare_runtime_directories() {
