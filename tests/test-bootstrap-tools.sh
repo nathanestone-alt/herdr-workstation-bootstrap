@@ -256,7 +256,19 @@ case "\${1:-}" in
     }
     case "\${2:-}" in
       install)
+        lifecycle_node_path="\$(command -v node || true)"
+        lifecycle_node_real="\$(/usr/bin/realpath -e -- "\$lifecycle_node_path" 2>/dev/null || true)"
+        [[ "\$lifecycle_node_real" == "\$fixture_node_dir/bin/node" ]] || {
+          echo "Npm lifecycle resolved node to an unexpected path: \$lifecycle_node_real" >&2
+          exit 24
+        }
+        lifecycle_node_version="\$(command "\$lifecycle_node_path" --version)"
+        [[ "\$lifecycle_node_version" == "v$NODE_VERSION" ]] || {
+          echo 'Npm lifecycle did not resolve the locked Node version.' >&2
+          exit 24
+        }
         printf '%s\\n' 'pinned-node-executed-npm-install' > "\$fixture_npm_marker"
+        printf '%s\\n' 'pinned-node-lifecycle-node' >> "\$fixture_npm_marker"
         ;;
       --version)
         printf '%s\\n' 'pinned-node-executed-npm-version' >> "\$fixture_npm_marker"
@@ -379,6 +391,7 @@ grep -Fqx 'apt:fixture=tools-phase' "$manifest"
 [[ "$(jq -r '.rtk_release.sha256' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$official_rtk_sha256" ]]
 [[ "$(jq -r '.role_identities.rtk.version' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "rtk $official_rtk_version" ]]
 grep -Fqx 'pinned-node-executed-npm-install' "$npm_invocation_marker"
+grep -Fqx 'pinned-node-lifecycle-node' "$npm_invocation_marker"
 grep -Fqx 'pinned-node-executed-npm-version' "$npm_invocation_marker"
 grep -Fqx "codex=codex-cli $CODEX_VERSION" "$manifest"
 grep -Fqx 'pinned-node-executed-codex-version' "$codex_invocation_marker"

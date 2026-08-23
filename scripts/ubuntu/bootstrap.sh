@@ -2134,13 +2134,15 @@ install_tools_transaction() {
     fence_replace_link "$executable_real" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
   # Keep the process PATH hermetic.  User-local tools are invoked below by
-  # their validated absolute paths; no user-writable directory is prepended
-  # globally.
+  # their validated absolute paths; the npm lifecycle child gets only the
+  # validated pinned Node directory so the lifecycle node lookup cannot use ambient
+  # PATH state.
   export PATH="$bootstrap_trusted_path"
   hash -r
   [[ "$("$node_anchor/bin/node" --version)" == "v$NODE_VERSION" ]] || { echo 'Node version does not match lock.' >&2; exit 24; }
 
-  "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
+  PATH="$node_anchor/bin:$bootstrap_trusted_path" \
+    "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
     "bun@$BUN_VERSION"
