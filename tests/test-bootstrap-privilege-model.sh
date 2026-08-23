@@ -29,8 +29,9 @@ case_root="$test_root/case"
 source_root="$case_root/source"
 fixture_root="$case_root/fixture"
 fixture_home="$fixture_root/home"
+root_home="$case_root/root-home"
 transport="$fixture_root/transport.git"
-mkdir -p "$source_root/scripts/ubuntu" "$source_root/config" "$fixture_home" "$case_root/bin"
+mkdir -p "$source_root/scripts/ubuntu" "$source_root/config" "$fixture_home" "$root_home" "$case_root/bin"
 chmod 0711 "$test_root" "$case_root"
 chown "$runtime_uid:$runtime_gid" "$fixture_home"
 chown "$runtime_uid:$runtime_gid" "$runtime_surface"
@@ -68,6 +69,12 @@ printf '%s\n' systemd
 EOF
 cat > "$case_root/bin/pwsh" <<EOF
 #!/usr/bin/bash
+set -euo pipefail
+/usr/bin/mkdir -p "\$HOME/.cache/powershell" "\$HOME/.local/share/powershell"
+: > "\$HOME/.cache/powershell/telemetry.uuid"
+: > "\$HOME/.cache/powershell/StartupProfileData-NonInteractive"
+: > "\$HOME/.local/share/powershell/state"
+printf '%s\n' "\$HOME" > "$case_root/pwsh-home"
 printf '%s\n' '$powershell_version'
 EOF
 cat > "$case_root/bin/systemctl" <<EOF
@@ -97,9 +104,27 @@ bootstrap_command_path() {
   esac
 }
 bootstrap_exec_system() {
+  local -a bootstrap_exec_args=("\$@")
+  local bootstrap_command_index=0
+  while [[ "\${bootstrap_exec_args[bootstrap_command_index]:-}" == *=* ]]; do
+    bootstrap_command_index=$((bootstrap_command_index + 1))
+  done
+  if [[ "\${bootstrap_exec_args[bootstrap_command_index]:-}" == /usr/bin/git ]]; then
+    bootstrap_exec_args[bootstrap_command_index]='$case_root/bin/git'
+  fi
   /usr/bin/env -i HOME='$fixture_home' PATH='$case_root/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\
-    CASE_ROOT='$case_root' "\$@"
+    CASE_ROOT='$case_root' "\${bootstrap_exec_args[@]}"
 }
+cat > '$case_root/bin/git' <<'GIT_FIXTURE'
+#!/usr/bin/bash
+set -euo pipefail
+[[ "\$*" == 'lfs install --system' ]] || {
+  echo "unexpected git fixture command: \$*" >&2
+  exit 24
+}
+printf '%s\n' "\$HOME" > "\$CASE_ROOT/git-lfs-home"
+GIT_FIXTURE
+chmod 0755 '$case_root/bin/git'
 fixture_base_user() {
   printf '%s\n' "\$(/usr/bin/id -u)" > "\$HOME/base-user-uid"
   /usr/bin/awk '/^NoNewPrivs:/ { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }' \\
@@ -119,7 +144,10 @@ fixture_runtime_children() {
   bootstrap_run_as_runtime_phase runtime-child-3
 }
 case "\$phase" in
-  base) install_base ;;
+  base)
+    bootstrap_root_home='$root_home'
+    install_base
+    ;;
   base-user) fixture_base_user ;;
   runtime-child-regression) fixture_runtime_children ;;
   runtime-child-1|runtime-child-2|runtime-child-3) fixture_runtime_child "\$phase" ;;
@@ -199,6 +227,37 @@ set -e
   { cat "$case_root/base.out" >&2; echo 'Base completion marker is not runtime-user owned.' >&2; exit 1; }
 [[ "$(stat -c '%u:%g' "$fixture_home/.local/bin")" == "$runtime_uid:$runtime_gid" ]] ||
   { cat "$case_root/base.out" >&2; echo 'Base managed bin directory is not runtime-user owned.' >&2; exit 1; }
+[[ "$(< "$case_root/git-lfs-home")" == "$root_home" ]] || {
+  cat "$case_root/base.out" >&2
+  echo 'Root git-lfs configuration did not use the explicit root-scoped HOME.' >&2
+  exit 1
+}
+[[ "$(< "$case_root/pwsh-home")" == "$root_home" ]] || {
+  cat "$case_root/base.out" >&2
+  echo 'Root PowerShell probes did not use the explicit root-scoped HOME.' >&2
+  exit 1
+}
+for root_artifact in \
+  "$root_home/.cache/powershell/telemetry.uuid" \
+  "$root_home/.cache/powershell/StartupProfileData-NonInteractive" \
+  "$root_home/.local/share/powershell/state"; do
+  [[ -f "$root_artifact" && "$(stat -c '%u:%g' "$root_artifact")" == 0:0 ]] || {
+    cat "$case_root/base.out" >&2
+    echo "Root-scoped PowerShell artifact has unexpected ownership: $root_artifact" >&2
+    exit 1
+  }
+done
+for runtime_artifact in \
+  "$fixture_home/.gitconfig" \
+  "$fixture_home/.cache/powershell/telemetry.uuid" \
+  "$fixture_home/.cache/powershell/StartupProfileData-NonInteractive" \
+  "$fixture_home/.local/share/powershell/state"; do
+  [[ ! -e "$runtime_artifact" ]] || {
+    cat "$case_root/base.out" >&2
+    echo "Root base phase wrote an artifact into the runtime HOME: $runtime_artifact" >&2
+    exit 1
+  }
+done
 runtime_output="$case_root/runtime-children.out"
 set +e
 /usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \

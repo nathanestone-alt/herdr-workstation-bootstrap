@@ -302,6 +302,24 @@ bootstrap_exec_user_runtime() {
     "$@"
 }
 
+bootstrap_root_home='/root'
+bootstrap_exec_root_scoped() {
+  [[ "${bootstrap_root_mode:-0}" == 1 ]] || {
+    echo 'Root-scoped bootstrap command requested outside root mode.' >&2
+    return 24
+  }
+  bootstrap_exec_system HOME="$bootstrap_root_home" "$@"
+}
+
+bootstrap_probe_powershell_version() {
+  local pwsh_bin="$1"
+  if [[ "${bootstrap_root_mode:-0}" == 1 ]]; then
+    bootstrap_exec_root_scoped "$pwsh_bin" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  else
+    bootstrap_exec_user_runtime "$pwsh_bin" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  fi
+}
+
 bootstrap_exec_python() {
   "$bootstrap_env_bin" -i \
     HOME="${HOME:-/nonexistent}" \
@@ -1938,14 +1956,18 @@ install_base() {
   bootstrap_exec_privileged "$sudo_bin" DEBIAN_FRONTEND=noninteractive "$apt_get_bin" install -y \
     apt-transport-https build-essential ca-certificates cifs-utils curl gawk git git-lfs gh gnupg jq mosh \
     openssh-client openssh-server pkg-config ripgrep rsync unzip zip
-  PATH='/usr/sbin:/usr/bin:/sbin:/bin' /usr/bin/git lfs install
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    bootstrap_exec_root_scoped "$bootstrap_git_bin" lfs install --system
+  else
+    bootstrap_exec_user_runtime "$bootstrap_git_bin" lfs install
+  fi
 
   if [[ "$("$ps_bin" -p 1 -o comm=)" != "systemd" ]]; then
     echo 'PID 1 is not systemd. This bootstrap expects a normal Ubuntu VM boot.' >&2
     exit 21
   fi
 
-  installed_pwsh="$("$pwsh_bin" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || true)"
+  installed_pwsh="$(bootstrap_probe_powershell_version "$pwsh_bin" 2>/dev/null || true)"
   if [[ "$installed_pwsh" != "$POWERSHELL_VERSION" ]]; then
     package="$(/usr/bin/mktemp --suffix=.deb)"
     bootstrap_register_cleanup "$package"
@@ -1953,7 +1975,7 @@ install_base() {
     bootstrap_install_locked_deb "$package" "$POWERSHELL_SHA256" "$sudo_bin" "$apt_get_bin"
     /usr/bin/rm -f -- "$package"
   fi
-  [[ "$("$pwsh_bin" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')" == "$POWERSHELL_VERSION" ]] || {
+  [[ "$(bootstrap_probe_powershell_version "$pwsh_bin")" == "$POWERSHELL_VERSION" ]] || {
     echo 'PowerShell version does not match lock.' >&2; exit 24;
   }
 
