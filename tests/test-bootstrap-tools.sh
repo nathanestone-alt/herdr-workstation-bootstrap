@@ -46,6 +46,15 @@ fixture_root="$test_root/fixture"
 fixture_home="$fixture_root/home"
 transport="$fixture_root/transport.git"
 mkdir -p -- "$fixture_root" "$fixture_home"
+if [[ "$root_tools_mode" == 1 ]]; then
+  # The runtime child executes the launcher-staged entrypoint below this
+  # temporary root.  Keep the fixture isolated, but allow traversal of the
+  # temporary parent without exposing directory listings.
+  /usr/bin/chmod 0711 "$test_root" "$fixture_root"
+else
+  /usr/bin/chmod 0755 "$fixture_root"
+fi
+/usr/bin/chmod 0755 "$fixture_home"
 fixture_ambient_node_dir="$fixture_root/ambient-node"
 wrong_node_version='22.0.0'
 mkdir -p -- "$fixture_ambient_node_dir/bin"
@@ -118,6 +127,9 @@ assert_payload_delivery() {
   local expected_payload="$test_root/receipt-payload.expected"
   local harness="$test_root/receipt-payload-harness.sh"
   local captured_payload="$test_root/receipt-payload.captured"
+  local payload_source_root="$test_root/receipt-payload-source"
+  local payload_home="$test_root/receipt-payload-home"
+  local required_fragment
   /usr/bin/awk \
     -v start='bootstrap_receipt_root_payload() {' \
     -v end='# END bootstrap_receipt_root_payload' '
@@ -141,6 +153,17 @@ assert_payload_delivery() {
       exit 1
     }
   /usr/bin/awk \
+    -v start='install_receipt_from_snapshots() {' \
+    -v end='}' '
+      $0 == start { capture=1 }
+      capture { print }
+      capture && $0 == end { closed=1; exit }
+      END { exit(capture && closed ? 0 : 1) }
+    ' "$payload_source" >> "$functions_file" || {
+      echo 'Receipt payload caller function was not found.' >&2
+      exit 1
+    }
+  /usr/bin/awk \
     -v start="  /usr/bin/cat <<'HERDR_RECEIPT_ROOT_PAYLOAD'" \
     -v end='HERDR_RECEIPT_ROOT_PAYLOAD' '
       $0 == start { capture=1; next }
@@ -157,18 +180,42 @@ assert_payload_delivery() {
     /usr/bin/cat <<'EOF'
 capture_path="$1"
 expected_path="$2"
+source_snapshot="$3"
+managed_home="$4"
 bootstrap_bash_bin=/usr/bin/bash
+bootstrap_source_snapshot="$source_snapshot"
+bootstrap_root_mode=1
+HOME="$managed_home"
+fixture_sha='0000000000000000000000000000000000000000000000000000000000000000'
+bootstrap_register_cleanup() {
+  :
+}
+attestation_snapshot_file_digest() {
+  printf '%s\n' "$fixture_sha"
+}
+attestation_build_payload_manifest() {
+  printf '%s\n' herdr-payload-manifest-v1 > "$2"
+}
+attestation_hash_file() {
+  printf '%s\n' "$fixture_sha"
+}
+bootstrap_exec_system() {
+  [[ "$#" == 6 && "$1" == /usr/bin/tar && "$2" == -C && -d "$3" &&
+    "$4" == -cf && "$5" == - && "$6" == . ]] || {
+    echo 'Production receipt caller changed its tar pipeline.' >&2
+    exit 1
+  }
+}
 bootstrap_exec_privileged() {
-  [[ "$1" == fixture-sudo && "$2" == /usr/bin/bash && "$3" == -c &&
-    "$5" == -- && "$6" == payload-arg-1 && "$7" == payload-arg-2 ]] || {
-    echo 'Privileged payload wrapper altered argv shape.' >&2
+  [[ "$#" == 8 && "$1" == '' && "$2" == /usr/bin/bash && "$3" == -c &&
+    "$5" == -- && "$6" == "$fixture_sha" && "$7" == "$fixture_sha" &&
+    "$8" == "$managed_home" ]] || {
+    echo 'Production receipt caller altered privileged payload argv shape.' >&2
     exit 1
   }
   printf '%s' "$4" > "$capture_path"
 }
-payload="$(bootstrap_receipt_root_payload)"
-payload+=$'\n'
-bootstrap_exec_privileged_payload fixture-sudo "$payload" payload-arg-1 payload-arg-2
+install_receipt_from_snapshots
 cmp -s "$capture_path" "$expected_path" || {
   echo 'Privileged shell payload is not byte-identical to the heredoc source.' >&2
   exit 1
@@ -176,13 +223,16 @@ cmp -s "$capture_path" "$expected_path" || {
 EOF
   } > "$harness"
   /usr/bin/chmod 0755 "$harness"
-  /usr/bin/bash "$harness" "$captured_payload" "$expected_payload"
+  /usr/bin/mkdir -p -- "$payload_source_root/scripts/ubuntu" "$payload_home"
+  /usr/bin/printf '%s\n' 'fixture source helper' > "$payload_source_root/scripts/ubuntu/source-attestation.sh"
+  /usr/bin/printf '%s\n' 'commit=fixture' > "$payload_source_root/.source-attestation"
+  /usr/bin/bash "$harness" "$captured_payload" "$expected_payload" "$payload_source_root" "$payload_home"
   for required_fragment in \
     'found++ } } END' \
     "while IFS= read -r -d '' full; do" \
     'if [[ -L "$full" ]]; then' \
-    'actual_mode=' \
-    'actual_digest=' \
+    '[[ "$actual_mode" == "${payload_mode[$relative]}" ]] || return 1' \
+    '[[ "$actual_digest" == "${payload_sha[$relative]}" ]] || return 1' \
     'done < <(/usr/bin/find -P "$root" -mindepth 1 -print0)' \
     'for path in "${!payload_sha[@]}"; do'; do
     /usr/bin/grep -Fq -- "$required_fragment" "$expected_payload" || {
@@ -270,6 +320,15 @@ fixture_tools_main() {
   export RTK_SHA256
   case "$phase" in
     tools) install_tools ;;
+    tools-prepare)
+      [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-prepare is runtime-only.' >&2; exit 24; }
+      bootstrap_tools_prepare_only=1
+      install_tools_transaction
+      ;;
+    tools-finalize)
+      [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-finalize is runtime-only.' >&2; exit 24; }
+      install_tools_finalize
+      ;;
     *) echo "Unsupported tools fixture phase: $phase" >&2; return 2 ;;
   esac
   if [[ "$phase" == tools ]]; then
