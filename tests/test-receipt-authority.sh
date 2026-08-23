@@ -662,6 +662,12 @@ else
     /usr/bin/chmod 0755 -- "$production_prefix"
     production_home="$production_prefix/home"
     /usr/bin/cp -a -- "$fixture_home" "$production_home"
+    # pyvenv.cfg stores an absolute runtime home; rebase the copied fixture
+    # metadata to the synthetic production home before exercising production
+    # receipt authority.
+    /usr/bin/sed -i \
+      "s|^home = .*|home = $production_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM|" \
+      "$production_home/.local/pyvenv.cfg"
     /usr/bin/chown -R "$fixture_runtime_uid:$fixture_runtime_gid" "$production_home"
     /usr/bin/cp -a -- "$transport" "$production_prefix/transport.git"
     /usr/bin/chmod 0700 -- "$production_prefix/transport.git"
