@@ -2140,7 +2140,7 @@ install_tools_transaction() {
   hash -r
   [[ "$("$node_anchor/bin/node" --version)" == "v$NODE_VERSION" ]] || { echo 'Node version does not match lock.' >&2; exit 24; }
 
-  "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
+  "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
     "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
     "bun@$BUN_VERSION"
@@ -2219,7 +2219,7 @@ install_tools_transaction() {
     printf 'rustup=%s\n' "$("$HOME/.cargo/bin/rustup" --version | /usr/bin/head -n 1)"
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
-    printf 'npm=%s\n' "$("$node_anchor/bin/npm" --version)"
+    printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
     printf 'codex=%s\n' "$("$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
@@ -2321,7 +2321,7 @@ install_tools_finalize() {
     printf 'rustup=%s\n' "$("$HOME/.cargo/bin/rustup" --version | /usr/bin/head -n 1)"
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
-    printf 'npm=%s\n' "$("$node_anchor/bin/npm" --version)"
+    printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
     printf 'codex=%s\n' "$("$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"

@@ -236,8 +236,48 @@ make_version_tool "$fixture_home/.cargo/bin/cargo" 'cargo 1.97.1 (fixture)'
 make_version_tool "$fixture_home/.cargo/bin/rustc" "rustc $RUST_TOOLCHAIN (fixture)"
 
 node_dir="$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64"
-make_version_tool "$node_dir/bin/node" "v$NODE_VERSION"
-make_version_tool "$node_dir/bin/npm" '10.9.3'
+npm_invocation_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/pinned-node-npm.marker"
+cat > "$node_dir/bin/node" <<EOF
+#!/usr/bin/bash
+set -euo pipefail
+fixture_node_dir='$node_dir'
+fixture_npm_marker='$npm_invocation_marker'
+case "\${1:-}" in
+  --version)
+    printf 'v%s\\n' '$NODE_VERSION'
+    ;;
+  /proc/self/fd/*/bin/npm)
+    npm_real="\$(/usr/bin/realpath -e -- "\$1" 2>/dev/null || true)"
+    [[ "\$npm_real" == "\$fixture_node_dir/bin/npm" ]] || {
+      echo "Pinned Node received an unexpected npm path: \$npm_real" >&2
+      exit 24
+    }
+    case "\${2:-}" in
+      install)
+        printf '%s\\n' 'pinned-node-executed-npm-install' > "\$fixture_npm_marker"
+        ;;
+      --version)
+        printf '%s\\n' 'pinned-node-executed-npm-version' >> "\$fixture_npm_marker"
+        printf '%s\\n' '10.9.3'
+        ;;
+      *)
+        echo "Pinned Node received unexpected npm arguments: \$*" >&2
+        exit 24
+        ;;
+    esac
+    ;;
+  *)
+    echo "Pinned Node received unexpected arguments: \$*" >&2
+    exit 24
+    ;;
+esac
+EOF
+chmod 0755 "$node_dir/bin/node"
+cat > "$node_dir/bin/npm" <<'EOF'
+#!/usr/bin/env node
+process.exit(91);
+EOF
+chmod 0755 "$node_dir/bin/npm"
 make_version_tool "$node_dir/bin/npx" '10.9.3'
 make_version_tool "$node_dir/bin/corepack" '0.31.0'
 make_version_tool "$node_dir/bin/codex" "codex $CODEX_VERSION"
@@ -306,6 +346,8 @@ grep -Fqx 'apt:fixture=tools-phase' "$manifest"
 [[ "$(jq -r '.rtk_release.url' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$official_rtk_url" ]]
 [[ "$(jq -r '.rtk_release.sha256' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "$official_rtk_sha256" ]]
 [[ "$(jq -r '.role_identities.rtk.version' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "rtk $official_rtk_version" ]]
+grep -Fqx 'pinned-node-executed-npm-install' "$npm_invocation_marker"
+grep -Fqx 'pinned-node-executed-npm-version' "$npm_invocation_marker"
 
 good_rtk="$fixture_home/.cargo/bin/rtk-good"
 mv -- "$rtk_path" "$good_rtk"
