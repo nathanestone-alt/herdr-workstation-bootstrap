@@ -4,7 +4,20 @@ umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(/usr/bin/realpath -e -- "$(mktemp -d)")"
-trap 'rm -rf -- "$test_root"' EXIT
+root_tools_fixture_parent='/var/lib/herdr-workstation/bootstrap/staging'
+root_tools_fixture_root=''
+cleanup_test() {
+  local status="$?"
+  trap - EXIT
+  set +e
+  if [[ -n "$root_tools_fixture_root" &&
+    "$root_tools_fixture_root" == "$root_tools_fixture_parent/herdr-test-bootstrap-tools."* ]]; then
+    /usr/bin/rm -rf -- "$root_tools_fixture_root"
+  fi
+  /usr/bin/rm -rf -- "$test_root"
+  exit "$status"
+}
+trap cleanup_test EXIT
 
 # This fixture executes the real tools phase through the installed trusted
 # launcher. Downloads and the receipt handoff are test transports; all
@@ -69,14 +82,21 @@ fi
 
 source_fixture="$test_root/source"
 fixture_root="$test_root/fixture"
+if [[ "$root_tools_mode" == 1 ]]; then
+  root_tools_fixture_root="$(/usr/bin/mktemp -d \
+    "$root_tools_fixture_parent/herdr-test-bootstrap-tools.XXXXXX")"
+  /usr/bin/chmod 0755 -- "$root_tools_fixture_root"
+  /usr/bin/chown 0:0 -- "$root_tools_fixture_root"
+  fixture_root="$root_tools_fixture_root"
+fi
 fixture_home="$fixture_root/home"
 transport="$fixture_root/transport.git"
 mkdir -p -- "$fixture_root" "$fixture_home"
 if [[ "$root_tools_mode" == 1 ]]; then
   # The runtime child executes the launcher-staged entrypoint below this
-  # temporary root. Keep the temporary parent traversal-only, while making
-  # the fixture root satisfy the trusted launcher's canonical 0755 system
-  # prefix contract.
+  # production-shaped root. Keep scratch data traversal-only, while placing
+  # the fixture root below the authority-controlled, non-writable staging
+  # ancestry required by the production receipt handoff.
   /usr/bin/chmod 0711 "$test_root"
   /usr/bin/chmod 0755 "$fixture_root"
   /usr/bin/chown "$(/usr/bin/id -u):$(/usr/bin/id -g)" "$fixture_root"
