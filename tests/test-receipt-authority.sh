@@ -3,18 +3,27 @@ set -euo pipefail
 umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d)"
+test_root=''
+production_stage_authority_parent='/var/lib/herdr-workstation/bootstrap/staging'
 production_prefix=''
 cleanup_test() {
-  local status="$?"
+  local status="${1:-$?}"
+  trap - EXIT HUP INT QUIT TERM
   set +e
-  rm -rf -- "$test_root"
-  if [[ -n "$production_prefix" && "$production_prefix" == /run/herdr-issue-8-production.* ]]; then
-    rm -rf -- "$production_prefix"
+  if [[ -n "$production_prefix" &&
+    ( "$production_prefix" == "$production_stage_authority_parent/herdr-test-production-simulation."* ||
+      "$production_prefix" == /tmp/herdr-test-production-ancestry-rejection.* ) ]]; then
+    /usr/bin/rm -rf -- "$production_prefix"
   fi
-  return "$status"
+  [[ -z "$test_root" ]] || /usr/bin/rm -rf -- "$test_root"
+  exit "$status"
 }
-trap cleanup_test EXIT
+trap 'cleanup_test "$?"' EXIT
+trap 'cleanup_test 129' HUP
+trap 'cleanup_test 130' INT
+trap 'cleanup_test 131' QUIT
+trap 'cleanup_test 143' TERM
+test_root="$(mktemp -d)"
 
 # The authority deliberately validates the same source and release-lock
 # relationships as production. Build a small clean source checkout and a
@@ -595,9 +604,61 @@ else
   production_policy=''
   production_authority_path=''
   production_receipt_path=''
+  assert_root_owned_nonwritable_chain() {
+    local label="$1"
+    local current="$2"
+    local resolved owner group mode
+    [[ "$current" == /* && -d "$current" && ! -L "$current" ]] || {
+      echo "$label is not an existing canonical directory: $current" >&2
+      exit 1
+    }
+    while :; do
+      resolved="$(/usr/bin/realpath -e -- "$current" 2>/dev/null || true)"
+      [[ "$resolved" == "$current" ]] || {
+        echo "$label has a symlinked or non-canonical ancestor: $current" >&2
+        exit 1
+      }
+      owner="$(/usr/bin/stat -c '%u' -- "$current" 2>/dev/null || true)"
+      group="$(/usr/bin/stat -c '%g' -- "$current" 2>/dev/null || true)"
+      mode="$(/usr/bin/stat -c '%a' -- "$current" 2>/dev/null || true)"
+      [[ "$owner" == 0 && "$group" == 0 && "$mode" =~ ^[0-7]+$ ]] || {
+        echo "$label is not root-owned with a readable-only authority mode: $current" >&2
+        exit 1
+      }
+      if (( (8#$mode & 022) != 0 )); then
+        echo "$label is group/other-writable: $current" >&2
+        exit 1
+      fi
+      [[ "$current" == '/' ]] && break
+      current="$(/usr/bin/dirname -- "$current")"
+    done
+  }
   prepare_production_payload_environment() {
+    local prefix_parent="${1:-$production_stage_authority_parent}"
+    local prefix_name="${2:-herdr-test-production-simulation}"
+    local tmp_mode
     [[ -n "$production_prefix" ]] && return 0
-    production_prefix="$(/usr/bin/mktemp -d /run/herdr-issue-8-production.XXXXXX)"
+    if [[ "$prefix_parent" == "$production_stage_authority_parent" ]]; then
+      assert_root_owned_nonwritable_chain production-stage-authority-parent \
+        "$production_stage_authority_parent"
+    elif [[ "$prefix_parent" == /tmp ]]; then
+      tmp_mode="$(/usr/bin/stat -c '%a' -- /tmp 2>/dev/null || true)"
+      [[ "$(/usr/bin/realpath -e -- /tmp 2>/dev/null || true)" == /tmp &&
+        "$(/usr/bin/stat -c '%u:%g' -- /tmp 2>/dev/null || true)" == 0:0 &&
+        "$tmp_mode" =~ ^[0-7]+$ ]] || {
+        echo 'The /tmp ancestry rejection fixture requires canonical root-owned /tmp.' >&2
+        exit 1
+      }
+      (( (8#$tmp_mode & 022) != 0 )) || {
+        echo 'The /tmp ancestry rejection fixture requires writable /tmp.' >&2
+        exit 1
+      }
+    else
+      echo "Unsupported production test prefix parent: $prefix_parent" >&2
+      exit 1
+    fi
+    production_prefix="$(/usr/bin/mktemp -d \
+      "$prefix_parent/$prefix_name.XXXXXX")"
     /usr/bin/chmod 0755 -- "$production_prefix"
     production_home="$production_prefix/home"
     /usr/bin/cp -a -- "$fixture_home" "$production_home"
@@ -622,6 +683,8 @@ else
     local payload_hash="$3"
     local payload_commit="$4"
     local fixture_mode="${5:-fixture}"
+    local production_parent="${6:-$production_stage_authority_parent}"
+    local production_name="${7:-herdr-test-production-simulation}"
     local -a fixture_args=()
     local capability_launcher capability_policy capability_parent payload_home target_authority target_receipt
     case "$fixture_mode" in
@@ -635,7 +698,7 @@ else
         fixture_args=(--fixture-root "$fixture_root")
         ;;
       production)
-        prepare_production_payload_environment
+        prepare_production_payload_environment "$production_parent" "$production_name"
         capability_launcher="$production_launcher"
         capability_policy="$production_policy"
         capability_parent="$production_prefix/var/lib/herdr-workstation/bootstrap/staging"
@@ -675,6 +738,21 @@ else
       --source-commit "$payload_commit" \
       "${fixture_args[@]}"
   }
+  # Preserve the production negative proof: a unique test prefix beneath
+  # writable /tmp must be rejected at that ancestor. This rejection fixture is
+  # never reused for the positive production simulation below.
+  prepare_production_payload_environment /tmp herdr-test-production-ancestry-rejection
+  expect_failure_diagnostic production-writable-ancestry \
+    'receipt authority: production runtime bundle staging parent is not root-owned and non-writable: /tmp' \
+    run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" \
+    production /tmp herdr-test-production-ancestry-rejection
+  /usr/bin/rm -rf -- "$production_prefix"
+  production_prefix=''
+  production_home=''
+  production_launcher=''
+  production_policy=''
+  production_authority_path=''
+  production_receipt_path=''
   # The hardened source snapshot strips every write bit, so the real payload
   # entrypoint and capability helper are root-owned 0555.  Payload receipt
   # capability must accept exactly that mode and must still reject the
