@@ -2162,7 +2162,7 @@ install_tools_transaction() {
   fence_replace_file "$herdr_temp" "$bin_dir/herdr" 0755 before-herdr-publish "$bin_fd"
   herdr_temp=''
 
-  [[ "$("$node_anchor/bin/codex" --version | /usr/bin/gawk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
+  [[ "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version | /usr/bin/gawk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
   [[ "$("$node_anchor/bin/claude" --version | /usr/bin/gawk '{ print $1 }')" == "$CLAUDE_VERSION" ]] || { echo 'Claude version does not match lock.' >&2; exit 24; }
   [[ "$("$node_anchor/bin/bun" --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
   [[ "$("$bin_dir/herdr" --version | /usr/bin/gawk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
@@ -2220,7 +2220,7 @@ install_tools_transaction() {
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
     printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
-    printf 'codex=%s\n' "$("$node_anchor/bin/codex" --version)"
+    printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
     printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"
@@ -2322,7 +2322,7 @@ install_tools_finalize() {
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
     printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
-    printf 'codex=%s\n' "$("$node_anchor/bin/codex" --version)"
+    printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
     printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"

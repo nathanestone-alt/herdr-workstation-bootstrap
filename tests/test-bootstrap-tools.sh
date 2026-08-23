@@ -187,7 +187,7 @@ mkdir -p -- \
   "$fixture_home/.local/lib/herdr-workstation/uv/$UV_VERSION" \
   "$fixture_home/.local/lib/herdr-workstation/python" \
   "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/bin" \
-  "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/lib/node_modules/@openai/codex" \
+  "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/lib/node_modules/@openai/codex/bin" \
   "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/lib/node_modules/@anthropic-ai/claude-code" \
   "$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64/lib/node_modules/bun" \
   "$fixture_home/code"
@@ -237,11 +237,13 @@ make_version_tool "$fixture_home/.cargo/bin/rustc" "rustc $RUST_TOOLCHAIN (fixtu
 
 node_dir="$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64"
 npm_invocation_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/pinned-node-npm.marker"
+codex_invocation_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/pinned-node-codex.marker"
 cat > "$node_dir/bin/node" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
 fixture_node_dir='$node_dir'
 fixture_npm_marker='$npm_invocation_marker'
+fixture_codex_marker='$codex_invocation_marker'
 case "\${1:-}" in
   --version)
     printf 'v%s\\n' '$NODE_VERSION'
@@ -266,6 +268,19 @@ case "\${1:-}" in
         ;;
     esac
     ;;
+  /proc/self/fd/*/bin/codex)
+    codex_real="\$(/usr/bin/realpath -e -- "\$1" 2>/dev/null || true)"
+    [[ "\$codex_real" == "\$fixture_node_dir/lib/node_modules/@openai/codex/bin/codex.js" ]] || {
+      echo "Pinned Node received an unexpected Codex path: \$codex_real" >&2
+      exit 24
+    }
+    [[ "\${2:-}" == '--version' ]] || {
+      echo "Pinned Node received unexpected Codex arguments: \$*" >&2
+      exit 24
+    }
+    printf '%s\n' 'pinned-node-executed-codex-version' >> "\$fixture_codex_marker"
+    printf '%s\n' 'codex-cli $CODEX_VERSION'
+    ;;
   *)
     echo "Pinned Node received unexpected arguments: \$*" >&2
     exit 24
@@ -280,7 +295,12 @@ EOF
 chmod 0755 "$node_dir/bin/npm"
 make_version_tool "$node_dir/bin/npx" '10.9.3'
 make_version_tool "$node_dir/bin/corepack" '0.31.0'
-make_version_tool "$node_dir/bin/codex" "codex $CODEX_VERSION"
+cat > "$node_dir/lib/node_modules/@openai/codex/bin/codex.js" <<'EOF'
+#!/usr/bin/env node
+process.exit(91);
+EOF
+chmod 0755 "$node_dir/lib/node_modules/@openai/codex/bin/codex.js"
+ln -s -- "$node_dir/lib/node_modules/@openai/codex/bin/codex.js" "$node_dir/bin/codex"
 make_version_tool "$node_dir/bin/claude" "$CLAUDE_VERSION fixture"
 make_version_tool "$node_dir/bin/bun" "$BUN_VERSION"
 make_version_tool "$node_dir/bin/bunx" "$BUN_VERSION"
@@ -299,6 +319,18 @@ EOF
 chmod 0755 "$test_root/rtk-root/rtk"
 tar -C "$test_root/rtk-root" -czf "$fixture_root/rtk-official-fixture.tar.gz" rtk
 chmod 0600 "$fixture_root/rtk-official-fixture.tar.gz"
+
+mkdir -p -- "$test_root/no-node-path"
+set +e
+/usr/bin/env -i HOME="$fixture_home" PATH="$test_root/no-node-path" \
+  "$node_dir/bin/codex" --version > "$test_root/direct-codex.out" 2>&1
+direct_codex_status=$?
+set -e
+(( direct_codex_status != 0 )) || {
+  cat "$test_root/direct-codex.out" >&2
+  echo 'Codex fixture unexpectedly succeeded through its ambient shebang.' >&2
+  exit 1
+}
 
 run_tools() {
   /usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -348,6 +380,8 @@ grep -Fqx 'apt:fixture=tools-phase' "$manifest"
 [[ "$(jq -r '.role_identities.rtk.version' "$fixture_root/etc/stmodel/issue-961/receipt.json")" == "rtk $official_rtk_version" ]]
 grep -Fqx 'pinned-node-executed-npm-install' "$npm_invocation_marker"
 grep -Fqx 'pinned-node-executed-npm-version' "$npm_invocation_marker"
+grep -Fqx "codex=codex-cli $CODEX_VERSION" "$manifest"
+grep -Fqx 'pinned-node-executed-codex-version' "$codex_invocation_marker"
 
 good_rtk="$fixture_home/.cargo/bin/rtk-good"
 mv -- "$rtk_path" "$good_rtk"
