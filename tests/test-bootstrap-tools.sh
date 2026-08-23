@@ -26,6 +26,32 @@ assert_fixture_rewrite() {
   }
 }
 
+assert_fixture_runtime_tree() {
+  [[ "$root_tools_mode" == 1 ]] || return 0
+  local expected_owner="${root_tools_uid}:${root_tools_gid}"
+  local actual_home_owner actual_home_mode bad_owner bad_mode
+  actual_home_owner="$(/usr/bin/stat -c '%u:%g' -- "$fixture_home" 2>/dev/null || true)"
+  actual_home_mode="$(/usr/bin/stat -c '%a' -- "$fixture_home" 2>/dev/null || true)"
+  [[ "$actual_home_owner" == "$expected_owner" && "$actual_home_mode" == 755 ]] || {
+    echo "Bootstrap tools fixture runtime HOME contract failed: path=$fixture_home owner=$actual_home_owner mode=$actual_home_mode expected_owner=$expected_owner expected_mode=755" >&2
+    exit 1
+  }
+  bad_owner="$(/usr/bin/find -P "$fixture_home" -xdev \
+    \( ! -uid "$root_tools_uid" -o ! -gid "$root_tools_gid" \) \
+    -printf '%u:%g:%m:%p\n' -quit 2>/dev/null || true)"
+  [[ -z "$bad_owner" ]] || {
+    echo "Bootstrap tools fixture runtime ownership is unsafe: expected_owner=$expected_owner first_mismatch=$bad_owner" >&2
+    exit 1
+  }
+  bad_mode="$(/usr/bin/find -P "$fixture_home" -xdev \
+    \( -type d -o -type f \) -perm /022 \
+    -printf '%u:%g:%m:%p\n' -quit 2>/dev/null || true)"
+  [[ -z "$bad_mode" ]] || {
+    echo "Bootstrap tools fixture runtime mode is unsafe: first_group_or_other_writable=$bad_mode" >&2
+    exit 1
+  }
+}
+
 root_tools_mode=0
 root_tools_uid=''
 root_tools_gid=''
@@ -313,11 +339,6 @@ fi
 
 fixture_tools_main() {
   local fixture_rtk_sha256
-  # A second root invocation restores the fixture HOME owner after the
-  # receipt handoff, while preserving every public file and symlink name.
-  if [[ "$(/usr/bin/id -u)" == 0 ]]; then
-    /usr/bin/chown -R --no-dereference 0:0 "$HOME"
-  fi
   fixture_rtk_sha256="$(/usr/bin/sha256sum -- "$fixture_tools_rtk_archive" | /usr/bin/gawk '{print $1}')"
   RTK_SHA256="$fixture_rtk_sha256"
   export RTK_SHA256
@@ -613,7 +634,6 @@ chmod 0755 "$test_root/rtk-root/rtk"
 tar -C "$test_root/rtk-root" -czf "$fixture_root/rtk-official-fixture.tar.gz" rtk
 if [[ "$root_tools_mode" == 1 ]]; then
   /usr/bin/chmod 0644 "$fixture_root/rtk-official-fixture.tar.gz"
-  /usr/bin/chown -R --no-dereference "$root_tools_uid:$root_tools_gid" "$fixture_home"
   /usr/bin/mkdir -p -- "$fixture_root/etc/stmodel/issue-961"
   /usr/bin/chmod 0755 "$fixture_root/etc/stmodel" "$fixture_root/etc/stmodel/issue-961"
   /usr/bin/chown 0:0 "$fixture_root/etc/stmodel" "$fixture_root/etc/stmodel/issue-961"
@@ -639,6 +659,10 @@ run_tools() {
     "$launcher" --entrypoint bootstrap -- --phase tools
 }
 
+if [[ "$root_tools_mode" == 1 ]]; then
+  /usr/bin/chown -R --no-dereference "$root_tools_uid:$root_tools_gid" "$fixture_home"
+  assert_fixture_runtime_tree
+fi
 if ! run_tools > "$test_root/tools.out" 2>&1; then
   cat "$test_root/tools.out" >&2
   exit 1
