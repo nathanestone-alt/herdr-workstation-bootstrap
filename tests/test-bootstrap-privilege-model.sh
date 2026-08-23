@@ -89,6 +89,15 @@ if [[ "\$1" == version ]]; then
   printf '%s\n' '$tailscale_version'
 fi
 EOF
+cat > "$case_root/bin/git" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+[[ "$*" == 'lfs install --system' ]] || {
+  echo "unexpected git fixture command: $*" >&2
+  exit 24
+}
+printf '%s\n' "$HOME" > "$CASE_ROOT/git-lfs-home"
+EOF
 chmod 0755 "$case_root/bin/"*
 
 /usr/bin/awk '
@@ -107,7 +116,7 @@ bootstrap_exec_system() {
   local -a bootstrap_exec_args=("\$@")
   local bootstrap_command_index=0
   while [[ "\${bootstrap_exec_args[bootstrap_command_index]:-}" == *=* ]]; do
-    bootstrap_command_index=$((bootstrap_command_index + 1))
+    bootstrap_command_index=\$((bootstrap_command_index + 1))
   done
   if [[ "\${bootstrap_exec_args[bootstrap_command_index]:-}" == /usr/bin/git ]]; then
     bootstrap_exec_args[bootstrap_command_index]='$case_root/bin/git'
@@ -115,16 +124,6 @@ bootstrap_exec_system() {
   /usr/bin/env -i HOME='$fixture_home' PATH='$case_root/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\
     CASE_ROOT='$case_root' "\${bootstrap_exec_args[@]}"
 }
-cat > '$case_root/bin/git' <<'GIT_FIXTURE'
-#!/usr/bin/bash
-set -euo pipefail
-[[ "\$*" == 'lfs install --system' ]] || {
-  echo "unexpected git fixture command: \$*" >&2
-  exit 24
-}
-printf '%s\n' "\$HOME" > "\$CASE_ROOT/git-lfs-home"
-GIT_FIXTURE
-chmod 0755 '$case_root/bin/git'
 fixture_base_user() {
   printf '%s\n' "\$(/usr/bin/id -u)" > "\$HOME/base-user-uid"
   /usr/bin/awk '/^NoNewPrivs:/ { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }' \\
