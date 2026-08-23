@@ -106,9 +106,22 @@ fixture_base_user() {
     /proc/self/status > "\$HOME/base-user-no-new-privs"
   install_base_user
 }
+fixture_runtime_child() {
+  local runtime_child_phase="\$1"
+  printf '%s\n' "\$(/usr/bin/id -u)" > "\$HOME/\$runtime_child_phase-uid"
+  /usr/bin/awk '/^NoNewPrivs:/ { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }' \
+    /proc/self/status > "\$HOME/\$runtime_child_phase-no-new-privs"
+}
+fixture_runtime_children() {
+  bootstrap_run_as_runtime_phase runtime-child-1
+  bootstrap_run_as_runtime_phase runtime-child-2
+  bootstrap_run_as_runtime_phase runtime-child-3
+}
 case "\$phase" in
   base) install_base ;;
   base-user) fixture_base_user ;;
+  runtime-child-regression) fixture_runtime_children ;;
+  runtime-child-1|runtime-child-2|runtime-child-3) fixture_runtime_child "\$phase" ;;
   *) echo "unsupported privilege fixture phase: \$phase" >&2; exit 2 ;;
 esac
 EOF
@@ -159,9 +172,19 @@ fi
   --fixture-runtime-uid "$runtime_uid" --fixture-runtime-gid "$runtime_gid" \
   > "$case_root/launcher-install.out"
 launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
+set +e
 /usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   BASH_ENV= ENV= LC_ALL=C TZ=UTC \
   "$launcher" --entrypoint bootstrap -- --phase base > "$case_root/base.out" 2>&1
+base_status=$?
+set -e
+(( base_status == 0 )) || {
+  cat "$case_root/base.out" >&2
+  if grep -Fq 'herdr launcher capability: policy grammar is not exact' "$case_root/base.out"; then
+    echo 'Runtime-child capability regression reproduced the consumed policy descriptor failure.' >&2
+  fi
+  exit 1
+}
 
 [[ -s "$case_root/apt.log" ]] || { cat "$case_root/base.out" >&2; echo 'Base phase did not execute its privileged apt seam.' >&2; exit 1; }
 [[ -s "$case_root/systemctl.log" ]] || { cat "$case_root/base.out" >&2; echo 'Base phase did not execute its privileged systemctl seam.' >&2; exit 1; }
@@ -175,5 +198,32 @@ launcher="$fixture_root/usr/local/libexec/herdr-workstation-bootstrap"
   { cat "$case_root/base.out" >&2; echo 'Base completion marker is not runtime-user owned.' >&2; exit 1; }
 [[ "$(stat -c '%u:%g' "$fixture_home/.local/bin")" == "$runtime_uid:$runtime_gid" ]] ||
   { cat "$case_root/base.out" >&2; echo 'Base managed bin directory is not runtime-user owned.' >&2; exit 1; }
+runtime_output="$case_root/runtime-children.out"
+set +e
+/usr/bin/env -i HOME="$fixture_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  BASH_ENV= ENV= LC_ALL=C TZ=UTC \
+  "$launcher" --entrypoint bootstrap -- --phase runtime-child-regression > "$runtime_output" 2>&1
+runtime_status=$?
+set -e
+(( runtime_status == 0 )) || {
+  cat "$runtime_output" >&2
+  if grep -Fq 'herdr launcher capability: policy grammar is not exact' "$runtime_output"; then
+    echo 'Runtime-child capability regression reproduced the consumed policy descriptor failure.' >&2
+  fi
+  exit 1
+}
+for runtime_child_phase in runtime-child-1 runtime-child-2 runtime-child-3; do
+  [[ "$(< "$fixture_home/$runtime_child_phase-uid")" == "$runtime_uid" ]] || {
+    cat "$runtime_output" >&2
+    echo "Runtime child '$runtime_child_phase' did not run as the selected runtime user." >&2
+    exit 1
+  }
+  [[ "$(< "$fixture_home/$runtime_child_phase-no-new-privs")" == 1 ]] || {
+    cat "$runtime_output" >&2
+    echo "Runtime child '$runtime_child_phase' did not retain no_new_privs." >&2
+    exit 1
+  }
+done
+echo 'Parent-to-runtime-child capability descriptors and no-new-privs regression passed.'
 
 echo 'Bootstrap privilege-model regression reproduced setpriv/sudo failure and passed the corrected root/runtime split.'

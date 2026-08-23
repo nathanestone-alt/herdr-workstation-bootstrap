@@ -238,18 +238,39 @@ bootstrap_exec_privileged() {
   fi
 }
 
+bootstrap_runtime_capability_fd=13
 bootstrap_run_as_runtime_phase() {
   local runtime_phase="$1"
+  local runtime_capability_fd="$bootstrap_runtime_capability_fd"
   [[ "${bootstrap_root_mode:-0}" == 1 ]] || {
     echo "Root bootstrap orchestration is required for runtime phase '$runtime_phase'." >&2
     return 24
   }
+  case "$runtime_capability_fd" in
+    13|14|15) ;;
+    *)
+      echo 'Runtime-child launcher capability descriptor pool is exhausted.' >&2
+      return 24
+      ;;
+  esac
+  bootstrap_runtime_capability_fd=$((runtime_capability_fd + 1))
   bootstrap_exec_system \
     HOME="$bootstrap_runtime_home" \
     "$bootstrap_setpriv_bin" \
     --reuid="$bootstrap_runtime_uid" --regid="$bootstrap_runtime_gid" \
     --clear-groups --no-new-privs \
-    "$bootstrap_bash_bin" "$bootstrap_script_path" --phase "$runtime_phase"
+    "$bootstrap_bash_bin" -c '
+      set -euo pipefail
+      case "$1" in
+        13) exec 9<&13 ;;
+        14) exec 9<&14 ;;
+        15) exec 9<&15 ;;
+        *) exit 24 ;;
+      esac
+      exec 13<&- 14<&- 15<&-
+      shift
+      exec "$@"
+    ' _ "$runtime_capability_fd" "$bootstrap_script_path" --phase "$runtime_phase"
 }
 
 bootstrap_prepare_runtime_directories() {

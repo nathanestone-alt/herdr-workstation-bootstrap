@@ -132,6 +132,9 @@ cleanup() {
   exec 10<&- 2>/dev/null || true
   exec 11<&- 2>/dev/null || true
   exec 12<&- 2>/dev/null || true
+  exec 13<&- 2>/dev/null || true
+  exec 14<&- 2>/dev/null || true
+  exec 15<&- 2>/dev/null || true
   return "$s"
 }
 trap 'cleanup "$?"' EXIT
@@ -158,6 +161,21 @@ entry_path="$stage_dir/$entrypoint"; assert_file "$entry_path" 755; entry_id="$(
 pause_at "$launcher_entry_pause_ready" "$launcher_entry_pause_continue"
 policy_lifetime; assert_dir "$stage_dir" 755; assert_file "$entry_path" 755
 [[ "$(policy_identity "$entry_path")" == "$entry_id" && "$($launcher_sha256_bin -- "$entry_path" | "$launcher_awk_bin" '{print $1}')" == "$entry_hash" && "$(git_safe -C "$stage_dir" hash-object --no-filters -- "$entry_path")" == "$oid" ]] || fail 'entrypoint replacement detected'
+# The root bootstrap process consumes fd 9 while proving its capability.  Keep
+# three independent open descriptions of that already-bound policy object for
+# the base-user, tools-prepare, and tools-finalize runtime children.  Children
+# receive one descriptor through the pre-exec handoff below and never reopen a
+# mutable policy pathname.
+if [[ "$entrypoint" == scripts/ubuntu/bootstrap.sh ]]; then
+  exec 13<"$policy_fd_path" || fail 'runtime policy capability 13 open failed'
+  exec 14<"$policy_fd_path" || fail 'runtime policy capability 14 open failed'
+  exec 15<"$policy_fd_path" || fail 'runtime policy capability 15 open failed'
+  for runtime_policy_fd in 13 14 15; do
+    [[ "$(policy_identity "/proc/$BASHPID/fd/$runtime_policy_fd")" == "$policy_id" ]] ||
+      fail "runtime policy capability $runtime_policy_fd identity changed"
+  done
+  policy_lifetime
+fi
 if [[ -n $launcher_fixture_home ]]; then
   home=$launcher_fixture_home
 else
