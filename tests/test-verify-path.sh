@@ -118,31 +118,70 @@ cat > "$managed_bin/rustc" <<EOF
 #!/usr/bin/bash
 printf 'rustc %s (fixturehash 2026-08-19)\\n' '$RUST_TOOLCHAIN'
 EOF
-cat > "$managed_bin/node" <<EOF
+node_root="$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64"
+node_bin="$node_root/bin"
+npm_cli="$node_root/lib/node_modules/npm/bin/npm-cli.js"
+codex_js="$node_root/lib/node_modules/@openai/codex/bin/codex.js"
+pinned_node_marker="$test_root/pinned-node-executions"
+mkdir -p "$node_bin" "$(dirname "$npm_cli")" "$(dirname "$codex_js")"
+cat > "$node_bin/node" <<EOF
 #!/usr/bin/bash
-printf 'v%s\\n' '$NODE_VERSION'
+set -euo pipefail
+fixture_npm_cli='$npm_cli'
+fixture_codex_js='$codex_js'
+fixture_marker='$pinned_node_marker'
+script="\$1"
+if [[ "\$script" == '--version' ]]; then
+  printf 'v%s\\n' '$NODE_VERSION'
+  exit 0
+fi
+script_real="\$(/usr/bin/realpath -e -- "\$script" 2>/dev/null || true)"
+case "\$script_real" in
+  "\$fixture_npm_cli")
+    printf '%s\\n' 'pinned-node-executed-npm' >> "\$fixture_marker"
+    printf '%s\\n' '11.6.0'
+    ;;
+  "\$fixture_codex_js")
+    printf '%s\\n' 'pinned-node-executed-codex' >> "\$fixture_marker"
+    printf 'codex-cli %s\\n' '$CODEX_VERSION'
+    ;;
+  *)
+    echo "Pinned fixture Node received unexpected arguments: \$*" >&2
+    exit 24
+    ;;
+esac
 EOF
-cat > "$managed_bin/npm" <<'EOF'
-#!/usr/bin/bash
-printf '11.6.0\n'
+chmod 0755 "$node_bin/node"
+cat > "$npm_cli" <<'EOF'
+#!/usr/bin/env node
+console.log('11.6.0');
 EOF
-cat > "$managed_bin/codex" <<EOF
-#!/usr/bin/bash
-printf 'codex-cli %s\\n' '$CODEX_VERSION'
+cat > "$codex_js" <<EOF
+#!/usr/bin/env node
+console.log('codex-cli $CODEX_VERSION');
 EOF
-cat > "$managed_bin/claude" <<EOF
+chmod 0755 "$npm_cli" "$codex_js"
+/usr/bin/ln -s -- "$npm_cli" "$node_bin/npm"
+/usr/bin/ln -s -- "$codex_js" "$node_bin/codex"
+cat > "$node_bin/claude" <<EOF
 #!/usr/bin/bash
 printf '%s\\n' '$CLAUDE_VERSION'
 EOF
-cat > "$managed_bin/bun" <<EOF
+cat > "$node_bin/bun" <<EOF
 #!/usr/bin/bash
 printf '%s\\n' '$BUN_VERSION'
 EOF
+chmod 0755 "$node_bin/claude" "$node_bin/bun"
+for node_tool in node npm codex claude bun; do
+  /usr/bin/ln -s -- "$node_bin/$node_tool" "$managed_bin/$node_tool"
+done
 cat > "$managed_bin/herdr" <<EOF
 #!/usr/bin/bash
 printf 'herdr %s\\n' '$HERDR_VERSION'
 EOF
-chmod 0755 "$managed_bin"/*
+chmod 0755 \
+  "$managed_bin/uv" "$managed_bin/python3.13" "$managed_bin/py" \
+  "$managed_bin/rustup" "$managed_bin/rustc" "$managed_bin/herdr"
 for managed_stub in cargo; do
   printf '#!/usr/bin/bash\nexit 0\n' > "$managed_bin/$managed_stub"
   chmod 0755 "$managed_bin/$managed_stub"
@@ -152,12 +191,6 @@ cat > "$fixture_home/.cargo/bin/rtk" <<EOF
 printf 'rtk %s\\n' '$RTK_VERSION'
 EOF
 chmod 0755 "$fixture_home/.cargo/bin/rtk"
-node_bin="$fixture_home/.local/lib/node-v${NODE_VERSION}-linux-x64/bin"
-mkdir -p "$node_bin"
-for node_tool in node npm codex claude bun; do
-  /usr/bin/mv "$managed_bin/$node_tool" "$node_bin/$node_tool"
-  /usr/bin/ln -s "$node_bin/$node_tool" "$managed_bin/$node_tool"
-done
 
 # Make the fixture's verify entrypoint use only the disposable host-command
 # seam. This override is committed into the fixture transport before the
@@ -269,10 +302,36 @@ grep -Fq 'Ubuntu bootstrap verification passed.' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture did not complete.' >&2; exit 1; }
 grep -Fq 'PASS login PATH includes' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture did not exercise login PATH checks.' >&2; exit 1; }
+grep -Fq 'PASS receipt npm=11.6.0' "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost npm receipt parity.' >&2; exit 1; }
+grep -Fq "PASS receipt codex=codex-cli $CODEX_VERSION" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost Codex receipt parity.' >&2; exit 1; }
+grep -Fxq 'pinned-node-executed-npm' "$pinned_node_marker" ||
+  { cat "$verify_output" >&2; echo 'Pinned Node did not execute npm-cli.js.' >&2; exit 1; }
+grep -Fxq 'pinned-node-executed-codex' "$pinned_node_marker" ||
+  { cat "$verify_output" >&2; echo 'Pinned Node did not execute codex.js.' >&2; exit 1; }
 while IFS= read -r login_path; do
   [[ "$login_path" == '/usr/bin:/bin' ]] ||
     { echo "Verifier passed an unsanitized login PATH: $login_path" >&2; exit 1; }
 done < "$fixture_home/.login-shell-input-paths"
+
+expect_ambient_shebang_failure() {
+  local name="$1"
+  local output="$test_root/ambient-$name-output"
+  local status
+  set +e
+  /usr/bin/env -i HOME="$fixture_home" PATH="$fixture_system_bin" \
+    "$managed_bin/$name" --version > "$output" 2>&1
+  status=$?
+  set -e
+  (( status == 127 )) || {
+    cat "$output" >&2
+    echo "Ambient $name shebang returned $status instead of 127." >&2
+    exit 1
+  }
+}
+expect_ambient_shebang_failure npm
+expect_ambient_shebang_failure codex
 
 # A post-provisioning local checkout mutation, including code before line 10,
 # must not alter the staged verify bytes selected by the launcher.

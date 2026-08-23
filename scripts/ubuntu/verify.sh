@@ -226,6 +226,23 @@ verify_resolve_command() {
   return 1
 }
 
+verify_run_command() {
+  local name="$1"
+  local command_path="$2"
+  shift 2
+  case "$name" in
+    npm|codex)
+      local node_path
+      node_path="$(verify_resolve_command node 2>/dev/null || true)"
+      [[ -n "$node_path" ]] || return 1
+      "$node_path" "$command_path" "$@"
+      ;;
+    *)
+      "$command_path" "$@"
+      ;;
+  esac
+}
+
 verify_main() {
 verify_validate_git_layout || { echo 'Verification repository metadata is not stable or owner-bound.' >&2; exit 24; }
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
@@ -293,7 +310,7 @@ check_exact_version() {
   local actual
   local command_path
   if ! command_path="$(verify_resolve_command "$name" 2>/dev/null)"; then return; fi
-  if actual="$("$command_path" --version 2>&1)" && [[ "$actual" == "$expected" ]]; then
+  if actual="$(verify_run_command "$name" "$command_path" --version 2>&1)" && [[ "$actual" == "$expected" ]]; then
     printf 'PASS exact version %-10s %s\n' "$name" "$actual"
   else
     printf 'FAIL exact version %-10s expected %s (got %s)\n' "$name" "$expected" "${actual:-unavailable}"
@@ -400,7 +417,7 @@ record_receipt_command() {
     receipt_failures=$((receipt_failures + 1))
     return 1
   fi
-  if ! output="$("$command_path" "$@" 2>&1)"; then
+  if ! output="$(verify_run_command "$command_name" "$command_path" "$@" 2>&1)"; then
     echo "FAIL receipt runtime probe $key"
     receipt_failures=$((receipt_failures + 1))
     return 1
@@ -426,7 +443,7 @@ record_receipt_first_line() {
     receipt_failures=$((receipt_failures + 1))
     return 1
   fi
-  if ! output="$("$command_path" "$@" 2>&1)"; then
+  if ! output="$(verify_run_command "$command_name" "$command_path" "$@" 2>&1)"; then
     echo "FAIL receipt runtime probe $key"
     receipt_failures=$((receipt_failures + 1))
     return 1
@@ -676,7 +693,7 @@ fi
 printf 'Versions:\n'
 for version_command in rtk codex claude herdr; do
   if version_path="$(verify_resolve_command "$version_command" 2>/dev/null)"; then
-    "$version_path" --version 2>/dev/null || true
+    verify_run_command "$version_command" "$version_path" --version 2>/dev/null || true
   fi
 done
 if version_path="$(verify_resolve_command git 2>/dev/null)"; then
