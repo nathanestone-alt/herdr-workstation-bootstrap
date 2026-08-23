@@ -75,10 +75,13 @@ Fixture tests redirect the three production paths below into a sealed
 temporary root; production provisioning never does so.
 
 The receipt authority entrypoint remains root-scoped so it can publish its
-root-owned receipt. The launcher drops to the selected runtime user for
-`bootstrap` and `verify`, while Python probes in receipt authority use the
-explicit root-to-user `setpriv` boundary. No signing-key or signing-service
-infrastructure is required.
+root-owned receipt. The `bootstrap` entrypoint stays in the root provisioning
+transaction for base packages, services, and receipt publication; its
+user-owned tools work runs in an explicit `setpriv --no-new-privs` child and
+the tools manifest is finalized there. The launcher drops directly to the
+selected runtime user with `--no-new-privs` for `verify`, while Python probes
+in receipt authority use the same explicit root-to-user boundary. No
+signing-key or signing-service infrastructure is required.
 
 ## Invocation
 

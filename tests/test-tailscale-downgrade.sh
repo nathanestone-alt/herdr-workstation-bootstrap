@@ -99,7 +99,11 @@ EOF
     -e "s|== /usr/bin/apt-get|== $trusted_apt|g" \
     -e "s|== 0:0:\\*|== $(/usr/bin/id -u):$(/usr/bin/id -g):*|g" \
     "$source_root/scripts/ubuntu/bootstrap.sh"
-  /usr/bin/head -n -9 "$source_root/scripts/ubuntu/bootstrap.sh" > "$source_root/scripts/ubuntu/bootstrap.sh.tmp"
+  dispatch_sentinel='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
+  /usr/bin/awk -v sentinel="$dispatch_sentinel" '
+    $0 == sentinel { exit }
+    { print }
+  ' "$source_root/scripts/ubuntu/bootstrap.sh" > "$source_root/scripts/ubuntu/bootstrap.sh.tmp"
   /usr/bin/mv -T "$source_root/scripts/ubuntu/bootstrap.sh.tmp" "$source_root/scripts/ubuntu/bootstrap.sh"
   cat >> "$source_root/scripts/ubuntu/bootstrap.sh" <<EOF
 fixture_tailscale_main() {

@@ -161,8 +161,8 @@ policy_lifetime; assert_dir "$stage_dir" 755; assert_file "$entry_path" 755
 if [[ -n $launcher_fixture_home ]]; then
   home=$launcher_fixture_home
 else
-  uid="$($launcher_id_bin -u)"
-  home="$($launcher_getent_bin passwd "$uid" | $launcher_awk_bin -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
+  home="$($launcher_getent_bin passwd "$launcher_runtime_uid" |
+    $launcher_awk_bin -F: 'NF >= 6 { print $6; found++ } END { exit(found == 1 ? 0 : 1) }' || true)"
 fi
 [[ $home == /* && $home != / && "$launcher_runtime_uid" =~ ^[0-9]+$ && "$launcher_runtime_gid" =~ ^[0-9]+$ ]] || fail 'no safe runtime user home or identity'
 parent_capability_kind=installed-launcher
@@ -220,7 +220,17 @@ if [[ -n "$launcher_fixture_receipt_pause_phase" ]]; then
     HERDR_RECEIPT_TEST_CONTINUE_FILE="$launcher_fixture_receipt_pause_continue"
   )
 fi
-if [[ "$entrypoint" == scripts/ubuntu/receipt-authority.sh || "$launcher_runtime_uid" == "$launcher_expected_uid" ]]; then
+if [[ "$entrypoint" == scripts/ubuntu/bootstrap.sh ]]; then
+  # Base/tools are a root provisioning transaction.  The attested bootstrap
+  # drops its user-owned work into an explicit no-new-privileges child; the
+  # launcher must not first drop to that user and then ask sudo to regain root.
+  launcher_env_args+=(
+    HERDR_BOOTSTRAP_RUNTIME_UID="$launcher_runtime_uid"
+    HERDR_BOOTSTRAP_RUNTIME_GID="$launcher_runtime_gid"
+    HERDR_BOOTSTRAP_RUNTIME_HOME="$home"
+  )
+  "$launcher_env_bin" -i "${launcher_env_args[@]}" "$launcher_bash_bin" "$entry_path" "$@"
+elif [[ "$entrypoint" == scripts/ubuntu/receipt-authority.sh || "$launcher_runtime_uid" == "$launcher_expected_uid" ]]; then
   "$launcher_env_bin" -i "${launcher_env_args[@]}" "$launcher_bash_bin" "$entry_path" "$@"
 else
   "$launcher_env_bin" -i "${launcher_env_args[@]}" "$launcher_setpriv_bin" \

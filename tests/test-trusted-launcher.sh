@@ -41,6 +41,22 @@ printf '%s\n' "$launcher_capability_parent_capability_kind" > "$HOME/parent-capa
 /usr/bin/stat -Lc '%u:%g:%a:%F' -- /proc/$BASHPID/fd/12 > "$HOME/parent-capability-stat"
 /usr/bin/readlink -- /proc/$BASHPID/fd/12 > "$HOME/parent-capability-link"
 EOF
+  cat > "$source_root/scripts/ubuntu/verify.sh" <<'EOF'
+#!/usr/bin/bash
+set -euo pipefail
+entry_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
+repo_path="$(/usr/bin/realpath -e -- "${entry_path%/*}/../..")"
+source "$repo_path/scripts/ubuntu/launcher-capability.sh" verify
+launcher_capability_lifetime
+: > "$HOME/verify-entrypoint-reached"
+printf '%s\n' "$(/usr/bin/id -u)" > "$HOME/verify-runtime-uid"
+printf '%s\n' "$(/usr/bin/id -g)" > "$HOME/verify-runtime-gid"
+/usr/bin/id -G > "$HOME/verify-runtime-groups"
+/usr/bin/awk '/^NoNewPrivs:/ { print $2; found++ } END { exit(found == 1 ? 0 : 1) }' /proc/self/status > "$HOME/verify-runtime-no-new-privs"
+printf '%s\n' "$launcher_capability_parent_capability_kind" > "$HOME/verify-parent-capability-kind"
+/usr/bin/stat -Lc '%u:%g:%a:%F' -- /proc/$BASHPID/fd/12 > "$HOME/verify-parent-capability-stat"
+/usr/bin/readlink -- /proc/$BASHPID/fd/12 > "$HOME/verify-parent-capability-link"
+EOF
   chmod 0755 "$source_root/scripts/ubuntu/"*.sh
   git -C "$source_root" init -q
   git -C "$source_root" config user.email fixture@example.invalid
@@ -90,7 +106,10 @@ stage_root="$fixture_root/var/lib/herdr-workstation/bootstrap/staging"
 
 run_launcher() {
   local cwd="${1:-$test_root}"
-  (cd "$cwd" && PATH="$test_root/hostile-bin:${PATH:-/usr/bin:/bin}" "$launcher")
+  local entrypoint="${2:-bootstrap}"
+  shift 2 || true
+  (cd "$cwd" && PATH="$test_root/hostile-bin:${PATH:-/usr/bin:/bin}" \
+    "$launcher" --entrypoint "$entrypoint" -- "$@")
 }
 
 make_fixture clean
@@ -555,18 +574,18 @@ else
   else
     make_fixture root-drop none "$root_drop_uid" "$root_drop_gid"
     set +e
-    run_launcher "$test_root"
+    run_launcher "$test_root" verify
     root_drop_status=$?
     set -e
     (( root_drop_status == 0 )) || fail_test "root-gated launcher fixture failed with status $root_drop_status"
-    [[ "$(< "$fixture_home/runtime-uid")" == "$root_drop_uid" ]] || fail_test 'launcher did not drop to the fixture uid'
-    [[ "$(< "$fixture_home/runtime-gid")" == "$root_drop_gid" ]] || fail_test 'launcher did not set the fixture gid'
-    [[ "$(tr -d '[:space:]' < "$fixture_home/runtime-groups")" == "$root_drop_gid" ]] || fail_test 'launcher did not clear supplementary groups'
-    [[ "$(< "$fixture_home/runtime-no-new-privs")" == 1 ]] || fail_test 'launcher did not set no_new_privs'
+    [[ "$(< "$fixture_home/verify-runtime-uid")" == "$root_drop_uid" ]] || fail_test 'launcher did not drop the verify entrypoint to the fixture uid'
+    [[ "$(< "$fixture_home/verify-runtime-gid")" == "$root_drop_gid" ]] || fail_test 'launcher did not set the verify fixture gid'
+    [[ "$(tr -d '[:space:]' < "$fixture_home/verify-runtime-groups")" == "$root_drop_gid" ]] || fail_test 'launcher did not clear supplementary groups for verify'
+    [[ "$(< "$fixture_home/verify-runtime-no-new-privs")" == 1 ]] || fail_test 'launcher did not set no_new_privs for verify'
     [[ "$root_drop_uid" != "$(id -u)" ]] || fail_test 'root-drop fixture did not cross a uid boundary'
-    [[ "$(< "$fixture_home/parent-capability-kind")" == installed-launcher ]] || fail_test 'root-drop fixture used the wrong parent capability role'
-    [[ "$(< "$fixture_home/parent-capability-stat")" == '0:0:600:regular file' ]] || fail_test 'root-drop fixture parent capability owner/mode/type is wrong'
-    [[ "$(< "$fixture_home/parent-capability-link")" == *' (deleted)' ]] || fail_test 'root-drop fixture parent capability was not unlinked'
+    [[ "$(< "$fixture_home/verify-parent-capability-kind")" == installed-launcher ]] || fail_test 'root-drop verify fixture used the wrong parent capability role'
+    [[ "$(< "$fixture_home/verify-parent-capability-stat")" == '0:0:600:regular file' ]] || fail_test 'root-drop verify parent capability owner/mode/type is wrong'
+    [[ "$(< "$fixture_home/verify-parent-capability-link")" == *' (deleted)' ]] || fail_test 'root-drop verify parent capability was not unlinked'
     [[ "$(stat -c '%u:%g:%a' "$launcher")" == 0:0:755 ]] || fail_test 'root-gated launcher binary is not root-owned'
     [[ "$(stat -c '%u:%g:%a' "$policy")" == 0:0:600 ]] || fail_test 'root-gated policy is not root-owned and private'
     [[ "$(stat -c '%u:%g:%a' "$stage_root")" == 0:0:755 ]] || fail_test 'root-gated staging root is not root-owned'

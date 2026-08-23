@@ -18,7 +18,11 @@ cp -a -- "$repo_root/." "$source_fixture/"
 chmod 0755 "$source_fixture"
 /usr/bin/rm -rf -- "$source_fixture/.agents" "$source_fixture/.codex"
 rm -rf -- "$source_fixture/.git"
-head -n -9 "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
+dispatch_sentinel='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
+/usr/bin/awk -v sentinel="$dispatch_sentinel" '
+  $0 == sentinel { exit }
+  { print }
+' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
 mv -T "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
 cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
 fixture_set_home() {

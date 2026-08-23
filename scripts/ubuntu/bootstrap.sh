@@ -19,9 +19,12 @@ readonly bootstrap_awk_bin='/usr/bin/gawk'
 readonly bootstrap_cp_bin='/usr/bin/cp'
 readonly bootstrap_rm_bin='/usr/bin/rm'
 readonly bootstrap_mkdir_bin='/usr/bin/mkdir'
+readonly bootstrap_chown_bin='/usr/bin/chown'
 readonly bootstrap_head_bin='/usr/bin/head'
 readonly bootstrap_getent_bin='/usr/bin/getent'
 readonly bootstrap_id_bin='/usr/bin/id'
+readonly bootstrap_bash_bin='/usr/bin/bash'
+readonly bootstrap_setpriv_bin='/usr/bin/setpriv'
 readonly bootstrap_powershell_canonical_path='/opt/microsoft/powershell/7/pwsh'
 readonly bootstrap_powershell_fallback_path='/usr/bin/pwsh'
 
@@ -147,7 +150,8 @@ for bootstrap_trusted_binary in \
   "$bootstrap_dirname_bin" "$bootstrap_find_bin" "$bootstrap_mktemp_bin" \
   "$bootstrap_chmod_bin" "$bootstrap_stat_bin" "$bootstrap_sha256_bin" \
   "$bootstrap_awk_bin" "$bootstrap_cp_bin" "$bootstrap_rm_bin" "$bootstrap_mkdir_bin" \
-  "$bootstrap_head_bin" "$bootstrap_getent_bin" "$bootstrap_id_bin"; do
+  "$bootstrap_chown_bin" "$bootstrap_head_bin" "$bootstrap_getent_bin" "$bootstrap_id_bin" \
+  "$bootstrap_bash_bin" "$bootstrap_setpriv_bin"; do
   bootstrap_trust_assert_binary "$bootstrap_trusted_binary"
 done
 
@@ -222,6 +226,46 @@ bootstrap_exec_system() {
     LC_ALL=C \
     TZ=UTC \
     "${bootstrap_exec_args[@]}"
+}
+
+bootstrap_exec_privileged() {
+  local sudo_bin="$1"
+  shift
+  if [[ "${bootstrap_root_mode:-0}" == 1 ]]; then
+    bootstrap_exec_system "$@"
+  else
+    bootstrap_exec_system "$sudo_bin" "$@"
+  fi
+}
+
+bootstrap_run_as_runtime_phase() {
+  local runtime_phase="$1"
+  [[ "${bootstrap_root_mode:-0}" == 1 ]] || {
+    echo "Root bootstrap orchestration is required for runtime phase '$runtime_phase'." >&2
+    return 24
+  }
+  bootstrap_exec_system \
+    HOME="$bootstrap_runtime_home" \
+    "$bootstrap_setpriv_bin" \
+    --reuid="$bootstrap_runtime_uid" --regid="$bootstrap_runtime_gid" \
+    --clear-groups --no-new-privs \
+    "$bootstrap_bash_bin" "$bootstrap_script_path" --phase "$runtime_phase"
+}
+
+bootstrap_prepare_runtime_directories() {
+  local path
+  [[ "${bootstrap_root_mode:-0}" == 1 ]] || return 0
+  for path in "$HOME/.local" "$HOME/.local/state" "$state_dir" "$bin_dir"; do
+    [[ -d "$path" && ! -L "$path" ]] || {
+      echo "Runtime managed directory is not a real directory: $path" >&2
+      return 24
+    }
+    "$bootstrap_chown_bin" --no-dereference "$bootstrap_runtime_uid:$bootstrap_runtime_gid" -- "$path"
+    [[ "$(/usr/bin/stat -c '%u:%g' -- "$path")" == "$bootstrap_runtime_uid:$bootstrap_runtime_gid" ]] || {
+      echo "Runtime managed directory ownership changed unexpectedly: $path" >&2
+      return 24
+    }
+  done
 }
 
 bootstrap_exec_user_runtime() {
@@ -579,6 +623,26 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+bootstrap_current_uid="$($bootstrap_id_bin -u)"
+bootstrap_current_gid="$($bootstrap_id_bin -g)"
+bootstrap_runtime_uid="${HERDR_BOOTSTRAP_RUNTIME_UID:-$bootstrap_current_uid}"
+bootstrap_runtime_gid="${HERDR_BOOTSTRAP_RUNTIME_GID:-$bootstrap_current_gid}"
+bootstrap_runtime_home="${HERDR_BOOTSTRAP_RUNTIME_HOME:-$HOME}"
+[[ "$bootstrap_current_uid" =~ ^[0-9]+$ && "$bootstrap_current_gid" =~ ^[0-9]+$ &&
+  "$bootstrap_runtime_uid" =~ ^[0-9]+$ && "$bootstrap_runtime_gid" =~ ^[0-9]+$ &&
+  "$bootstrap_runtime_home" == /* && "$bootstrap_runtime_home" != / ]] || {
+    echo 'Bootstrap runtime identity is not canonical.' >&2
+    exit 24
+  }
+[[ "$HOME" == "$bootstrap_runtime_home" ]] || {
+  echo 'Bootstrap HOME does not match the launcher-bound runtime home.' >&2
+  exit 24
+}
+bootstrap_root_mode=0
+if [[ "$bootstrap_current_uid" == 0 && "$bootstrap_runtime_uid" != 0 ]]; then
+  bootstrap_root_mode=1
+fi
 lock_file="$repo_root/config/ubuntu-toolchain.lock"
 state_dir="${HOME}/.local/state/herdr-workstation-bootstrap"
 bin_dir="${HOME}/.local/bin"
@@ -655,9 +719,13 @@ install_receipt_from_snapshots() {
     return 1
   }
   expected_payload_sha="$(attestation_hash_file "$payload_manifest")"
-  sudo_bin="$(bootstrap_command_path sudo)"
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    sudo_bin=''
+  else
+    sudo_bin="$(bootstrap_command_path sudo)"
+  fi
 
-  bootstrap_exec_system /usr/bin/tar -C "$payload_root" -cf - . | bootstrap_exec_system "$sudo_bin" -- /usr/bin/bash -c '
+  bootstrap_exec_system /usr/bin/tar -C "$payload_root" -cf - . | bootstrap_exec_privileged "$sudo_bin" /usr/bin/bash -c '
     set -euo pipefail
     expected_payload_sha="$1"
     expected_source_helper_sha="$2"
@@ -814,8 +882,8 @@ validate_user_home() {
     echo 'Could not resolve the real user home.' >&2
     return 1
   }
-  [[ "$(/usr/bin/stat -c '%u' -- "$home_real" 2>/dev/null || true)" == "$(/usr/bin/id -u)" ]] || {
-    echo 'The resolved user home is not owned by the current user.' >&2
+  [[ "$(/usr/bin/stat -c '%u:%g' -- "$home_real" 2>/dev/null || true)" == "$bootstrap_runtime_uid:$bootstrap_runtime_gid" ]] || {
+    echo 'The resolved user home is not owned by the selected runtime user.' >&2
     return 1
   }
 }
@@ -1389,7 +1457,11 @@ install_locked_tailscale() (
 
   validate_toolchain_lock || exit 22
   tailscale_bin="$(bootstrap_command_path tailscale)"
-  sudo_bin="$(bootstrap_command_path sudo)"
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    sudo_bin=''
+  else
+    sudo_bin="$(bootstrap_command_path sudo)"
+  fi
   shell_bin='/usr/bin/dash'
   bootstrap_trust_assert_binary "$shell_bin"
   apt_get_bin="$(bootstrap_command_path apt-get)"
@@ -1404,8 +1476,8 @@ install_locked_tailscale() (
   bootstrap_validate_tailscale_apt_identity "$real_apt_get"
 
   download_verified "$TAILSCALE_INSTALLER_URL" "$TAILSCALE_INSTALLER_SHA256" "$installer"
-  root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-tailscale-root.XXXXXX)"
-  if bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
+  root_stage_dir="$(bootstrap_exec_privileged "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-tailscale-root.XXXXXX)"
+  if bootstrap_exec_privileged "$sudo_bin" /usr/bin/bash -s -- \
     "$installer" "$root_stage_dir" "$TAILSCALE_INSTALLER_SHA256" "$TAILSCALE_VERSION" <<'HERDR_TAILSCALE_ROOT'
 set -euo pipefail
 installer_path="$1"
@@ -1497,8 +1569,8 @@ bootstrap_install_locked_deb() {
   local sudo_bin="$3"
   local apt_get_bin="$4"
   local root_stage_dir
-  root_stage_dir="$(bootstrap_exec_system "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-deb-root.XXXXXX)"
-  bootstrap_exec_system "$sudo_bin" /usr/bin/bash -s -- \
+  root_stage_dir="$(bootstrap_exec_privileged "$sudo_bin" /usr/bin/mktemp -d /tmp/herdr-deb-root.XXXXXX)"
+  bootstrap_exec_privileged "$sudo_bin" /usr/bin/bash -s -- \
     "$package_path" "$root_stage_dir" "$expected_sha" "$apt_get_bin" <<'HERDR_DEB_ROOT'
 set -euo pipefail
 package_path="$1"
@@ -1793,12 +1865,37 @@ converge_profile_hook() {
   [[ -z "$replacement" ]] || rm -f "$replacement"
 }
 
+install_base_user() {
+  local state_fd
+  local bin_fd
+  local state_anchor
+  validate_managed_paths "$state_dir" "$state_dir/base-complete" "$bin_dir" || {
+    echo 'Managed bootstrap paths are unsafe.' >&2
+    exit 24
+  }
+  fence_open_directory "$state_dir" state_fd
+  fence_open_directory "$bin_dir" bin_fd
+  state_anchor="/proc/self/fd/$state_fd"
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'base bin directory'
+  bootstrap_test_pause before-base-directory-mutations
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  : > "$state_anchor/base-complete"
+  fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  close_fence_fd "$state_fd"
+  close_fence_fd "$bin_fd"
+}
+
 install_base() {
   local state_fd
   local bin_fd
   local state_anchor
   local sudo_bin apt_get_bin ps_bin pwsh_bin systemctl_bin
-  sudo_bin="$(bootstrap_command_path sudo)"
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    sudo_bin=''
+  else
+    sudo_bin="$(bootstrap_command_path sudo)"
+  fi
   apt_get_bin="$(bootstrap_command_path apt-get)"
   ps_bin="$(bootstrap_command_path ps)"
   pwsh_bin="$(bootstrap_command_path pwsh)"
@@ -1814,8 +1911,8 @@ install_base() {
   fence_require_directory "$state_dir" "$state_fd" 'base state directory'
   fence_require_directory "$bin_dir" "$bin_fd" 'base bin directory'
   bootstrap_test_pause before-base-directory-mutations
-  "$sudo_bin" "$apt_get_bin" update
-  "$sudo_bin" DEBIAN_FRONTEND=noninteractive "$apt_get_bin" install -y \
+  bootstrap_exec_privileged "$sudo_bin" "$apt_get_bin" update
+  bootstrap_exec_privileged "$sudo_bin" DEBIAN_FRONTEND=noninteractive "$apt_get_bin" install -y \
     apt-transport-https build-essential ca-certificates cifs-utils curl gawk git git-lfs gh gnupg jq mosh \
     openssh-client openssh-server pkg-config ripgrep rsync unzip zip
   PATH='/usr/sbin:/usr/bin:/sbin:/bin' /usr/bin/git lfs install
@@ -1837,17 +1934,24 @@ install_base() {
     echo 'PowerShell version does not match lock.' >&2; exit 24;
   }
 
-  "$sudo_bin" "$systemctl_bin" enable --now ssh
+  bootstrap_exec_privileged "$sudo_bin" "$systemctl_bin" enable --now ssh
   install_locked_tailscale
-  "$sudo_bin" "$systemctl_bin" enable --now tailscaled
+  bootstrap_exec_privileged "$sudo_bin" "$systemctl_bin" enable --now tailscaled
   fence_require_directory "$state_dir" "$state_fd" 'base state directory'
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    bootstrap_prepare_runtime_directories
+    close_fence_fd "$state_fd"
+    close_fence_fd "$bin_fd"
+    bootstrap_run_as_runtime_phase base-user
+    return
+  fi
   : > "$state_anchor/base-complete"
   fence_require_directory "$state_dir" "$state_fd" 'base state directory'
   close_fence_fd "$state_fd"
   close_fence_fd "$bin_fd"
 }
 
-install_tools() {
+install_tools_transaction() {
   local state_fd
   local bin_fd
   local state_anchor
@@ -2018,6 +2122,15 @@ install_tools() {
   [[ "$("$node_anchor/bin/bun" --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
   [[ "$("$bin_dir/herdr" --version | /usr/bin/gawk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
 
+  if [[ "${bootstrap_tools_prepare_only:-0}" == 1 ]]; then
+    close_fence_fd "$state_fd"
+    close_fence_fd "$bin_fd"
+    close_fence_fd "$profile_dir_fd"
+    close_fence_fd "$node_fd"
+    close_fence_fd "$code_fd"
+    return
+  fi
+
   install_receipt_from_snapshots
 
   manifest="$state_dir/toolchain-manifest.txt"
@@ -2090,12 +2203,125 @@ install_tools() {
   echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
 }
 
+install_tools_finalize() {
+  local state_fd
+  local bin_fd
+  local state_anchor
+  local node_fd
+  local node_anchor
+  local code_fd
+  local manifest_tmp
+  local manifest
+  local receipt_authority_manifest_path
+  profile_dir="$HOME/.config/herdr-workstation"
+  node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
+  validate_toolchain_lock || exit 22
+  validate_cargo_roots || exit 24
+  validate_managed_paths \
+    "$state_dir" "$state_dir/base-complete" "$state_dir/toolchain-manifest.txt" \
+    "$bin_dir" "$profile_dir" "$profile_dir/profile.sh" "$node_dir" "$node_dir/bin" \
+    "$HOME/.cargo" "$HOME/.cargo/bin" "$HOME/.cargo/bin/rtk" \
+    "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" || {
+      echo 'Managed bootstrap paths are unsafe.' >&2
+      exit 24
+    }
+  fence_open_directory "$state_dir" state_fd
+  fence_open_directory "$bin_dir" bin_fd
+  fence_open_directory "$node_dir" node_fd
+  fence_open_directory "$HOME/code" code_fd
+  state_anchor="/proc/self/fd/$state_fd"
+  node_anchor="/proc/self/fd/$node_fd"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  fence_require_directory "$bin_dir" "$bin_fd" 'tools bin directory'
+  fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+
+  manifest="$state_dir/toolchain-manifest.txt"
+  receipt_authority_manifest_path="$(bootstrap_receipt_authority_path)"
+  [[ "$receipt_authority_manifest_path" == /* && -f "$receipt_authority_manifest_path" &&
+    ! -L "$receipt_authority_manifest_path" ]] || {
+      echo "Receipt authority handoff is missing its published authority: $receipt_authority_manifest_path" >&2
+      exit 24
+    }
+  manifest_tmp="$(mktemp "$state_anchor/.toolchain-manifest.XXXXXX")"
+  bootstrap_register_cleanup "$manifest_tmp"
+  {
+    printf 'receipt_format=%s\n' 'issue-961-toolchain-v2'
+    printf 'lock_sha256=%s\n' "$(/usr/bin/sha256sum "$lock_file" | /usr/bin/gawk '{print $1}')"
+    printf 'host_platform=%s\n' 'linux'
+    printf 'host_architecture=%s\n' "$(/usr/bin/uname -m)"
+    printf 'uv_path=%s\n' "$bin_dir/uv"
+    printf 'python3.13_path=%s\n' "$bin_dir/python3.13"
+    printf 'python3.13_kind=%s\n' 'regular-file'
+    printf 'python3.13_sha256=%s\n' "$(/usr/bin/sha256sum "$bin_dir/python3.13" | /usr/bin/gawk '{print $1}')"
+    printf 'python3.13_pyvenv_cfg=%s\n' "$HOME/.local/pyvenv.cfg"
+    printf 'py_path=%s\n' "$bin_dir/py"
+    printf 'rtk_path=%s\n' "$HOME/.cargo/bin/rtk"
+    printf 'rtk_version=%s\n' "$("$HOME/.cargo/bin/rtk" --version 2>&1)"
+    printf 'rtk_url=%s\n' "$RTK_URL"
+    printf 'rtk_sha256=%s\n' "$RTK_SHA256"
+    printf 'uv_version=%s\n' "$("$bin_dir/uv" --version)"
+    printf 'uv_url=%s\n' "$UV_URL"
+    printf 'uv_sha256=%s\n' "$UV_SHA256"
+    printf 'python3.13_version=%s\n' "$("$bin_dir/python3.13" --version 2>&1)"
+    printf 'py_3.13_version=%s\n' "$("$bin_dir/py" -3.13 --version 2>&1)"
+    printf 'py_3.13_probe=%s\n' "$("$bin_dir/py" -3.13 -c 'import platform, sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}|{sys.platform}")')"
+    printf 'uv_platform=%s\n' "$UV_PLATFORM"
+    printf 'python_version=%s\n' "$PYTHON_VERSION"
+    printf 'python_platform=%s\n' "$PYTHON_PLATFORM"
+    printf 'python_release=%s\n' "$PYTHON_RELEASE"
+    printf 'python_archive=%s\n' "$PYTHON_ARCHIVE"
+    printf 'python_url=%s\n' "$PYTHON_URL"
+    printf 'python_sha256=%s\n' "$PYTHON_SHA256"
+    printf 'tailscale=%s\n' "$("$(bootstrap_command_path tailscale)" version | /usr/bin/head -n 1)"
+    printf 'rustup=%s\n' "$("$HOME/.cargo/bin/rustup" --version | /usr/bin/head -n 1)"
+    printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
+    printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
+    printf 'npm=%s\n' "$("$node_anchor/bin/npm" --version)"
+    printf 'codex=%s\n' "$("$node_anchor/bin/codex" --version)"
+    printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
+    printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
+    printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"
+    printf 'powershell=%s\n' "$("$(bootstrap_command_path pwsh)" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
+    printf 'receipt_authority_path=%s\n' "$receipt_authority_manifest_path"
+    printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum -- "$receipt_authority_manifest_path" | /usr/bin/gawk '{print $1}')"
+    bootstrap_query_apt_manifest
+  } > "$manifest_tmp"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  mv -T -- "$manifest_tmp" "$state_anchor/toolchain-manifest.txt"
+  manifest_tmp=''
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  fence_require_directory "$HOME/code" "$code_fd" 'code directory'
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  : > "$state_anchor/tools-complete"
+  fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
+  close_fence_fd "$state_fd"
+  close_fence_fd "$bin_fd"
+  close_fence_fd "$node_fd"
+  close_fence_fd "$code_fd"
+  echo "Tool installation complete. Resolved manifest: $manifest"
+  echo "The tools are available immediately through $bin_dir. The managed .profile hook, plus any pre-existing .bash_profile or .bash_login chain, makes them available in new Bash login shells."
+  echo 'Authentication, Tailscale login, SMB credentials, and Herdr integration validation remain manual.'
+}
+
+install_tools() {
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    bootstrap_run_as_runtime_phase tools-prepare
+    install_receipt_from_snapshots
+    bootstrap_run_as_runtime_phase tools-finalize
+    return
+  fi
+  install_tools_transaction
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "$phase" in
     base) install_base ;;
     validate-lock) validate_toolchain_lock; echo 'Ubuntu toolchain lock validation passed.' ;;
     tools) install_tools ;;
     all) install_base; install_tools ;;
+    base-user) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'base-user is runtime-only.' >&2; exit 24; }; install_base_user ;;
+    tools-prepare) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-prepare is runtime-only.' >&2; exit 24; }; bootstrap_tools_prepare_only=1; install_tools_transaction ;;
+    tools-finalize) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-finalize is runtime-only.' >&2; exit 24; }; install_tools_finalize ;;
     *) echo "Unsupported phase: $phase" >&2; exit 2 ;;
   esac
 fi
