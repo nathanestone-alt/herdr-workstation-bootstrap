@@ -789,7 +789,7 @@ else
   expect_failure_diagnostic unsigned-payload-manifest-hash \
     'receipt authority trust prelude: payload manifest requires a mandatory external SHA-256 binding' \
     run_payload_authority --check "$payload_probe" '' "$payload_probe_commit"
-  run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$payload_probe_commit"
+  run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" production
   [[ "$(/usr/bin/jq -r '.source_commit_sha' "$production_receipt_path")" == "$source_commit" ]] || {
     echo 'Root payload receipt transaction did not hand off the approved source commit.' >&2
     exit 1
