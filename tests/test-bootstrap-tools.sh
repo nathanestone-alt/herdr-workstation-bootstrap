@@ -16,6 +16,16 @@ official_rtk_version="$RTK_VERSION"
 official_rtk_url="$RTK_URL"
 official_rtk_sha256="$RTK_SHA256"
 
+assert_fixture_rewrite() {
+  local fixture_file="$1"
+  local expected_text="$2"
+  local label="$3"
+  /usr/bin/grep -Fq -- "$expected_text" "$fixture_file" || {
+    echo "Fixture rewrite did not apply: $label" >&2
+    exit 1
+  }
+}
+
 root_tools_mode=0
 root_tools_uid=''
 root_tools_gid=''
@@ -27,6 +37,8 @@ if [[ "$(/usr/bin/id -u)" == 0 ]]; then
   else
     echo 'SKIP: root trusted-launcher tools handoff fixture (nobody account unavailable).' >&2
   fi
+else
+  echo 'SKIP: root trusted-launcher tools handoff fixture (not running as root).' >&2
 fi
 
 source_fixture="$test_root/source"
@@ -80,12 +92,108 @@ read -r dispatch_candidate_count dispatch_sentinel_count <<< "$dispatch_counts"
 ' "$source_fixture/scripts/ubuntu/bootstrap.sh" > "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp"
 mv -T -- "$source_fixture/scripts/ubuntu/bootstrap.sh.tmp" "$source_fixture/scripts/ubuntu/bootstrap.sh"
 if [[ "$root_tools_mode" == 1 ]]; then
+  # Keep the root regression isolated from live /etc and /usr/local. The
+  # fixture-root rewrite intentionally does not exercise production's complete
+  # /etc-to-/ ancestry; this is an accepted fixture relaxation, while the
+  # actual production root handoff remains covered by the root invocation.
   /usr/bin/sed -i \
     -e "s|/etc/herdr-workstation/bootstrap-policy.conf|$fixture_root/etc/herdr-workstation/bootstrap-policy.conf|g" \
     -e "s|for policy_component in /etc /etc/herdr-workstation; do|for policy_component in \"$fixture_root/etc\" \"$fixture_root/etc/herdr-workstation\"; do|g" \
     -e "s|/usr/local/libexec/herdr-workstation-bootstrap|$fixture_root/usr/local/libexec/herdr-workstation-bootstrap|g" \
     "$source_fixture/scripts/ubuntu/bootstrap.sh"
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/bootstrap.sh" \
+    "$fixture_root/etc/herdr-workstation/bootstrap-policy.conf" \
+    'bootstrap policy path'
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/bootstrap.sh" \
+    "for policy_component in \"$fixture_root/etc\" \"$fixture_root/etc/herdr-workstation\"; do" \
+    'bootstrap policy component ancestry'
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/bootstrap.sh" \
+    "$fixture_root/usr/local/libexec/herdr-workstation-bootstrap" \
+    'trusted launcher path'
 fi
+
+assert_payload_delivery() {
+  local payload_source="$1"
+  local functions_file="$test_root/receipt-payload-functions.sh"
+  local expected_payload="$test_root/receipt-payload.expected"
+  local harness="$test_root/receipt-payload-harness.sh"
+  local captured_payload="$test_root/receipt-payload.captured"
+  /usr/bin/awk \
+    -v start='bootstrap_receipt_root_payload() {' \
+    -v end='# END bootstrap_receipt_root_payload' '
+      $0 == start { capture=1 }
+      capture { print }
+      capture && $0 == end { closed=1; exit }
+      END { exit(capture && closed ? 0 : 1) }
+    ' "$payload_source" > "$functions_file" || {
+      echo 'Receipt payload producer function was not found.' >&2
+      exit 1
+    }
+  /usr/bin/awk \
+    -v start='bootstrap_exec_privileged_payload() {' \
+    -v end='# END bootstrap_exec_privileged_payload' '
+      $0 == start { capture=1 }
+      capture { print }
+      capture && $0 == end { closed=1; exit }
+      END { exit(capture && closed ? 0 : 1) }
+    ' "$payload_source" >> "$functions_file" || {
+      echo 'Privileged payload delivery function was not found.' >&2
+      exit 1
+    }
+  /usr/bin/awk \
+    -v start="  /usr/bin/cat <<'HERDR_RECEIPT_ROOT_PAYLOAD'" \
+    -v end='HERDR_RECEIPT_ROOT_PAYLOAD' '
+      $0 == start { capture=1; next }
+      capture && $0 == end { closed=1; exit }
+      capture { print }
+      END { exit(capture && closed ? 0 : 1) }
+    ' "$payload_source" > "$expected_payload" || {
+      echo 'Receipt payload heredoc body was not found.' >&2
+      exit 1
+    }
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    /usr/bin/cat "$functions_file"
+    /usr/bin/cat <<'EOF'
+capture_path="$1"
+expected_path="$2"
+bootstrap_bash_bin=/usr/bin/bash
+bootstrap_exec_privileged() {
+  [[ "$1" == fixture-sudo && "$2" == /usr/bin/bash && "$3" == -c &&
+    "$5" == -- && "$6" == payload-arg-1 && "$7" == payload-arg-2 ]] || {
+    echo 'Privileged payload wrapper altered argv shape.' >&2
+    exit 1
+  }
+  printf '%s' "$4" > "$capture_path"
+}
+payload="$(bootstrap_receipt_root_payload)"
+payload+=$'\n'
+bootstrap_exec_privileged_payload fixture-sudo "$payload" payload-arg-1 payload-arg-2
+cmp -s "$capture_path" "$expected_path" || {
+  echo 'Privileged shell payload is not byte-identical to the heredoc source.' >&2
+  exit 1
+}
+EOF
+  } > "$harness"
+  /usr/bin/chmod 0755 "$harness"
+  /usr/bin/bash "$harness" "$captured_payload" "$expected_payload"
+  for required_fragment in \
+    'found++ } } END' \
+    "while IFS= read -r -d '' full; do" \
+    'if [[ -L "$full" ]]; then' \
+    'actual_mode=' \
+    'actual_digest=' \
+    'done < <(/usr/bin/find -P "$root" -mindepth 1 -print0)' \
+    'for path in "${!payload_sha[@]}"; do'; do
+    /usr/bin/grep -Fq -- "$required_fragment" "$expected_payload" || {
+      echo "Receipt payload is missing required verifier fragment: $required_fragment" >&2
+      exit 1
+    }
+  done
+}
+
+assert_payload_delivery "$source_fixture/scripts/ubuntu/bootstrap.sh"
+
 cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<'EOF'
 fixture_tools_root="${HOME%/home}"
 fixture_tools_home="$HOME"
@@ -162,8 +270,6 @@ fixture_tools_main() {
   export RTK_SHA256
   case "$phase" in
     tools) install_tools ;;
-    tools-prepare) bootstrap_tools_prepare_only=1; install_tools_transaction ;;
-    tools-finalize) install_tools_finalize ;;
     *) echo "Unsupported tools fixture phase: $phase" >&2; return 2 ;;
   esac
   if [[ "$phase" == tools ]]; then
@@ -180,6 +286,12 @@ if [[ "$root_tools_mode" == 1 ]]; then
     -e "s|authority_path='/etc/stmodel/issue-961/receipt-authority.json'|authority_path='$fixture_root/etc/stmodel/issue-961/receipt-authority.json'|" \
     -e "s|receipt_path='/etc/stmodel/issue-961/receipt.json'|receipt_path='$fixture_root/etc/stmodel/issue-961/receipt.json'|" \
     "$source_fixture/scripts/ubuntu/receipt-authority.sh"
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
+    "authority_path='$fixture_root/etc/stmodel/issue-961/receipt-authority.json'" \
+    'receipt authority path'
+  assert_fixture_rewrite "$source_fixture/scripts/ubuntu/receipt-authority.sh" \
+    "receipt_path='$fixture_root/etc/stmodel/issue-961/receipt.json'" \
+    'receipt path'
 fi
 chmod 0755 "$source_fixture/scripts/ubuntu/bootstrap.sh"
 

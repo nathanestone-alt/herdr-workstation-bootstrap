@@ -744,9 +744,160 @@ install_rtk_release() {
   /usr/bin/rm -rf -- "$download_dir"
 }
 
+bootstrap_receipt_root_payload() {
+  /usr/bin/cat <<'HERDR_RECEIPT_ROOT_PAYLOAD'
+set -euo pipefail
+expected_payload_sha="$1"
+expected_source_helper_sha="$2"
+managed_user_home="$3"
+policy_path=/etc/herdr-workstation/bootstrap-policy.conf
+[[ -f "$policy_path" && ! -L "$policy_path" &&
+  "$(/usr/bin/realpath -e -- "$policy_path" 2>/dev/null || true)" == "$policy_path" ]] || exit 24
+for policy_component in /etc /etc/herdr-workstation; do
+  [[ ! -L "$policy_component" && -d "$policy_component" ]] || exit 24
+  [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_component")" == 0:0:755 ]] || exit 24
+done
+[[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_path")" == 0:0:600 ]] || exit 24
+exec 9<"$policy_path"
+policy_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/9)"
+[[ "$policy_identity" =~ ^[0-9]+:[0-9]+:0:0:600:regular[[:space:]]file$ ]] || exit 24
+policy_header_count=0
+policy_origin_count=0
+policy_commit_count=0
+policy_origin=''
+policy_commit=''
+while IFS= read -r policy_line; do
+  case "$policy_line" in
+    herdr-bootstrap-policy-v1) ((policy_header_count += 1)) ;;
+    origin=*)
+      ((policy_origin_count += 1))
+      [[ -z "$policy_origin" ]] || exit 24
+      policy_origin="${policy_line#origin=}"
+      ;;
+    commit=*)
+      ((policy_commit_count += 1))
+      [[ -z "$policy_commit" ]] || exit 24
+      policy_commit="${policy_line#commit=}"
+      ;;
+    *) exit 24 ;;
+  esac
+done < /proc/$BASHPID/fd/9
+[[ "$policy_header_count" == 1 && "$policy_origin_count" == 1 &&
+  "$policy_commit_count" == 1 && "$policy_commit" =~ ^[0-9a-f]{40}$ &&
+  "$policy_origin" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*\.git$ &&
+  "$policy_origin" != *..* && "$policy_origin" != *@* ]] || exit 24
+stage="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-payload.XXXXXX)"
+receipt_parent_capability=''
+cleanup_root_payload() {
+  /usr/bin/rm -rf -- "$stage"
+  [[ -z "$receipt_parent_capability" ]] || /usr/bin/rm -rf -- "$receipt_parent_capability"
+}
+trap cleanup_root_payload EXIT
+/usr/bin/tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions
+/usr/bin/chown -R --no-dereference 0:0 -- "$stage"
+exec 10<"$stage"
+[[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/10)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
+receipt_parent_capability="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-capability.XXXXXX)"
+/usr/bin/chmod 0700 -- "$receipt_parent_capability"
+exec 12<"$receipt_parent_capability"
+[[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/12)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
+/usr/bin/rm -rf -- "$receipt_parent_capability"
+receipt_parent_capability=''
+[[ -f /usr/local/libexec/herdr-workstation-bootstrap &&
+  ! -L /usr/local/libexec/herdr-workstation-bootstrap &&
+  "$(/usr/bin/realpath -e -- /usr/local/libexec/herdr-workstation-bootstrap 2>/dev/null || true)" == /usr/local/libexec/herdr-workstation-bootstrap &&
+  "$(/usr/bin/stat -c '%u:%g:%a' -- /usr/local/libexec/herdr-workstation-bootstrap)" == 0:0:755 ]] || exit 24
+exec 11</usr/local/libexec/herdr-workstation-bootstrap
+[[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/11)" =~ ^[0-9]+:[0-9]+:0:0:755:regular[[:space:]]file$ ]] || exit 24
+[[ -f "$stage/.payload-manifest" && ! -L "$stage/.payload-manifest" ]] || exit 24
+root_verify_payload() {
+  local root="$1" manifest="$2" expected_hash="$3" expected_commit="$4"
+  local line relative full mode digest path actual_mode actual_digest
+  local header_count=0 source_commit
+  [[ "$root" == /* && -d "$root" && ! -L "$root" && "$manifest" == "$root/.payload-manifest" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%u' -- "$root")" == 0 && "$(/usr/bin/stat -c '%a' -- "$root")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$root") & 022)) == 0 ]] || return 1
+  [[ "$(/usr/bin/stat -c '%u' -- "$manifest")" == 0 && "$(/usr/bin/stat -c '%a' -- "$manifest")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$manifest") & 022)) == 0 ]] || return 1
+  [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$(/usr/bin/sha256sum -- "$manifest" | /usr/bin/gawk '{print $1}')" == "$expected_hash" ]] || return 1
+  source_commit="$(/usr/bin/gawk -F= '{ if ($1 == "commit") { print $2; found++ } } END { exit(found == 1 ? 0 : 1) }' "$root/source/.source-attestation" 2>/dev/null || true)"
+  [[ "$source_commit" == "$expected_commit" ]] || return 1
+  declare -A payload_mode=() payload_sha=() payload_dirs=()
+  payload_dirs["."]=1
+  while IFS= read -r line; do
+    if [[ "$line" == herdr-payload-manifest-v1 ]]; then
+      ((header_count += 1))
+      continue
+    fi
+    [[ "${line:0:2}" == "F	" ]] || return 1
+    IFS="$(printf "\\t")" read -r _ mode digest path <<< "$line"
+    [[ "$path" != /* && "$path" != *..* ]] || return 1
+    [[ -n "$path" && "$mode" =~ ^(444|555|644|755)$ && "$digest" =~ ^[0-9a-f]{64}$ && -z "${payload_sha[$path]+x}" ]] || return 1
+    payload_mode["$path"]="$mode"
+    payload_sha["$path"]="$digest"
+    local current='.' component
+    IFS='/' read -r -a components <<< "$path"
+    for component in "${components[@]}"; do
+      [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+      current="$current/$component"
+      current="${current#./}"
+      payload_dirs["$current"]=1
+    done
+  done < "$manifest"
+  [[ "$header_count" == 1 && "${#payload_sha[@]}" -gt 0 ]] || return 1
+  while IFS= read -r -d '' full; do
+    relative="${full#"$root"/}"
+    [[ "$relative" != .payload-manifest ]] || continue
+    [[ "$relative" != /* && "$relative" != *..* ]] || return 1
+    if [[ -L "$full" ]]; then
+      return 1
+    elif [[ -d "$full" ]]; then
+      [[ -n "${payload_dirs[$relative]+x}" ]] || return 1
+    elif [[ -f "$full" ]]; then
+      [[ -n "${payload_sha[$relative]+x}" ]] || return 1
+      actual_mode="$(/usr/bin/stat -c '%a' -- "$full")"
+      [[ "$actual_mode" == "${payload_mode[$relative]}" ]] || return 1
+      actual_digest="$(/usr/bin/sha256sum -- "$full" | /usr/bin/gawk '{print $1}')"
+      [[ "$actual_digest" == "${payload_sha[$relative]}" ]] || return 1
+    else
+      return 1
+    fi
+  done < <(/usr/bin/find -P "$root" -mindepth 1 -print0)
+  for path in "${!payload_sha[@]}"; do
+    full="$root/$path"
+    [[ -f "$full" && ! -L "$full" ]] || return 1
+  done
+}
+root_verify_payload "$stage" "$stage/.payload-manifest" "$expected_payload_sha" "$policy_commit" || exit 24
+[[ "$(/usr/bin/sha256sum -- "$stage/source/scripts/ubuntu/source-attestation.sh" | /usr/bin/gawk '{print $1}')" == "$expected_source_helper_sha" ]] || exit 24
+# The standalone root verifier binds the payload manifest and source
+# commit before the helper is sourced.  The helper then rechecks every
+# extracted file before the authority script is loaded.
+# shellcheck disable=SC1091
+source "$stage/source/scripts/ubuntu/source-attestation.sh"
+attestation_reject_git_environment
+attestation_verify_payload_manifest "$stage" "$stage/.payload-manifest" "$expected_payload_sha"
+/usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
+  --install \
+  --source-root "$stage/source" \
+  --source-manifest "$stage/source/.source-attestation" \
+  --payload-root "$stage" \
+  --payload-manifest "$stage/.payload-manifest" \
+  --payload-manifest-sha256 "$expected_payload_sha" \
+  --source-commit "$policy_commit" \
+  --user-home "$managed_user_home"
+HERDR_RECEIPT_ROOT_PAYLOAD
+}
+# END bootstrap_receipt_root_payload
+
+bootstrap_exec_privileged_payload() {
+  local sudo_bin="$1" payload="$2"
+  shift 2
+  bootstrap_exec_privileged "$sudo_bin" "$bootstrap_bash_bin" -c "$payload" -- "$@"
+}
+# END bootstrap_exec_privileged_payload
+
 install_receipt_from_snapshots() {
   local payload_root payload_manifest expected_payload_sha expected_source_helper_sha
-  local sudo_bin
+  local sudo_bin receipt_root_payload
   payload_root="$(/usr/bin/mktemp -d /tmp/herdr-receipt-payload.XXXXXX)"
   bootstrap_register_cleanup "$payload_root"
   /usr/bin/chmod 0700 -- "$payload_root"
@@ -766,146 +917,11 @@ install_receipt_from_snapshots() {
     sudo_bin="$(bootstrap_command_path sudo)"
   fi
 
-  bootstrap_exec_system /usr/bin/tar -C "$payload_root" -cf - . | bootstrap_exec_privileged "$sudo_bin" /usr/bin/bash -c '
-    set -euo pipefail
-    expected_payload_sha="$1"
-    expected_source_helper_sha="$2"
-    managed_user_home="$3"
-    policy_path=/etc/herdr-workstation/bootstrap-policy.conf
-    [[ -f "$policy_path" && ! -L "$policy_path" &&
-      "$(/usr/bin/realpath -e -- "$policy_path" 2>/dev/null || true)" == "$policy_path" ]] || exit 24
-    for policy_component in /etc /etc/herdr-workstation; do
-      [[ ! -L "$policy_component" && -d "$policy_component" ]] || exit 24
-      [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_component")" == 0:0:755 ]] || exit 24
-    done
-    [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$policy_path")" == 0:0:600 ]] || exit 24
-    exec 9<"$policy_path"
-    policy_identity="$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/9)"
-    [[ "$policy_identity" =~ ^[0-9]+:[0-9]+:0:0:600:regular[[:space:]]file$ ]] || exit 24
-    policy_header_count=0
-    policy_origin_count=0
-    policy_commit_count=0
-    policy_origin=''
-    policy_commit=''
-    while IFS= read -r policy_line; do
-      case "$policy_line" in
-        herdr-bootstrap-policy-v1) ((policy_header_count += 1)) ;;
-        origin=*)
-          ((policy_origin_count += 1))
-          [[ -z "$policy_origin" ]] || exit 24
-          policy_origin="${policy_line#origin=}"
-          ;;
-        commit=*)
-          ((policy_commit_count += 1))
-          [[ -z "$policy_commit" ]] || exit 24
-          policy_commit="${policy_line#commit=}"
-          ;;
-        *) exit 24 ;;
-      esac
-    done < /proc/$BASHPID/fd/9
-    [[ "$policy_header_count" == 1 && "$policy_origin_count" == 1 &&
-      "$policy_commit_count" == 1 && "$policy_commit" =~ ^[0-9a-f]{40}$ &&
-      "$policy_origin" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*\.git$ &&
-      "$policy_origin" != *..* && "$policy_origin" != *@* ]] || exit 24
-    stage="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-payload.XXXXXX)"
-    receipt_parent_capability=''
-    cleanup_root_payload() {
-      /usr/bin/rm -rf -- "$stage"
-      [[ -z "$receipt_parent_capability" ]] || /usr/bin/rm -rf -- "$receipt_parent_capability"
-    }
-    trap cleanup_root_payload EXIT
-    /usr/bin/tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions
-    /usr/bin/chown -R --no-dereference 0:0 -- "$stage"
-    exec 10<"$stage"
-    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/10)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
-    receipt_parent_capability="$(/usr/bin/mktemp -d /tmp/herdr-root-receipt-capability.XXXXXX)"
-    /usr/bin/chmod 0700 -- "$receipt_parent_capability"
-    exec 12<"$receipt_parent_capability"
-    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/12)" =~ ^[0-9]+:[0-9]+:0:0:700:directory$ ]] || exit 24
-    /usr/bin/rm -rf -- "$receipt_parent_capability"
-    receipt_parent_capability=''
-    [[ -f /usr/local/libexec/herdr-workstation-bootstrap &&
-      ! -L /usr/local/libexec/herdr-workstation-bootstrap &&
-      "$(/usr/bin/realpath -e -- /usr/local/libexec/herdr-workstation-bootstrap 2>/dev/null || true)" == /usr/local/libexec/herdr-workstation-bootstrap &&
-      "$(/usr/bin/stat -c '%u:%g:%a' -- /usr/local/libexec/herdr-workstation-bootstrap)" == 0:0:755 ]] || exit 24
-    exec 11</usr/local/libexec/herdr-workstation-bootstrap
-    [[ "$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- /proc/$BASHPID/fd/11)" =~ ^[0-9]+:[0-9]+:0:0:755:regular[[:space:]]file$ ]] || exit 24
-    [[ -f "$stage/.payload-manifest" && ! -L "$stage/.payload-manifest" ]] || exit 24
-    root_verify_payload() {
-      local root="$1" manifest="$2" expected_hash="$3" expected_commit="$4"
-      local line relative full mode digest path actual_mode actual_digest
-      local header_count=0 source_commit
-      [[ "$root" == /* && -d "$root" && ! -L "$root" && "$manifest" == "$root/.payload-manifest" ]] || return 1
-      [[ "$(/usr/bin/stat -c '%u' -- "$root")" == 0 && "$(/usr/bin/stat -c '%a' -- "$root")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$root") & 022)) == 0 ]] || return 1
-      [[ "$(/usr/bin/stat -c '%u' -- "$manifest")" == 0 && "$(/usr/bin/stat -c '%a' -- "$manifest")" =~ ^[0-7]+$ && $((8#$(/usr/bin/stat -c '%a' -- "$manifest") & 022)) == 0 ]] || return 1
-      [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$(/usr/bin/sha256sum -- "$manifest" | /usr/bin/gawk "{print \$1}")" == "$expected_hash" ]] || return 1
-      source_commit="$(/usr/bin/gawk -F= "{ if (\$1 == \"commit\") { print \$2; found++ } END { exit(found == 1 ? 0 : 1) }" "$root/source/.source-attestation" 2>/dev/null || true)"
-      [[ "$source_commit" == "$expected_commit" ]] || return 1
-      declare -A payload_mode=() payload_sha=() payload_dirs=()
-      payload_dirs["."]=1
-      while IFS= read -r line; do
-        if [[ "$line" == herdr-payload-manifest-v1 ]]; then
-          ((header_count += 1))
-          continue
-        fi
-        [[ "${line:0:2}" == "F	" ]] || return 1
-        IFS="$(printf "\\t")" read -r _ mode digest path <<< "$line"
-        [[ "$path" != /* && "$path" != *..* ]] || return 1
-        [[ -n "$path" && "$mode" =~ ^(444|555|644|755)$ && "$digest" =~ ^[0-9a-f]{64}$ && -z "${payload_sha[$path]+x}" ]] || return 1
-        payload_mode["$path"]="$mode"
-        payload_sha["$path"]="$digest"
-        local current='.' component
-        IFS='/' read -r -a components <<< "$path"
-        for component in "${components[@]}"; do
-          [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
-          current="$current/$component"
-          current="${current#./}"
-          payload_dirs["$current"]=1
-        done
-      done < "$manifest"
-      [[ "$header_count" == 1 && "${#payload_sha[@]}" -gt 0 ]] || return 1
-      while IFS= read -r -d '' full; do
-        relative="${full#"$root"/}"
-        [[ "$relative" != .payload-manifest ]] || continue
-        [[ "$relative" != /* && "$relative" != *..* ]] || return 1
-        if [[ -L "$full" ]]; then
-          return 1
-        elif [[ -d "$full" ]]; then
-          [[ -n "${payload_dirs[$relative]+x}" ]] || return 1
-        elif [[ -f "$full" ]]; then
-          [[ -n "${payload_sha[$relative]+x}" ]] || return 1
-          actual_mode="$(/usr/bin/stat -c '%a' -- "$full")"
-          [[ "$actual_mode" == "${payload_mode[$relative]}" ]] || return 1
-          actual_digest="$(/usr/bin/sha256sum -- "$full" | /usr/bin/gawk "{print \$1}")"
-          [[ "$actual_digest" == "${payload_sha[$relative]}" ]] || return 1
-        else
-          return 1
-        fi
-      done < <(/usr/bin/find -P "$root" -mindepth 1 -print0)
-      for path in "${!payload_sha[@]}"; do
-        full="$root/$path"
-        [[ -f "$full" && ! -L "$full" ]] || return 1
-      done
-    }
-    root_verify_payload "$stage" "$stage/.payload-manifest" "$expected_payload_sha" "$policy_commit" || exit 24
-    [[ "$(/usr/bin/sha256sum -- "$stage/source/scripts/ubuntu/source-attestation.sh" | /usr/bin/gawk "{print \$1}")" == "$expected_source_helper_sha" ]] || exit 24
-    # The standalone root verifier binds the payload manifest and source
-    # commit before the helper is sourced.  The helper then rechecks every
-    # extracted file before the authority script is loaded.
-    # shellcheck disable=SC1091
-    source "$stage/source/scripts/ubuntu/source-attestation.sh"
-    attestation_reject_git_environment
-    attestation_verify_payload_manifest "$stage" "$stage/.payload-manifest" "$expected_payload_sha"
-    /usr/bin/bash "$stage/source/scripts/ubuntu/receipt-authority.sh" \
-      --install \
-      --source-root "$stage/source" \
-      --source-manifest "$stage/source/.source-attestation" \
-      --payload-root "$stage" \
-      --payload-manifest "$stage/.payload-manifest" \
-      --payload-manifest-sha256 "$expected_payload_sha" \
-      --source-commit "$policy_commit" \
-      --user-home "$managed_user_home"
-  ' -- "$expected_payload_sha" "$expected_source_helper_sha" "$HOME"
+  receipt_root_payload="$(bootstrap_receipt_root_payload)"
+  receipt_root_payload+=$'\n'
+  bootstrap_exec_system /usr/bin/tar -C "$payload_root" -cf - . | \
+    bootstrap_exec_privileged_payload "$sudo_bin" "$receipt_root_payload" \
+      "$expected_payload_sha" "$expected_source_helper_sha" "$HOME"
   /usr/bin/rm -rf -- "$payload_root"
 }
 
