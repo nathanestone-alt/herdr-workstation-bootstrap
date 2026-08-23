@@ -4,7 +4,17 @@ umask 022
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
-trap 'rm -rf -- "$test_root"' EXIT
+production_prefix=''
+cleanup_test() {
+  local status="$?"
+  set +e
+  rm -rf -- "$test_root"
+  if [[ -n "$production_prefix" && "$production_prefix" == /run/herdr-issue-8-production.* ]]; then
+    rm -rf -- "$production_prefix"
+  fi
+  return "$status"
+}
+trap cleanup_test EXIT
 
 # The authority deliberately validates the same source and release-lock
 # relationships as production. Build a small clean source checkout and a
@@ -14,6 +24,8 @@ fixture_root="$test_root/fixture"
 fixture_home="$fixture_root/home"
 authority_path="$fixture_root/etc/stmodel/issue-961/receipt-authority.json"
 receipt_path="$fixture_root/etc/stmodel/issue-961/receipt.json"
+fixture_stage_authority_root="$fixture_root/var/lib/herdr-workstation/bootstrap/staging"
+fixture_bundle_stage_parent="$fixture_stage_authority_root/receipt-runtime"
 source_root="$test_root/source"
 runtime_root="$fixture_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
 stdlib_root="$runtime_root/lib/python3.13"
@@ -274,10 +286,10 @@ run_bundle_stage_mutation() {
     exit 1
   }
   stage_root=''
-  active_stage_parent="$(/usr/bin/find /tmp -maxdepth 1 -type d -name 'herdr-receipt-exec.*' \
+  active_stage_parent="$(/usr/bin/find "$fixture_bundle_stage_parent" -mindepth 1 -maxdepth 1 -type d -name 'herdr-receipt-exec.*' \
     -printf '%T@ %p\n' 2>/dev/null | /usr/bin/sort -nr | /usr/bin/head -n 1 | /usr/bin/cut -d' ' -f2- || true)"
-  if [[ -n "$active_stage_parent" && -d "$active_stage_parent/python313/.local" ]]; then
-    stage_root="$active_stage_parent/python313/.local"
+  if [[ -n "$active_stage_parent" && -d "$active_stage_parent/stage/python313/.local" ]]; then
+    stage_root="$active_stage_parent/stage/python313/.local"
   fi
   [[ -n "$stage_root" ]] || {
     : > "$continue_file"
@@ -360,6 +372,22 @@ run_authority --check
 (( $(jq -r '.role_identities.pwsh.bundle.file_count' "$receipt_path") > 1 )) || exit 1
 (( $(jq -r '.python313.bundle.file_count' "$receipt_path") > 1 )) || exit 1
 [[ "$(jq -r '.python313.execution_path' "$receipt_path")" == sealed://python313/.local/bin/python3.13 ]] || exit 1
+
+# The bundle parent is deliberately outside /tmp: it is a child of the
+# launcher-controlled staging root.  An existing writable parent must be
+# rejected without being repaired, while the approved private parent succeeds.
+bundle_stage_parent_mode="$(/usr/bin/stat -c '%a' -- "$fixture_bundle_stage_parent")"
+/usr/bin/chmod 0777 -- "$fixture_bundle_stage_parent"
+expect_failure_diagnostic bundle-writable-stage-parent \
+  "receipt authority: fixture runtime bundle staging parent is not fixture-owned and non-writable: $fixture_bundle_stage_parent" \
+  run_authority --check
+[[ "$(/usr/bin/stat -c '%a' -- "$fixture_bundle_stage_parent")" == 777 ]] || {
+  echo 'Writable bundle parent was silently repaired instead of rejected.' >&2
+  exit 1
+}
+/usr/bin/chmod "$bundle_stage_parent_mode" -- "$fixture_bundle_stage_parent"
+run_authority --check
+
 run_bundle_stage_mutation bundle-extra-file
 run_bundle_stage_mutation bundle-omitted-file
 run_bundle_stage_mutation bundle-path-traversal
@@ -493,7 +521,7 @@ if [[ ! -e "$role_stage_race_ready" ]]; then
   exit 1
 fi
 role_stage_race_replaced=0
-for role_stage_dir in /tmp/herdr-receipt-exec.*; do
+for role_stage_dir in "$fixture_bundle_stage_parent"/herdr-receipt-exec.*/stage; do
   [[ -f "$role_stage_dir/rtk" ]] || continue
   mv -- "$role_stage_dir/rtk" "$role_stage_dir/rtk-original"
   cp -- "$role_stage_race_hostile" "$role_stage_dir/rtk"
@@ -562,6 +590,32 @@ else
   payload_probe_commit="$attestation_snapshot_commit"
   chown -R 0:0 "$payload_probe"
   chmod 0700 "$payload_probe"
+  production_home=''
+  production_launcher=''
+  production_policy=''
+  production_authority_path=''
+  production_receipt_path=''
+  prepare_production_payload_environment() {
+    [[ -n "$production_prefix" ]] && return 0
+    production_prefix="$(/usr/bin/mktemp -d /run/herdr-issue-8-production.XXXXXX)"
+    /usr/bin/chmod 0755 -- "$production_prefix"
+    production_home="$production_prefix/home"
+    /usr/bin/cp -a -- "$fixture_home" "$production_home"
+    /usr/bin/chown -R "$fixture_runtime_uid:$fixture_runtime_gid" "$production_home"
+    /usr/bin/cp -a -- "$transport" "$production_prefix/transport.git"
+    /usr/bin/chmod 0700 -- "$production_prefix/transport.git"
+    /usr/bin/bash "$repo_root/scripts/ubuntu/install-trusted-launcher.sh" \
+      --origin https://github.com/nathanestone-alt/herdr-workstation-bootstrap.git \
+      --commit "$source_commit" \
+      --fixture-root "$production_prefix" \
+      --fixture-transport "$production_prefix/transport.git" \
+      --fixture-home "$production_home" \
+      "${fixture_runtime_args[@]}" > "$test_root/production-launcher-install.out"
+    production_launcher="$production_prefix/usr/local/libexec/herdr-workstation-bootstrap"
+    production_policy="$production_prefix/etc/herdr-workstation/bootstrap-policy.conf"
+    production_authority_path="$production_prefix/output/etc/stmodel/issue-961/receipt-authority.json"
+    production_receipt_path="$production_prefix/output/etc/stmodel/issue-961/receipt.json"
+  }
   run_payload_authority() {
     local mode="$1"
     local root="$2"
@@ -569,26 +623,49 @@ else
     local payload_commit="$4"
     local fixture_mode="${5:-fixture}"
     local -a fixture_args=()
+    local capability_launcher capability_policy capability_parent payload_home target_authority target_receipt
     case "$fixture_mode" in
-      fixture) fixture_args=(--fixture-root "$fixture_root") ;;
-      production) ;;
+      fixture)
+        capability_launcher="$launcher"
+        capability_policy="$fixture_root/etc/herdr-workstation/bootstrap-policy.conf"
+        capability_parent="$fixture_stage_authority_root"
+        payload_home="$fixture_home"
+        target_authority="$authority_path"
+        target_receipt="$receipt_path"
+        fixture_args=(--fixture-root "$fixture_root")
+        ;;
+      production)
+        prepare_production_payload_environment
+        capability_launcher="$production_launcher"
+        capability_policy="$production_policy"
+        capability_parent="$production_prefix/var/lib/herdr-workstation/bootstrap/staging"
+        payload_home="$production_home"
+        target_authority="$production_authority_path"
+        target_receipt="$production_receipt_path"
+        ;;
       *) echo "Unknown payload authority fixture mode: $fixture_mode" >&2; exit 1 ;;
     esac
-    /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+    /usr/bin/env -i HOME="$payload_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
       LC_ALL=C TZ=UTC BASH_ENV= ENV= /usr/bin/bash -c '
         payload_root="$1"
         launcher="$2"
         policy="$3"
-        shift 3
+        capability_parent="$4"
+        payload_home="$5"
+        authority_path="$6"
+        receipt_path="$7"
+        shift 7
         exec 9<"$policy"
         exec 10<"$payload_root"
         exec 11<"$launcher"
-        receipt_parent_capability="$(/usr/bin/mktemp -d /tmp/herdr-test-receipt-capability.XXXXXX)"
+        receipt_parent_capability="$(/usr/bin/mktemp -d "$capability_parent/.herdr-test-receipt-capability.XXXXXX")"
         /usr/bin/chmod 0700 -- "$receipt_parent_capability"
         exec 12<"$receipt_parent_capability"
         /usr/bin/rm -rf -- "$receipt_parent_capability"
-        /usr/bin/bash "$payload_root/source/scripts/ubuntu/receipt-authority.sh" "$@"
-      ' _ "$root" "$launcher" "$fixture_root/etc/herdr-workstation/bootstrap-policy.conf" \
+        /usr/bin/bash "$payload_root/source/scripts/ubuntu/receipt-authority.sh" "$@" \
+          --user-home "$payload_home" --authority-path "$authority_path" --receipt-path "$receipt_path"
+      ' _ "$root" "$capability_launcher" "$capability_policy" "$capability_parent" "$payload_home" \
+      "$target_authority" "$target_receipt" \
       "$mode" \
       --source-root "$root/source" \
       --source-manifest "$root/source/.source-attestation" \
@@ -596,7 +673,6 @@ else
       --payload-manifest "$root/.payload-manifest" \
       --payload-manifest-sha256 "$payload_hash" \
       --source-commit "$payload_commit" \
-      --user-home "$fixture_home" --authority-path "$authority_path" --receipt-path "$receipt_path" \
       "${fixture_args[@]}"
   }
   # The hardened source snapshot strips every write bit, so the real payload
@@ -636,7 +712,7 @@ else
     'receipt authority trust prelude: payload manifest requires a mandatory external SHA-256 binding' \
     run_payload_authority --check "$payload_probe" '' "$payload_probe_commit"
   run_payload_authority --install "$payload_probe" "$payload_probe_hash" "$payload_probe_commit"
-  [[ "$(/usr/bin/jq -r '.source_commit_sha' "$receipt_path")" == "$source_commit" ]] || {
+  [[ "$(/usr/bin/jq -r '.source_commit_sha' "$production_receipt_path")" == "$source_commit" ]] || {
     echo 'Root payload receipt transaction did not hand off the approved source commit.' >&2
     exit 1
   }

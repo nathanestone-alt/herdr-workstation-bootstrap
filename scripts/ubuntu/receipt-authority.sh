@@ -11,6 +11,7 @@ readonly receipt_realpath_bin='/usr/bin/realpath'
 readonly receipt_dirname_bin='/usr/bin/dirname'
 readonly receipt_find_bin='/usr/bin/find'
 readonly receipt_mktemp_bin='/usr/bin/mktemp'
+readonly receipt_mkdir_bin='/usr/bin/mkdir'
 readonly receipt_chmod_bin='/usr/bin/chmod'
 readonly receipt_stat_bin='/usr/bin/stat'
 readonly receipt_sha256_bin='/usr/bin/sha256sum'
@@ -136,7 +137,7 @@ receipt_trust_assert_binary() {
 
 for receipt_trusted_binary in \
   "$receipt_env_bin" "$receipt_realpath_bin" "$receipt_dirname_bin" \
-  "$receipt_find_bin" "$receipt_mktemp_bin" "$receipt_chmod_bin" \
+  "$receipt_find_bin" "$receipt_mktemp_bin" "$receipt_mkdir_bin" "$receipt_chmod_bin" \
   "$receipt_stat_bin" "$receipt_sha256_bin" "$receipt_awk_bin" \
   "$receipt_head_bin" "$receipt_cp_bin" "$receipt_sort_bin" "$receipt_readlink_bin" "$receipt_cmp_bin" \
   "$receipt_rm_bin" "$receipt_chown_bin" \
@@ -532,7 +533,8 @@ receipt_cleanup() {
   local cleanup_path
   for cleanup_path in "${receipt_cleanup_paths[@]:-}"; do
     if [[ -n "$cleanup_path" ]]; then
-      if [[ "$cleanup_path" == /tmp/herdr-receipt-exec.* ]]; then
+      if [[ -n "${receipt_exec_stage_dir:-}" && "$cleanup_path" == "$receipt_exec_stage_dir" ]] ||
+        [[ -n "${receipt_exec_scratch_root:-}" && "$cleanup_path" == "$receipt_exec_scratch_root" ]]; then
         "$receipt_chmod_bin" -R u+w -- "$cleanup_path" 2>/dev/null || true
       fi
       "$receipt_rm_bin" -rf -- "$cleanup_path"
@@ -713,6 +715,8 @@ receipt_test_pause() {
 
 if [[ -n "$fixture_root" ]]; then
   [[ "$fixture_root" == /* ]] || fail 'fixture root must be absolute'
+  fixture_root="$($receipt_realpath_bin -e -- "$fixture_root" 2>/dev/null || true)"
+  [[ -n "$fixture_root" && -d "$fixture_root" && ! -L "$fixture_root" ]] || fail 'fixture root is not a canonical directory'
   [[ "$authority_path" != "$default_authority_path" && "$receipt_path" != "$default_receipt_path" ]] || {
     fail 'fixture mode cannot address production authority paths'
   }
@@ -886,6 +890,8 @@ declare -A role_bundle_manifest_file role_bundle_manifest_sha256 role_bundle_fil
 declare -A role_bundle_source_owner_uid role_bundle_source_owner_gid role_bundle_stage_root role_bundle_snapshot_file
 declare -A role_bundle_stage_hash
 receipt_exec_stage_dir=''
+receipt_exec_scratch_root=''
+receipt_bundle_stage_parent=''
 
 readonly receipt_bundle_manifest_header='herdr-role-bundle-manifest-v1'
 readonly receipt_bundle_snapshot_header='herdr-role-bundle-snapshot-v1'
@@ -909,6 +915,105 @@ receipt_bundle_stage_mode() {
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
   value=$((8#$mode & 0555))
   printf '%03o' "$value"
+}
+
+receipt_bundle_mktemp() {
+  local template="$1"
+  [[ -n "${receipt_exec_scratch_root:-}" && -d "$receipt_exec_scratch_root" && ! -L "$receipt_exec_scratch_root" ]] || {
+    fail 'runtime bundle scratch root is unavailable'
+  }
+  "$receipt_mktemp_bin" "$receipt_exec_scratch_root/$template" || fail 'runtime bundle scratch allocation failed'
+}
+
+receipt_bundle_validate_authority_path() {
+  local path="$1"
+  local current="$path"
+  local boundary expected_uid expected_gid owner group mode
+  [[ -n "$path" && "$path" == /* ]] || fail "runtime bundle authority path is not absolute: $path"
+  reject_symlink_components "$path" || fail "runtime bundle authority path contains a symlink: $path"
+  [[ -d "$path" && ! -L "$path" ]] || fail "runtime bundle authority path is not a directory: $path"
+  [[ "$($receipt_realpath_bin -e -- "$path" 2>/dev/null || true)" == "$path" ]] || {
+    fail "runtime bundle authority path is not canonical: $path"
+  }
+  if [[ -n "$fixture_root" ]]; then
+    boundary="$fixture_root"
+    expected_uid="$launcher_capability_owner_uid"
+    expected_gid="$launcher_capability_owner_gid"
+    [[ "$path" == "$fixture_root" || "$path" == "$fixture_root/"* ]] || {
+      fail "fixture runtime bundle scratch escaped the fixture root: $path"
+    }
+  else
+    boundary='/'
+    expected_uid=0
+    expected_gid=0
+  fi
+  while :; do
+    owner="$($receipt_stat_bin -c '%u' -- "$current" 2>/dev/null || true)"
+    group="$($receipt_stat_bin -c '%g' -- "$current" 2>/dev/null || true)"
+    mode="$($receipt_stat_bin -c '%a' -- "$current" 2>/dev/null || true)"
+    if [[ "$owner" != "$expected_uid" || "$group" != "$expected_gid" ||
+      ! "$mode" =~ ^[0-7]+$ || $((8#$mode & 022)) != 0 ]]; then
+      if [[ -n "$fixture_root" ]]; then
+        fail "fixture runtime bundle staging parent is not fixture-owned and non-writable: $current"
+      fi
+      fail "production runtime bundle staging parent is not root-owned and non-writable: $current"
+    fi
+    [[ "$current" == "$boundary" ]] && break
+    [[ "$current" != '/' ]] || fail "runtime bundle authority path escaped its trust boundary: $path"
+    current="$($receipt_dirname_bin -- "$current")"
+  done
+}
+
+receipt_bundle_prepare_stage_parent() {
+  local policy_path="$launcher_capability_policy_path"
+  local policy_suffix='/etc/herdr-workstation/bootstrap-policy.conf'
+  local prefix authority_root parent
+  [[ "$policy_path" == *"$policy_suffix" ]] || fail 'runtime bundle authority policy path is not canonical'
+  prefix="${policy_path%$policy_suffix}"
+  authority_root="$prefix/var/lib/herdr-workstation/bootstrap/staging"
+  if [[ -n "$fixture_root" ]]; then
+    [[ "$authority_root" == "$fixture_root/var/lib/herdr-workstation/bootstrap/staging" ]] || {
+      fail 'fixture runtime bundle staging root escaped the fixture root'
+    }
+  fi
+  receipt_bundle_validate_authority_path "$authority_root"
+  # Keep this run-independent directory traversable for the unprivileged role
+  # probes, but never writable by group or other users.  An existing unsafe
+  # directory is rejected rather than repaired in place.
+  parent="$authority_root/receipt-runtime"
+  reject_symlink_components "$parent" || fail "runtime bundle staging parent contains a symlink: $parent"
+  if [[ -e "$parent" || -L "$parent" ]]; then
+    [[ -d "$parent" && ! -L "$parent" ]] || fail "runtime bundle staging parent is not a directory: $parent"
+  else
+    receipt_exec_system "$receipt_mkdir_bin" -- "$parent" || fail "runtime bundle staging parent could not be created: $parent"
+    receipt_exec_system "$receipt_chmod_bin" 0755 -- "$parent" || fail "runtime bundle staging parent permission setup failed: $parent"
+    if [[ -z "$fixture_root" ]]; then
+      receipt_exec_system "$receipt_chown_bin" 0:0 -- "$parent" || fail "runtime bundle staging parent ownership setup failed: $parent"
+    fi
+  fi
+  receipt_bundle_validate_authority_path "$parent"
+  receipt_bundle_stage_parent="$parent"
+}
+
+receipt_bundle_prepare_scratch() {
+  receipt_bundle_prepare_stage_parent
+  receipt_exec_scratch_root="$($receipt_mktemp_bin -d "$receipt_bundle_stage_parent/herdr-receipt-exec.XXXXXX")" || {
+    fail 'runtime bundle scratch directory could not be created'
+  }
+  receipt_register_cleanup "$receipt_exec_scratch_root"
+  receipt_exec_system "$receipt_chmod_bin" 0755 -- "$receipt_exec_scratch_root" || fail 'runtime bundle scratch permission setup failed'
+  if [[ -z "$fixture_root" ]]; then
+    receipt_exec_system "$receipt_chown_bin" 0:0 -- "$receipt_exec_scratch_root" || fail 'runtime bundle scratch ownership setup failed'
+  fi
+  receipt_bundle_validate_authority_path "$receipt_exec_scratch_root"
+  receipt_exec_stage_dir="$receipt_exec_scratch_root/stage"
+  receipt_exec_system "$receipt_mkdir_bin" -- "$receipt_exec_stage_dir" || fail 'runtime bundle execution stage could not be created'
+  receipt_exec_system "$receipt_chmod_bin" 0700 -- "$receipt_exec_stage_dir" || fail 'runtime bundle execution stage permission setup failed'
+  if [[ -z "$fixture_root" ]]; then
+    receipt_exec_system "$receipt_chown_bin" 0:0 -- "$receipt_exec_stage_dir" || fail 'runtime bundle execution stage ownership setup failed'
+  fi
+  receipt_register_cleanup "$receipt_exec_stage_dir"
+  receipt_bundle_validate_authority_path "$receipt_exec_stage_dir"
 }
 
 receipt_bundle_add_source_dir() {
@@ -999,8 +1104,8 @@ receipt_bundle_build_pwsh_source_manifest() {
   local normal_raw snapshot_raw entry base target
   local expected_uid expected_gid
   declare -A bundle_seen_dirs=()
-  normal_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-normal.XXXXXX)"
-  snapshot_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  normal_raw="$(receipt_bundle_mktemp '.bundle-normal.XXXXXX')"
+  snapshot_raw="$(receipt_bundle_mktemp '.bundle-snapshot.XXXXXX')"
   receipt_register_cleanup "$normal_raw"
   receipt_register_cleanup "$snapshot_raw"
   : > "$normal_raw"
@@ -1043,8 +1148,8 @@ receipt_bundle_build_python_source_manifest() {
   local normal_raw snapshot_raw full relative runtime_relative stdlib_relative
   local expected_uid expected_gid
   declare -A bundle_seen_dirs=()
-  normal_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-normal.XXXXXX)"
-  snapshot_raw="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  normal_raw="$(receipt_bundle_mktemp '.bundle-normal.XXXXXX')"
+  snapshot_raw="$(receipt_bundle_mktemp '.bundle-snapshot.XXXXXX')"
   receipt_register_cleanup "$normal_raw"
   receipt_register_cleanup "$snapshot_raw"
   : > "$normal_raw"
@@ -1112,7 +1217,10 @@ receipt_bundle_copy_from_snapshot() {
   local source_fd descriptor_path source_id live_id live_hash live_owner live_group live_mode stage_mode stage_hash
   local stage_parent
   stage_parent="${stage_root%/*}"
-  [[ "$stage_parent" != "$stage_root" ]] || stage_parent='/tmp'
+  [[ "$stage_parent" != "$stage_root" &&
+    ( "$stage_parent" == "$receipt_exec_stage_dir" || "$stage_parent" == "$receipt_exec_stage_dir/$role" ) ]] || {
+    fail "$role runtime bundle stage parent is not the sealed execution stage: $stage_parent"
+  }
   /usr/bin/mkdir -p -- "$stage_root"
   "$receipt_chmod_bin" 0700 -- "$stage_root"
   while IFS=$'\t' read -r kind relative mode owner group identity source_hash transform; do
@@ -1231,6 +1339,8 @@ receipt_bundle_assert_stage() {
   local expected_uid expected_gid
   expected_uid="$(receipt_exec_system "$receipt_id_bin" -u)"
   expected_gid="$(receipt_exec_system "$receipt_id_bin" -g)"
+  receipt_bundle_validate_authority_path "$receipt_exec_scratch_root"
+  receipt_bundle_validate_authority_path "$receipt_exec_stage_dir"
   stage_parent="${stage_root%/*}"
   if [[ "$stage_parent" != "$stage_root" && "$stage_parent" != "$receipt_exec_stage_dir" ]]; then
     [[ -d "$stage_parent" && ! -L "$stage_parent" ]] || fail "$role runtime bundle stage parent is unsafe: $stage_parent"
@@ -1238,8 +1348,8 @@ receipt_bundle_assert_stage() {
       fail "$role runtime bundle stage parent owner or mode changed: $stage_parent"
     }
   fi
-  expected="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-expected.XXXXXX)"
-  actual="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-actual.XXXXXX)"
+  expected="$(receipt_bundle_mktemp '.bundle-expected.XXXXXX')"
+  actual="$(receipt_bundle_mktemp '.bundle-actual.XXXXXX')"
   receipt_register_cleanup "$expected"
   receipt_register_cleanup "$actual"
   "$receipt_awk_bin" -F $'\t' 'NR > 1 { print $1 "\t" $2 }' "$normal" > "$expected"
@@ -1283,8 +1393,8 @@ receipt_bundle_assert_stage() {
 receipt_bundle_assert_source_snapshot() {
   local role="$1"
   local current_normal current_snapshot
-  current_normal="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-current-normal.XXXXXX)"
-  current_snapshot="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-current-snapshot.XXXXXX)"
+  current_normal="$(receipt_bundle_mktemp '.bundle-current-normal.XXXXXX')"
+  current_snapshot="$(receipt_bundle_mktemp '.bundle-current-snapshot.XXXXXX')"
   receipt_register_cleanup "$current_normal"
   receipt_register_cleanup "$current_snapshot"
   receipt_bundle_build_source_manifest "$role" "$current_normal" "$current_snapshot"
@@ -1319,8 +1429,8 @@ receipt_stage_bundle() {
   role_bundle_source_owner_uid["$role"]="$(receipt_exec_system "$receipt_stat_bin" -c '%u' -- "$path" 2>/dev/null || true)"
   role_bundle_source_owner_gid["$role"]="$(receipt_exec_system "$receipt_stat_bin" -c '%g' -- "$path" 2>/dev/null || true)"
   [[ "${role_bundle_source_owner_uid[$role]}" =~ ^[0-9]+$ && "${role_bundle_source_owner_gid[$role]}" =~ ^[0-9]+$ ]] || fail "$role runtime bundle executable owner is invalid"
-  normal="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-manifest.XXXXXX)"
-  snapshot="$($receipt_mktemp_bin /tmp/herdr-receipt-bundle-snapshot.XXXXXX)"
+  normal="$(receipt_bundle_mktemp '.bundle-manifest.XXXXXX')"
+  snapshot="$(receipt_bundle_mktemp '.bundle-snapshot.XXXXXX')"
   receipt_register_cleanup "$normal"
   receipt_register_cleanup "$snapshot"
   role_bundle_manifest_file["$role"]="$normal"
@@ -1471,12 +1581,7 @@ reject_symlink_components "$python_runtime_root" || fail 'Python runtime contain
 [[ "$(/usr/bin/realpath -e -- "$python_runtime_root" 2>/dev/null || true)" == "$python_runtime_root" ]] || fail 'Python managed runtime is not lexically canonical'
 [[ -d "$python_stdlib_root" && ! -L "$python_stdlib_root" ]] || fail 'Python managed standard library is missing or not a directory'
 
-receipt_exec_stage_dir="$($receipt_mktemp_bin -d /tmp/herdr-receipt-exec.XXXXXX)"
-receipt_register_cleanup "$receipt_exec_stage_dir"
-receipt_exec_system "$receipt_chmod_bin" 0700 -- "$receipt_exec_stage_dir"
-if [[ -z "$fixture_root" ]]; then
-  receipt_exec_system "$receipt_chown_bin" 0:0 -- "$receipt_exec_stage_dir"
-fi
+receipt_bundle_prepare_scratch
 for role in "${roles[@]}" python313; do
   receipt_stage_executable "$role"
 done
