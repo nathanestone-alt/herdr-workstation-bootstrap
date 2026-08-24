@@ -460,25 +460,24 @@ record_receipt_first_line() {
 read_receipt_pyvenv_value() {
   local config_path="$1"
   local key="$2"
-  # The consumer of pyvenv.cfg is CPython site.py, which splits each line at the
-  # first '=', folds the key with str.strip().lower(), and resolves duplicate
-  # keys last-wins (python3.13 .../lib/python3.13/site.py:620-626). To attest
-  # only what CPython actually consumes, this reader must not diverge from that
-  # normalization. It therefore (1) refuses any byte CPython's Unicode
-  # str.strip() could fold but a C-locale gawk trim would not — i.e. anything
-  # outside printable ASCII, tab, or CR — closing NBSP/control-char key
-  # smuggling; (2) matches the key case-insensitively like .lower(); and
-  # (3) rejects the file as ambiguous when more than one line resolves to the
-  # requested key, which is stricter than, and never disagrees with, last-wins.
-  # Split records exactly as CPython's `for line in f` does — on \r\n, \r, or \n
-  # (universal newlines) — so a carriage return embedded in a line becomes its
-  # own record here just as it starts a new line for the consumer; an otherwise
-  # hidden `\r`-smuggled directive then trips the duplicate-key rejection below.
-  # A rejecting path must print NOTHING: the sole caller captures stdout through
-  # `|| true`, discarding the exit status, so any emitted value is trusted. Any
-  # byte outside printable ASCII or tab is rejected (deferred to END, since an
-  # in-rule `exit` would still run END and print the last matched value),
-  # closing NBSP/control-character key smuggling.
+  # The consumer of pyvenv.cfg is CPython site.py, which iterates the file with
+  # universal newlines, splits each line at the first '=', folds the key with
+  # str.strip().lower(), and resolves duplicate keys last-wins (python3.13
+  # .../lib/python3.13/site.py:620-626). To attest only what CPython actually
+  # consumes, this reader must not diverge from that normalization. It therefore
+  # (1) sets RS to split records on \r\n, \r, or \n exactly as CPython's
+  # `for line in f` does, so a carriage return embedded in a line becomes its own
+  # record here just as it starts a new line for the consumer, exposing an
+  # otherwise hidden `\r`-smuggled directive to the duplicate-key rejection;
+  # (2) rejects any byte outside printable ASCII or tab — anything CPython's
+  # Unicode str.strip() could fold but a C-locale gawk trim would not — closing
+  # NBSP/control-character key smuggling; (3) matches the key case-insensitively
+  # like .lower(); and (4) rejects the file as ambiguous when more than one line
+  # resolves to the requested key, which is stricter than, and never disagrees
+  # with, last-wins. A rejecting path must print NOTHING: the sole caller
+  # captures stdout through `|| true`, discarding the exit status, so any emitted
+  # value is trusted — hence the byte rejection is deferred to END (an in-rule
+  # `exit` would still run END and print the last matched value).
   /usr/bin/gawk -v key="$key" '
     BEGIN { RS = "\r\n|\r|\n" }
     {
