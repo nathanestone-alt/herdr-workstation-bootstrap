@@ -12,6 +12,20 @@ sentinel="commissioning-synthetic-sentinel-$$"
 printf '%s\n' 'clean commissioning evidence' > "$fixture_root/clean.log"
 printf '%s\n' "$sentinel" > "$fixture_root/leak.log"
 
+unsafe_scanner="$fixture_root/unsafe-scanner.sh"
+cp -- "$scanner" "$unsafe_scanner"
+# Build the synthetic unsafe source without placing an actual fixture value in
+# this test script's own command arguments.
+unsafe_line="$(printf '%s%s%s%s%s' \
+  '  rg -F -l -- "$' 'secret' '" "$' 'target' '"  # synthetic unsafe source')"
+printf '%s\n' "$unsafe_line" >> "$unsafe_scanner"
+if printf '%s\n' 'fixture-unused-value' |
+    "$unsafe_scanner" --repo "$repo_root" --scan "$fixture_root/clean.log" \
+      > "$fixture_root/static-stdout" 2> "$fixture_root/static-stderr"; then
+  echo 'static argv self-check unexpectedly passed' >&2
+  exit 1
+fi
+
 printf '%s\n' "$sentinel" |
   "$scanner" --repo "$repo_root" --scan "$fixture_root/clean.log" >/dev/null
 

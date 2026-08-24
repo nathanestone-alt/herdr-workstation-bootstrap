@@ -2,8 +2,10 @@
 
 This fixture contains no real password and creates no repository artifact. It
 uses a process-local synthetic sentinel to prove both sides of the hygiene
-check: clean evidence passes, and evidence containing the sentinel is rejected
-without the sentinel appearing in the checker’s stdout or stderr.
+check: the scanner rejects a temporary copy containing a synthetic unsafe
+secret-to-argv use, clean evidence passes, and evidence containing the
+sentinel is rejected without the sentinel appearing in the checker’s stdout or
+stderr.
 
 Run from the repository root:
 

@@ -15,7 +15,7 @@ manifest, log, Git diff, OneDrive file, or commissioning record.
 
 | #957 acceptance checkbox | Satisfying step | Who runs it | Evidence to retain |
 | --- | --- | --- | --- |
-| C-01: Work from the reviewed implementation and commissioning branch | Confirm the branch is based on 6495aae6b5fb41fff8ac04a4943001599a24435d; this worker commit is recorded in the return artifact | automated/static | branch name and commit SHA |
+| C-01: Work from the reviewed implementation and commissioning branch | Confirm the branch is based on 6495aae6b5fb41fff8ac04a4943001599a24435d; this worker commit is recorded in the return artifact | automated | branch name and commit SHA |
 | C-02: HerdrBridge is a dedicated enabled non-admin identity | Run scripts/windows/New-HerdrExchangeShare.ps1 with its interactive password prompt; do not use Administrator or supply a password argument | user-Windows | exact LocalUser/SID, enabled state, and direct group membership |
 | C-03: The Windows exchange share is encrypted | The same existing share script must create or converge HerdrExchange with EncryptData true and AccessBased enumeration | user-Windows | Get-SmbShare output showing path, encryption, and access mode |
 | C-04: SMB exposure is Tailscale-scoped | Review the exact rule Herdr Exchange SMB over Tailscale: inbound TCP 445, remote 100.64.0.0/10 and fd7a:115c:a1e0::/48 | user-Windows | exact rule name, protocol/port, profiles, and remote ranges |
@@ -38,7 +38,7 @@ manifest, log, Git diff, OneDrive file, or commissioning record.
 | C-21: Fixture is noncanonical and disposable | Use fixtures/commissioning/disposable-workbook/README.md generation instructions; use no STModel workbook and do not commit generated files | user-Windows | fixture path, hash, and cleanup confirmation |
 | C-22: Password-leak negative test passes | Run fixtures/commissioning/password-leak-negative/README.md self-test, then pipe the approved password-manager value to ubuntu/test-password-hygiene.sh over all relevant evidence paths | user-sudo-Ubuntu | PASS hygiene output; no password value in captured stdout/stderr |
 | C-23: Manual gates are explicitly acknowledged | Record credential supply, Windows interactive login/session, exact firewall review, OneDrive hydration, and final evidence review before enabling approved in the host-owned runtime config | user-Windows / user-sudo-Ubuntu | signed or ticket-linked commissioning record |
-| C-24: Evidence is posted only by the user | Review the local records and post the approved evidence to STModel-Private #957 manually; no worker or script invokes GitHub | user gate | issue comment URL supplied by the user |
+| C-24: Evidence is posted only by the user | Review the local records and post the approved evidence to STModel-Private #957 manually; no worker or script invokes GitHub | user-Windows / user-sudo-Ubuntu | issue comment URL supplied by the user |
 
 ## Ordered runbook
 

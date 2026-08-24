@@ -26,6 +26,14 @@ command -v rg >/dev/null 2>&1 || fail 'rg is required for the password-hygiene s
 command -v mktemp >/dev/null 2>&1 || fail 'mktemp is required for the password-hygiene scan'
 command -v git >/dev/null 2>&1 || fail 'git is required for the password-hygiene scan'
 
+assert_secret_not_in_argv() {
+  local script_path="${BASH_SOURCE[0]}"
+  if rg -n -- '(^|[[:space:];|&])rg.*"\$secret"' "$script_path" >/dev/null 2>&1; then
+    fail 'password scanner source passes the secret to an rg argument'
+  fi
+}
+assert_secret_not_in_argv
+
 scan_path_list="$(mktemp)"
 cleanup_scan_list() { rm -f -- "$scan_path_list"; }
 trap cleanup_scan_list EXIT
@@ -78,7 +86,8 @@ scan_file_or_directory() {
   : > "$matches"
   : > "$errors"
   set +e
-  rg -F -l --hidden --glob '!.git' -- "$secret" "$target" > "$matches" 2> "$errors"
+  printf '%s\n' "$secret" |
+    rg -F -l -f - --hidden --glob '!.git' -- "$target" > "$matches" 2> "$errors"
   local result=$?
   set -e
   if [[ "$result" -eq 0 ]]; then
@@ -87,21 +96,42 @@ scan_file_or_directory() {
   [[ "$result" -eq 1 ]] || fail "could not scan $label evidence"
 }
 
+scan_stream_for_secret() {
+  local line
+  local matched=1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$secret"* ]]; then
+      matched=0
+    fi
+  done
+  return "$matched"
+}
+
 while IFS= read -r path; do
   [[ -n "$path" ]] || continue
   scan_file_or_directory 'selected' "$path"
 done < "$scan_path_list"
 scan_file_or_directory 'repository working tree' "$repo_path"
 
-working_diff="$tmp_root/git-working.diff"
-index_diff="$tmp_root/git-index.diff"
-if ! git -C "$repo_path" diff --no-ext-diff --binary HEAD > "$working_diff" 2> "$tmp_root/git-working.err"; then
-  fail 'could not capture the working-tree Git evidence'
-fi
-if ! git -C "$repo_path" diff --cached --no-ext-diff --binary > "$index_diff" 2> "$tmp_root/git-index.err"; then
-  fail 'could not capture the index Git evidence'
-fi
-scan_file_or_directory 'working-tree Git diff' "$working_diff"
-scan_file_or_directory 'index Git diff' "$index_diff"
+# Keep raw diffs on the pipe: a matched password must never be materialized.
+scan_git_diff() {
+  local label="$1"
+  local error_file="$2"
+  shift 2
+  : > "$error_file"
+  set +e
+  git -C "$repo_path" diff --no-ext-diff --binary "$@" 2> "$error_file" |
+    scan_stream_for_secret >/dev/null
+  local -a statuses=("${PIPESTATUS[@]}")
+  set -e
+  [[ "${statuses[0]}" -eq 0 ]] || fail "could not capture the $label"
+  if [[ "${statuses[1]}" -eq 0 ]]; then
+    fail "password matched $label"
+  fi
+  [[ "${statuses[1]}" -eq 1 ]] || fail "could not scan $label"
+}
+
+scan_git_diff 'working-tree Git diff' "$tmp_root/git-working.err" HEAD
+scan_git_diff 'index Git diff' "$tmp_root/git-index.err" --cached
 
 printf 'PASS password_hygiene=PASS scanned_paths=%s repository_worktree=PASS git_evidence=PASS secret_value=not-disclosed\n' "$scan_count"
