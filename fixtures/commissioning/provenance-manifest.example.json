@@ -1,0 +1,43 @@
+{
+  "schema": "herdr-excel-job-result-v1",
+  "job_id": "commissioning-job-001",
+  "completed_utc": "<runtime-generated UTC timestamp>",
+  "source": {
+    "path": "<OneDrive Inbox>\\Herdr Review Exchange\\Inbox\\commissioning.xlsm",
+    "observed_utc": "<runtime-generated UTC timestamp>",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_bytes": 12345
+  },
+  "staged": {
+    "path": "<local exchange>\\in\\commissioning-job-001\\input.xlsm",
+    "observed_utc": "<runtime-generated UTC timestamp>",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_bytes": 12345
+  },
+  "last_mile": {
+    "path": "<host-owned review jobs>\\commissioning-job-001\\input.xlsm",
+    "observed_utc": "<runtime-generated UTC timestamp>",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_bytes": 12345
+  },
+  "result": {
+    "path": "<local exchange>\\out\\commissioning-job-001\\result.xlsm",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "size_bytes": 12345,
+    "one_drive_outbox_path": "<OneDrive Inbox>\\Herdr Review Exchange\\Outbox\\commissioning-job-001\\result.xlsm",
+    "one_drive_outbox_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "provenance": {
+    "repository": "STModel-Private",
+    "branch": "<commissioning source branch>",
+    "commit": "<reviewed source commit>"
+  },
+  "security": {
+    "interactive_session_required": true,
+    "macros": "disabled",
+    "external_links": "not-updated",
+    "data_connections": "disabled",
+    "trusted_locations": "none-added",
+    "canonical_workbook_mutated": false
+  }
+}
