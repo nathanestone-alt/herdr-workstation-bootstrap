@@ -28,9 +28,43 @@ command -v git >/dev/null 2>&1 || fail 'git is required for the password-hygiene
 
 assert_secret_not_in_argv() {
   local script_path="${BASH_SOURCE[0]}"
-  if rg -n -- '(^|[[:space:];|&])rg.*"\$secret"' "$script_path" >/dev/null 2>&1; then
-    fail 'password scanner source passes the secret to an rg argument'
-  fi
+  local dollar='$'
+  local dollar_regex='\$'
+  local secret_ref="${dollar}secret"
+  local occurrence_pattern="${dollar_regex}secret\\b|${dollar_regex}\\{secret\\}"
+  local allow_assignment='secret=""'
+  local allow_read='IFS= read -r secret || fail '\''password-manager input was not supplied'\'''
+  local allow_empty="[[ -n \"${secret_ref}\" ]] || fail 'password-manager input was empty'"
+  local allow_printf="  printf '%s\\n' \"${secret_ref}\" |"
+  local allow_compare="    if [[ \"\$line\" == *\"${secret_ref}\"* ]]; then"
+  local -a allowed_lines=(
+    "$allow_assignment"
+    "$allow_read"
+    "$allow_empty"
+    "$allow_printf"
+    "$allow_compare"
+  )
+  local matches rg_status line_no source_line allowed_line allowed
+
+  set +e
+  matches="$(rg -n --no-heading --color never -e "$occurrence_pattern" -- "$script_path")"
+  rg_status=$?
+  set -e
+  [[ "$rg_status" -eq 0 || "$rg_status" -eq 1 ]] ||
+    fail 'password scanner could not inspect its source for secret usages'
+
+  while IFS=: read -r line_no source_line; do
+    [[ -n "$line_no" ]] || continue
+    allowed=1
+    for allowed_line in "${allowed_lines[@]}"; do
+      if [[ "$source_line" == "$allowed_line" ]]; then
+        allowed=0
+        break
+      fi
+    done
+    (( allowed == 0 )) ||
+      fail "password scanner source has an unallowlisted secret usage at line ${line_no}; review and extend the allowlist consciously"
+  done <<< "$matches"
 }
 assert_secret_not_in_argv
 
