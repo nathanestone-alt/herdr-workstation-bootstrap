@@ -522,6 +522,17 @@ expect_receipt_rejection pyvenv-nbsp-key-site 'FAIL receipt evidence pyvenv.cfg 
 printf 'home = %s\nhome\x1f = /decoy\ninclude-system-site-packages = false\nversion = %s\n' \
   "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
 expect_receipt_rejection pyvenv-control-key-home 'FAIL receipt evidence pyvenv.cfg contract'
+# A carriage return is a line separator to CPython's universal-newline file
+# iteration but not to a newline-only reader, so a decoy line + embedded CR +
+# smuggled directive would let the runtime enable system-site-packages (or
+# redirect home) while a naive reader sees one benign line. The reader must
+# split on CR as CPython does, exposing the smuggled key as a duplicate.
+printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\ndecoy = 1\rinclude-system-site-packages = true\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-embedded-cr-site 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\ndecoy = 1\rhome = /decoy/evil\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-embedded-cr-home 'FAIL receipt evidence pyvenv.cfg contract'
 /usr/bin/mv -T -- "$test_root/pyvenv.cfg.good" "$fixture_home/.local/pyvenv.cfg"
 
 /usr/bin/mv -T -- "$fixture_authority_path" "$test_root/receipt-authority.json.good"

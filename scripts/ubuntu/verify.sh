@@ -470,15 +470,20 @@ read_receipt_pyvenv_value() {
   # smuggling; (2) matches the key case-insensitively like .lower(); and
   # (3) rejects the file as ambiguous when more than one line resolves to the
   # requested key, which is stricter than, and never disagrees with, last-wins.
+  # Split records exactly as CPython's `for line in f` does — on \r\n, \r, or \n
+  # (universal newlines) — so a carriage return embedded in a line becomes its
+  # own record here just as it starts a new line for the consumer; an otherwise
+  # hidden `\r`-smuggled directive then trips the duplicate-key rejection below.
   # A rejecting path must print NOTHING: the sole caller captures stdout through
-  # `|| true`, discarding the exit status, so any emitted value is trusted. The
-  # `bad` flag defers the non-ASCII rejection to END (an in-rule `exit` would
-  # still run END and print the last matched value), keeping reject == empty.
+  # `|| true`, discarding the exit status, so any emitted value is trusted. Any
+  # byte outside printable ASCII or tab is rejected (deferred to END, since an
+  # in-rule `exit` would still run END and print the last matched value),
+  # closing NBSP/control-character key smuggling.
   /usr/bin/gawk -v key="$key" '
-    /[^ -~\t\r]/ { bad = 1 }
+    BEGIN { RS = "\r\n|\r|\n" }
     {
       line = $0
-      sub(/\r$/, "", line)
+      if (line ~ /[^ -~\t]/) { bad = 1 }
       eq = index(line, "=")
       if (eq == 0) {
         lhs = line
