@@ -216,7 +216,7 @@ verify_resolve_command() {
     if [[ -e "$candidate" || -L "$candidate" ]]; then
       resolved="$(/usr/bin/realpath -e -- "$candidate" 2>/dev/null || true)"
       [[ -n "$verify_home_real" && -f "$resolved" && -x "$resolved" ]] || return 1
-      if path_is_under "$resolved" "$HOME/.local/bin" || path_is_under "$resolved" "$HOME/.cargo" || path_is_under "$resolved" "$HOME/.local/lib/node-v$NODE_VERSION-linux-x64"; then
+      if path_is_under "$resolved" "$HOME/.local/bin" || path_is_under "$resolved" "$HOME/.cargo" || path_is_under "$resolved" "$HOME/.local/lib/node-v$NODE_VERSION-linux-x64" || path_is_under "$resolved" "$HOME/.local/lib/herdr-workstation/uv/$UV_VERSION/$UV_PLATFORM"; then
         printf '%s\n' "$candidate"
         return 0
       fi

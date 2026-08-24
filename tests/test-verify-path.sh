@@ -91,10 +91,17 @@ if [[ "${1:-}" == --version ]]; then printf '%s\n' '$POWERSHELL_VERSION'; else p
 EOF
 chmod 0755 "$fixture_system_bin"/*
 
-cat > "$managed_bin/uv" <<EOF
+# uv is published as a symlink into its managed runtime directory, exactly as
+# production installs it (fence_replace_link in bootstrap.sh), so the verifier's
+# managed-command resolution must accept that location, not just ~/.local/bin.
+uv_runtime_dir="$fixture_home/.local/lib/herdr-workstation/uv/$UV_VERSION/$UV_PLATFORM"
+mkdir -p "$uv_runtime_dir"
+cat > "$uv_runtime_dir/uv" <<EOF
 #!/usr/bin/bash
 printf 'uv %s (%s)\\n' '$UV_VERSION' '$UV_PLATFORM'
 EOF
+chmod 0755 "$uv_runtime_dir/uv"
+/usr/bin/ln -s -- "$uv_runtime_dir/uv" "$managed_bin/uv"
 cat > "$managed_bin/python3.13" <<EOF
 #!/usr/bin/bash
 printf 'Python %s\\n' '$PYTHON_VERSION'
@@ -180,7 +187,7 @@ cat > "$managed_bin/herdr" <<EOF
 printf 'herdr %s\\n' '$HERDR_VERSION'
 EOF
 chmod 0755 \
-  "$managed_bin/uv" "$managed_bin/python3.13" "$managed_bin/py" \
+  "$managed_bin/python3.13" "$managed_bin/py" \
   "$managed_bin/rustup" "$managed_bin/rustc" "$managed_bin/herdr"
 for managed_stub in cargo; do
   printf '#!/usr/bin/bash\nexit 0\n' > "$managed_bin/$managed_stub"
