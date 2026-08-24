@@ -453,8 +453,16 @@ expect_receipt_rejection authority-digest 'FAIL receipt mismatch receipt_authori
 /usr/bin/sed -i "s|^receipt_authority_path=.*$|receipt_authority_path=$fixture_authority_dir/decoy-authority.json|" "$toolchain_manifest"
 expect_receipt_rejection authority-path 'FAIL receipt mismatch receipt_authority_path'
 
-/usr/bin/sed -i '/^python3.13_pyvenv_cfg=/d' "$toolchain_manifest"
-expect_receipt_rejection missing-pyvenv 'FAIL receipt missing python3.13_pyvenv_cfg'
+# Every producer evidence key fails closed when absent, and a repeated
+# assignment is rejected as a duplicate rather than silently re-validated.
+for evidence_key in python3.13_kind python3.13_sha256 python3.13_pyvenv_cfg \
+  receipt_authority_path receipt_authority_sha256; do
+  /usr/bin/sed -i "/^${evidence_key}=/d" "$toolchain_manifest"
+  expect_receipt_rejection "missing-${evidence_key}" "FAIL receipt missing $evidence_key"
+  duplicate_line="$(grep -m1 -- "^${evidence_key}=" "$toolchain_manifest")"
+  printf '%s\n' "$duplicate_line" >> "$toolchain_manifest"
+  expect_receipt_rejection "duplicate-${evidence_key}" "FAIL receipt duplicate key $evidence_key"
+done
 
 # Evidence that no longer matches the producer contract fails closed even when
 # the recorded manifest value is untouched.
@@ -468,6 +476,27 @@ expect_receipt_rejection python-symlink 'FAIL receipt evidence python3.13 is not
 printf 'home = %s\ninclude-system-site-packages = true\nversion = %s\n' \
   "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
 expect_receipt_rejection pyvenv-contract 'FAIL receipt evidence pyvenv.cfg contract'
+# Assignments carrying an extra '=' delimiter are complete values, so the
+# strict contract must reject them instead of validating a truncated prefix.
+printf 'home = %s=decoy\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-home-extra-delimiter 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\ninclude-system-site-packages = false=true\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-site-extra-delimiter 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\ninclude-system-site-packages = false\nversion = %s=0\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-version-extra-delimiter 'FAIL receipt evidence pyvenv.cfg contract'
+# Duplicate, bare, and absent assignments stay rejected with the parser fix.
+printf 'home = %s\nhome = %s\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$python_runtime_root" "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-duplicate-home 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-bare-home 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'include-system-site-packages = false\nversion = %s\n' \
+  "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-missing-home 'FAIL receipt evidence pyvenv.cfg contract'
 /usr/bin/mv -T -- "$test_root/pyvenv.cfg.good" "$fixture_home/.local/pyvenv.cfg"
 
 /usr/bin/mv -T -- "$fixture_authority_path" "$test_root/receipt-authority.json.good"

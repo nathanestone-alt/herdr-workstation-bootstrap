@@ -460,9 +460,21 @@ record_receipt_first_line() {
 read_receipt_pyvenv_value() {
   local config_path="$1"
   local key="$2"
-  /usr/bin/gawk -F= -v key="$key" '
-    $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
-      value = $2
+  /usr/bin/gawk -v key="$key" '
+    {
+      eq = index($0, "=")
+      if (eq == 0) {
+        lhs = $0
+        sub(/^[[:space:]]+/, "", lhs)
+        sub(/[[:space:]]+$/, "", lhs)
+        if (lhs == key) count++
+        next
+      }
+      lhs = substr($0, 1, eq - 1)
+      sub(/^[[:space:]]+/, "", lhs)
+      sub(/[[:space:]]+$/, "", lhs)
+      if (lhs != key) next
+      value = substr($0, eq + 1)
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+$/, "", value)
       result = value
