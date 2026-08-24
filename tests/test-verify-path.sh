@@ -192,6 +192,32 @@ printf 'rtk %s\\n' '$RTK_VERSION'
 EOF
 chmod 0755 "$fixture_home/.cargo/bin/rtk"
 
+# Producer-shaped Python evidence: the managed launcher is a regular file, and
+# its controlling pyvenv.cfg names the locked managed runtime.
+python_runtime_root="$fixture_home/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+cat > "$fixture_home/.local/pyvenv.cfg" <<EOF
+home = $python_runtime_root
+include-system-site-packages = false
+version = $PYTHON_VERSION
+EOF
+chmod 0644 "$fixture_home/.local/pyvenv.cfg"
+python_launcher_sha256="$(/usr/bin/sha256sum -- "$managed_bin/python3.13" | /usr/bin/gawk '{print $1}')"
+
+# Producer-shaped receipt-authority evidence. The fixture publishes its own
+# authority envelope and the committed fixture bootstrap seam points at it, so
+# the verifier resolves the same path the producer recorded.
+fixture_authority_dir="$fixture_root/etc/stmodel/issue-961"
+fixture_authority_path="$fixture_authority_dir/receipt-authority.json"
+mkdir -p "$fixture_authority_dir"
+printf '{"schema_version":1,"authority_id":"#961-installation-authority-v1"}\n' > "$fixture_authority_path"
+chmod 0644 "$fixture_authority_path"
+authority_sha256="$(/usr/bin/sha256sum -- "$fixture_authority_path" | /usr/bin/gawk '{print $1}')"
+cat >> "$source_fixture/scripts/ubuntu/bootstrap.sh" <<EOF
+bootstrap_receipt_authority_path() {
+  printf '%s\\n' '$fixture_authority_path'
+}
+EOF
+
 # Make the fixture's verify entrypoint use only the disposable host-command
 # seam. This override is committed into the fixture transport before the
 # launcher is provisioned, so it cannot be injected after the capability gate.
@@ -220,6 +246,7 @@ fi
 EOF
 chmod 0755 "$source_fixture/scripts/ubuntu/verify.sh"
 
+toolchain_manifest="$fixture_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
 {
   printf 'receipt_format=issue-961-toolchain-v2\n'
   printf 'lock_sha256=%s\n' "$lock_sha256"
@@ -227,6 +254,9 @@ chmod 0755 "$source_fixture/scripts/ubuntu/verify.sh"
   printf 'host_architecture=x86_64\n'
   printf 'uv_path=%s\n' "$fixture_home/.local/bin/uv"
   printf 'python3.13_path=%s\n' "$fixture_home/.local/bin/python3.13"
+  printf 'python3.13_kind=regular-file\n'
+  printf 'python3.13_sha256=%s\n' "$python_launcher_sha256"
+  printf 'python3.13_pyvenv_cfg=%s\n' "$fixture_home/.local/pyvenv.cfg"
   printf 'py_path=%s\n' "$fixture_home/.local/bin/py"
   printf 'rtk_path=%s\n' "$fixture_home/.cargo/bin/rtk"
   printf 'rtk_version=rtk %s\n' "$RTK_VERSION"
@@ -255,10 +285,12 @@ chmod 0755 "$source_fixture/scripts/ubuntu/verify.sh"
   printf 'bun=%s\n' "$BUN_VERSION"
   printf 'herdr=herdr %s\n' "$HERDR_VERSION"
   printf 'powershell=%s\n' "$POWERSHELL_VERSION"
+  printf 'receipt_authority_path=%s\n' "$fixture_authority_path"
+  printf 'receipt_authority_sha256=%s\n' "$authority_sha256"
   for package in cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
     printf 'apt:%s=fixture-%s\n' "$package" "$package"
   done
-} > "$fixture_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+} > "$toolchain_manifest"
 
 /usr/bin/git -C "$source_fixture" add -f .
 /usr/bin/git -C "$source_fixture" commit -qm 'verify launcher fixture'
@@ -306,6 +338,16 @@ grep -Fq 'PASS receipt npm=11.6.0' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost npm receipt parity.' >&2; exit 1; }
 grep -Fq "PASS receipt codex=codex-cli $CODEX_VERSION" "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost Codex receipt parity.' >&2; exit 1; }
+grep -Fq 'PASS receipt python3.13_kind=regular-file' "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost Python kind receipt parity.' >&2; exit 1; }
+grep -Fq "PASS receipt python3.13_sha256=$python_launcher_sha256" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost Python digest receipt parity.' >&2; exit 1; }
+grep -Fq "PASS receipt python3.13_pyvenv_cfg=$fixture_home/.local/pyvenv.cfg" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost pyvenv.cfg receipt parity.' >&2; exit 1; }
+grep -Fq "PASS receipt receipt_authority_path=$fixture_authority_path" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost receipt-authority path parity.' >&2; exit 1; }
+grep -Fq "PASS receipt receipt_authority_sha256=$authority_sha256" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost receipt-authority digest parity.' >&2; exit 1; }
 grep -Fxq 'pinned-node-executed-npm' "$pinned_node_marker" ||
   { cat "$verify_output" >&2; echo 'Pinned Node did not execute npm-cli.js.' >&2; exit 1; }
 grep -Fxq 'pinned-node-executed-codex' "$pinned_node_marker" ||
@@ -367,6 +409,76 @@ set -e
 }
 grep -Eqi 'capability|launcher' "$test_root/direct-verify-output" ||
   { cat "$test_root/direct-verify-output" >&2; echo 'Direct verify lacked a capability rejection.' >&2; exit 1; }
+
+# The producer-emitted receipt fields are strictly validated, not ignored, and
+# genuinely unknown fields still fail closed.
+cp -- "$toolchain_manifest" "$test_root/toolchain-manifest.good"
+expect_receipt_rejection() {
+  local name="$1"
+  local pattern="$2"
+  local output="$test_root/receipt-$name-output"
+  local status
+  set +e
+  run_verify > "$output" 2>&1
+  status=$?
+  set -e
+  (( status == 1 )) || {
+    cat "$output" >&2
+    echo "Verify returned $status instead of receipt rejection 1 for $name." >&2
+    exit 1
+  }
+  grep -Fq "$pattern" "$output" || {
+    cat "$output" >&2
+    echo "Verify did not report '$pattern' for $name." >&2
+    exit 1
+  }
+  cp -- "$test_root/toolchain-manifest.good" "$toolchain_manifest"
+}
+
+printf 'python3.13_kindness=regular-file\n' >> "$toolchain_manifest"
+expect_receipt_rejection unknown-key 'FAIL receipt unknown key python3.13_kindness'
+
+/usr/bin/sed -i "s|^python3.13_sha256=.*$|python3.13_sha256=$(printf '0%.0s' {1..64})|" "$toolchain_manifest"
+expect_receipt_rejection python-digest 'FAIL receipt mismatch python3.13_sha256'
+
+/usr/bin/sed -i 's|^python3.13_kind=.*$|python3.13_kind=symlink|' "$toolchain_manifest"
+expect_receipt_rejection python-kind 'FAIL receipt mismatch python3.13_kind'
+
+/usr/bin/sed -i "s|^python3.13_pyvenv_cfg=.*$|python3.13_pyvenv_cfg=$fixture_home/.local/pyvenv.cfg.decoy|" "$toolchain_manifest"
+expect_receipt_rejection pyvenv-path 'FAIL receipt mismatch python3.13_pyvenv_cfg'
+
+/usr/bin/sed -i "s|^receipt_authority_sha256=.*$|receipt_authority_sha256=$(printf '0%.0s' {1..64})|" "$toolchain_manifest"
+expect_receipt_rejection authority-digest 'FAIL receipt mismatch receipt_authority_sha256'
+
+/usr/bin/sed -i "s|^receipt_authority_path=.*$|receipt_authority_path=$fixture_authority_dir/decoy-authority.json|" "$toolchain_manifest"
+expect_receipt_rejection authority-path 'FAIL receipt mismatch receipt_authority_path'
+
+/usr/bin/sed -i '/^python3.13_pyvenv_cfg=/d' "$toolchain_manifest"
+expect_receipt_rejection missing-pyvenv 'FAIL receipt missing python3.13_pyvenv_cfg'
+
+# Evidence that no longer matches the producer contract fails closed even when
+# the recorded manifest value is untouched.
+/usr/bin/mv -T -- "$managed_bin/python3.13" "$managed_bin/python3.13.real"
+/usr/bin/ln -s -- "$managed_bin/python3.13.real" "$managed_bin/python3.13"
+expect_receipt_rejection python-symlink 'FAIL receipt evidence python3.13 is not a regular file'
+/usr/bin/rm -f -- "$managed_bin/python3.13"
+/usr/bin/mv -T -- "$managed_bin/python3.13.real" "$managed_bin/python3.13"
+
+/usr/bin/mv -T -- "$fixture_home/.local/pyvenv.cfg" "$test_root/pyvenv.cfg.good"
+printf 'home = %s\ninclude-system-site-packages = true\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-contract 'FAIL receipt evidence pyvenv.cfg contract'
+/usr/bin/mv -T -- "$test_root/pyvenv.cfg.good" "$fixture_home/.local/pyvenv.cfg"
+
+/usr/bin/mv -T -- "$fixture_authority_path" "$test_root/receipt-authority.json.good"
+expect_receipt_rejection authority-missing 'FAIL receipt evidence receipt authority is not a published regular file'
+/usr/bin/mv -T -- "$test_root/receipt-authority.json.good" "$fixture_authority_path"
+
+run_verify > "$test_root/restored-verify-output" 2>&1 || {
+  cat "$test_root/restored-verify-output" >&2
+  echo 'Restored receipt fixture did not pass again.' >&2
+  exit 1
+}
 
 for hostile_command in env bash git realpath stat sha256sum gawk; do
   [[ ! -e "$test_root/path-$hostile_command-reached" ]] || {

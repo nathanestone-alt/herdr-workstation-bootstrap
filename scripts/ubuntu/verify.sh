@@ -457,6 +457,77 @@ record_receipt_first_line() {
   expected_by_key["$key"]="$output"
 }
 
+read_receipt_pyvenv_value() {
+  local config_path="$1"
+  local key="$2"
+  /usr/bin/gawk -F= -v key="$key" '
+    $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
+      value = $2
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      result = value
+      count++
+    }
+    END { if (count == 1) print result; else exit 1 }
+  ' "$config_path"
+}
+
+record_receipt_python_evidence() {
+  local launcher="$HOME/.local/bin/python3.13"
+  local pyvenv_config="$HOME/.local/pyvenv.cfg"
+  local runtime_root="$HOME/.local/lib/herdr-workstation/python/$PYTHON_VERSION-$PYTHON_RELEASE-$PYTHON_PLATFORM"
+  local digest
+  local venv_home
+  local venv_site
+  local venv_version
+  if [[ ! -f "$launcher" || -L "$launcher" ]]; then
+    echo 'FAIL receipt evidence python3.13 is not a regular file'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  digest="$(/usr/bin/sha256sum -- "$launcher" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
+  if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'FAIL receipt evidence python3.13 digest'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  if [[ ! -f "$pyvenv_config" || -L "$pyvenv_config" ]]; then
+    echo 'FAIL receipt evidence pyvenv.cfg is not a regular file'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  venv_home="$(read_receipt_pyvenv_value "$pyvenv_config" home 2>/dev/null || true)"
+  venv_site="$(read_receipt_pyvenv_value "$pyvenv_config" include-system-site-packages 2>/dev/null || true)"
+  venv_version="$(read_receipt_pyvenv_value "$pyvenv_config" version 2>/dev/null || true)"
+  if [[ "$venv_home" != "$runtime_root" || "$venv_site" != false || "$venv_version" != "$PYTHON_VERSION" ]]; then
+    echo 'FAIL receipt evidence pyvenv.cfg contract'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  expected_by_key[python3.13_kind]='regular-file'
+  expected_by_key[python3.13_sha256]="$digest"
+  expected_by_key[python3.13_pyvenv_cfg]="$pyvenv_config"
+}
+
+record_receipt_authority_evidence() {
+  local authority_path
+  local digest
+  authority_path="$(bootstrap_receipt_authority_path 2>/dev/null || true)"
+  if [[ "$authority_path" != /* || ! -f "$authority_path" || -L "$authority_path" ]]; then
+    echo 'FAIL receipt evidence receipt authority is not a published regular file'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  digest="$(/usr/bin/sha256sum -- "$authority_path" 2>/dev/null | /usr/bin/gawk '{print $1}' || true)"
+  if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'FAIL receipt evidence receipt authority digest'
+    receipt_failures=$((receipt_failures + 1))
+    return 1
+  fi
+  expected_by_key[receipt_authority_path]="$authority_path"
+  expected_by_key[receipt_authority_sha256]="$digest"
+}
+
 validate_locked_receipt_value() {
   local key="$1"
   local value="${expected_by_key[$key]}"
@@ -557,6 +628,8 @@ validate_runtime_receipt() {
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
     uv_path python3.13_path py_path rtk_path rtk_version rtk_url rtk_sha256 uv_version python3.13_version
+    python3.13_kind python3.13_sha256 python3.13_pyvenv_cfg
+    receipt_authority_path receipt_authority_sha256
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
     rustup rustc node npm codex claude bun herdr powershell
@@ -595,6 +668,8 @@ validate_runtime_receipt() {
     return 1
   fi
   local runtime_probe_failed=0
+  record_receipt_python_evidence || runtime_probe_failed=1
+  record_receipt_authority_evidence || runtime_probe_failed=1
   record_receipt_first_line rustup rustup --version || runtime_probe_failed=1
   record_receipt_command rustc rustc --version || runtime_probe_failed=1
   record_receipt_command rtk rtk --version || runtime_probe_failed=1
