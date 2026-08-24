@@ -76,7 +76,8 @@ if ! run_fixture_entrypoint bootstrap --phase validate-lock > "$bootstrap_output
 fi
 grep -Fq 'Ubuntu toolchain lock validation passed.' "$bootstrap_output" ||
   { cat "$bootstrap_output" >&2; echo 'Launcher did not reach bootstrap end to end.' >&2; exit 1; }
-if ! run_fixture_entrypoint receipt-authority --help > "$test_root/receipt-help-output" 2>&1; then
+if ! run_fixture_entrypoint receipt-authority --help --fixture-root "$fixture_root" \
+  > "$test_root/receipt-help-output" 2>&1; then
   cat "$test_root/receipt-help-output" >&2
   exit 1
 fi
@@ -103,7 +104,8 @@ clean_bootstrap_hash="$(/usr/bin/git -C "$source_fixture" hash-object -- scripts
 [[ "$dirty_bootstrap_hash" != "$clean_bootstrap_hash" ]] ||
   { echo 'Dirty local bootstrap fixture was not changed.' >&2; exit 1; }
 run_fixture_entrypoint bootstrap --phase validate-lock > "$test_root/dirty-bootstrap-output" 2>&1
-run_fixture_entrypoint receipt-authority --help > "$test_root/dirty-receipt-output" 2>&1
+run_fixture_entrypoint receipt-authority --help --fixture-root "$fixture_root" \
+  > "$test_root/dirty-receipt-output" 2>&1
 set +e
 run_fixture_entrypoint verify > "$test_root/dirty-verify-output" 2>&1
 dirty_verify_status=$?
