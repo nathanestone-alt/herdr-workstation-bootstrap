@@ -176,9 +176,20 @@ new_home() {
 write_toolchain_receipt() {
   local home="$1"
   local lock_sha256
+  local herdr_output
+  local herdr_version
+  local herdr_sha256
+  local herdr_newer_than_lock=false
   # shellcheck disable=SC1090
   source "$fixture_root/config/ubuntu-toolchain.lock"
   lock_sha256="$(sha256sum "$fixture_root/config/ubuntu-toolchain.lock" | awk '{print $1}')"
+  herdr_output="$("$home/.local/bin/herdr" --version)"
+  herdr_version="$(printf '%s\n' "$herdr_output" | awk '{print $NF}')"
+  herdr_sha256="$(sha256sum -- "$home/.local/bin/herdr" | awk '{print $1}')"
+  if [[ "$(printf '%s\n%s\n' "$HERDR_VERSION" "$herdr_version" | LC_ALL=C sort -V | head -n 1)" == "$HERDR_VERSION" &&
+    "$herdr_version" != "$HERDR_VERSION" ]]; then
+    herdr_newer_than_lock=true
+  fi
   mkdir -p "$home/.local/state/herdr-workstation-bootstrap"
   {
     printf 'receipt_format=issue-961-toolchain-v2\n'
@@ -209,7 +220,10 @@ write_toolchain_receipt() {
     printf 'codex=codex-cli %s\n' "$CODEX_VERSION"
     printf 'claude=%s\n' "$CLAUDE_VERSION"
     printf 'bun=%s\n' "$BUN_VERSION"
-    printf 'herdr=herdr %s\n' "$HERDR_VERSION"
+    printf 'herdr=%s\n' "$herdr_output"
+    printf 'herdr_version=%s\n' "$herdr_version"
+    printf 'herdr_sha256=%s\n' "$herdr_sha256"
+    printf 'herdr_newer_than_lock=%s\n' "$herdr_newer_than_lock"
     printf 'powershell=%s\n' "$POWERSHELL_VERSION"
     for package in cifs-utils curl gawk git git-lfs gh jq mosh openssh-client openssh-server ripgrep rsync; do
       printf 'apt:%s=fixture-%s\n' "$package" "$package"
@@ -703,6 +717,24 @@ set -e
 assert_no_owned_transaction_residue "$candidate_receipt_home"
 printf 'Full toolchain receipt compatibility: starting_status=%s (rejected), candidate_status=%s (accepted).\n' \
   "$starting_receipt_status" "$candidate_receipt_status"
+
+# Differential floor case: the payload consumer accepts a user-managed Herdr
+# newer than the lock and requires the actual manifest fields.
+make_fixture
+newer_receipt_home="$(FIXTURE_HERDR_VERSION=0.8.3 new_home producer-shaped-newer)"
+newer_receipt_output="$test_root/producer-shaped-newer.out"
+set +e
+HOME="$newer_receipt_home" PATH="$newer_receipt_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$newer_receipt_output" 2>&1
+newer_receipt_status=$?
+set -e
+[[ "$newer_receipt_status" == 0 ]] || { cat "$newer_receipt_output" >&2; exit 1; }
+newer_manifest="$newer_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+grep -Fqx 'herdr=herdr 0.8.3' "$newer_manifest"
+grep -Fqx 'herdr_version=0.8.3' "$newer_manifest"
+grep -Fqx 'herdr_newer_than_lock=true' "$newer_manifest"
+printf 'Herdr floor parity: locked=%s, newer=%s (both accepted).\n' \
+  "$candidate_receipt_status" "$newer_receipt_status"
 
 # Every producer field is required exactly once, and runtime/managed-tool
 # contracts remain fail-closed before any payload destination mutation.

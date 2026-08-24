@@ -563,6 +563,7 @@ validate_locked_receipt_value() {
   local key="$1"
   local value="${expected_by_key[$key]}"
   local escaped_version
+  local actual_version
   case "$key" in
     rustup)
       escaped_version="${RUSTUP_VERSION//./\\.}"
@@ -593,8 +594,16 @@ validate_locked_receipt_value() {
       [[ "$value" == "$BUN_VERSION" ]] || { echo "FAIL receipt locked contract $key"; return 1; }
       ;;
     herdr)
-      escaped_version="${HERDR_VERSION//./\\.}"
-      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || { echo "FAIL receipt locked contract $key"; return 1; }
+      if [[ "$value" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]]; then
+        actual_version="${BASH_REMATCH[1]}"
+        bootstrap_version_at_least "$actual_version" "$HERDR_VERSION" || {
+          echo "FAIL receipt locked contract $key"
+          return 1
+        }
+      else
+        echo "FAIL receipt locked contract $key"
+        return 1
+      fi
       ;;
     powershell)
       [[ "$value" == "$POWERSHELL_VERSION" ]] || { echo "FAIL receipt locked contract $key"; return 1; }
@@ -655,6 +664,12 @@ validate_runtime_receipt() {
   local key
   local value
   local expected
+  local herdr_path
+  local herdr_attestation
+  local herdr_output
+  local herdr_version
+  local herdr_sha256
+  local herdr_newer_than_lock
   local receipt_failures=0
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
@@ -663,7 +678,7 @@ validate_runtime_receipt() {
     receipt_authority_path receipt_authority_sha256
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
-    rustup rustc node npm codex claude bun herdr powershell
+    rustup rustc node npm codex claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -713,6 +728,24 @@ validate_runtime_receipt() {
   record_receipt_command powershell pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' || runtime_probe_failed=1
   if (( runtime_probe_failed )); then
     return 1
+  fi
+  herdr_path="$(verify_resolve_command herdr 2>/dev/null || true)"
+  herdr_attestation=''
+  if [[ -n "$herdr_path" ]]; then
+    herdr_attestation="$(bootstrap_herdr_attestation "$herdr_path" 2>/dev/null || true)"
+  fi
+  if [[ -z "$herdr_attestation" ]]; then
+    echo 'FAIL receipt locked contract herdr'
+    receipt_failures=$((receipt_failures + 1))
+  else
+    IFS=$'\t' read -r herdr_output herdr_version herdr_sha256 herdr_newer_than_lock <<< "$herdr_attestation"
+    if [[ "$herdr_output" != "${expected_by_key[herdr]:-}" ]]; then
+      echo 'FAIL receipt runtime probe changed herdr output'
+      receipt_failures=$((receipt_failures + 1))
+    fi
+    expected_by_key[herdr_version]="$herdr_version"
+    expected_by_key[herdr_sha256]="$herdr_sha256"
+    expected_by_key[herdr_newer_than_lock]="$herdr_newer_than_lock"
   fi
   for runtime_key in rustup rustc rtk node npm codex claude bun herdr powershell; do
     if ! validate_locked_receipt_value "$runtime_key"; then

@@ -21,6 +21,7 @@ readonly bootstrap_rm_bin='/usr/bin/rm'
 readonly bootstrap_mkdir_bin='/usr/bin/mkdir'
 readonly bootstrap_chown_bin='/usr/bin/chown'
 readonly bootstrap_head_bin='/usr/bin/head'
+readonly bootstrap_sort_bin='/usr/bin/sort'
 readonly bootstrap_getent_bin='/usr/bin/getent'
 readonly bootstrap_id_bin='/usr/bin/id'
 readonly bootstrap_bash_bin='/usr/bin/bash'
@@ -150,7 +151,7 @@ for bootstrap_trusted_binary in \
   "$bootstrap_dirname_bin" "$bootstrap_find_bin" "$bootstrap_mktemp_bin" \
   "$bootstrap_chmod_bin" "$bootstrap_stat_bin" "$bootstrap_sha256_bin" \
   "$bootstrap_awk_bin" "$bootstrap_cp_bin" "$bootstrap_rm_bin" "$bootstrap_mkdir_bin" \
-  "$bootstrap_chown_bin" "$bootstrap_head_bin" "$bootstrap_getent_bin" "$bootstrap_id_bin" \
+  "$bootstrap_chown_bin" "$bootstrap_head_bin" "$bootstrap_sort_bin" "$bootstrap_getent_bin" "$bootstrap_id_bin" \
   "$bootstrap_bash_bin" "$bootstrap_setpriv_bin"; do
   bootstrap_trust_assert_binary "$bootstrap_trusted_binary"
 done
@@ -158,6 +159,29 @@ done
 declare -a bootstrap_cleanup_paths=()
 bootstrap_register_cleanup() {
   [[ -n "${1:-}" ]] && bootstrap_cleanup_paths+=("$1")
+}
+
+bootstrap_version_at_least() {
+  local actual="$1"
+  local floor="$2"
+  local sorted
+  local lowest
+  [[ "$actual" =~ ^[0-9]+([.][0-9]+)*$ && "$floor" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+  sorted="$(printf '%s\n%s\n' "$floor" "$actual" | "$bootstrap_sort_bin" -V)"
+  lowest="${sorted%%$'\n'*}"
+  [[ "$lowest" == "$floor" ]]
+}
+
+bootstrap_version_greater() {
+  bootstrap_version_at_least "$1" "$2" && [[ "$1" != "$2" ]]
+}
+
+bootstrap_herdr_version() {
+  local herdr_path="$1"
+  local output
+  output="$("$herdr_path" --version 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 bootstrap_private_helper_dir=''
@@ -1379,6 +1403,12 @@ validate_toolchain_lock() {
   [[ "$RTK_URL" == "https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION/rtk-x86_64-unknown-linux-musl.tar.gz" ]] || {
     echo 'RTK_URL does not identify the pinned official x86-64 Linux release artifact.' >&2; return 1;
   }
+  [[ "$HERDR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'HERDR_VERSION is not a pinned semantic version.' >&2; return 1;
+  }
+  [[ "$HERDR_URL" == "https://github.com/herdrdev/herdr/releases/download/v$HERDR_VERSION/herdr-linux-x86_64" ]] || {
+    echo 'HERDR_URL does not identify the pinned official Herdr x86-64 release artifact.' >&2; return 1;
+  }
   [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
     echo 'TAILSCALE_VERSION is not a pinned semantic version.' >&2; return 1;
   }
@@ -1500,6 +1530,43 @@ download_verified() {
     bootstrap_exec_system /usr/bin/rm -f -- "$destination"
     exit 23
   }
+}
+
+bootstrap_herdr_attestation() {
+  local herdr_path="$1"
+  local output
+  local version
+  local sha256
+  local newer_than_lock=false
+  output="$("$herdr_path" --version 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]] || return 1
+  version="${BASH_REMATCH[1]}"
+  bootstrap_version_at_least "$version" "$HERDR_VERSION" || return 1
+  sha256="$("$bootstrap_sha256_bin" -- "$herdr_path" | "$bootstrap_awk_bin" '{print $1}')" || return 1
+  [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if bootstrap_version_greater "$version" "$HERDR_VERSION"; then
+    newer_than_lock=true
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$output" "$version" "$sha256" "$newer_than_lock"
+}
+
+converge_herdr() {
+  local expected_fd="${1:-}"
+  local herdr_path="$bin_dir/herdr"
+  local installed_version=''
+  local herdr_temp
+  if [[ -x "$herdr_path" ]]; then
+    installed_version="$(bootstrap_herdr_version "$herdr_path" 2>/dev/null || true)"
+  fi
+  if bootstrap_version_greater "$installed_version" "$HERDR_VERSION"; then
+    printf 'Keeping user-managed Herdr %s; lock floor is %s.\n' "$installed_version" "$HERDR_VERSION" >&2
+    return 0
+  fi
+  herdr_temp="$(mktemp)"
+  bootstrap_register_cleanup "$herdr_temp"
+  download_verified "$HERDR_URL" "$HERDR_SHA256" "$herdr_temp"
+  fence_replace_file "$herdr_temp" "$herdr_path" 0755 before-herdr-publish "$expected_fd"
+  herdr_temp=''
 }
 
 install_locked_tailscale() (
@@ -2030,6 +2097,11 @@ install_tools_transaction() {
   local ps_bin
   local rtk_existing_target
   local receipt_authority_manifest_path
+  local herdr_attestation
+  local herdr_output
+  local herdr_version
+  local herdr_sha256
+  local herdr_newer_than_lock
   ps_bin="$(bootstrap_command_path ps)"
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
@@ -2215,16 +2287,18 @@ install_tools_transaction() {
     fence_replace_link "$executable_real" "$bin_dir/$executable" "before-$executable-link-publish" "$bin_fd"
   done
 
-  herdr_temp="$(mktemp)"
-  bootstrap_register_cleanup "$herdr_temp"
-  download_verified "$HERDR_URL" "$HERDR_SHA256" "$herdr_temp"
-  fence_replace_file "$herdr_temp" "$bin_dir/herdr" 0755 before-herdr-publish "$bin_fd"
-  herdr_temp=''
+  converge_herdr "$bin_fd"
 
   [[ "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version | /usr/bin/gawk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
   [[ "$("$node_anchor/bin/claude" --version | /usr/bin/gawk '{ print $1 }')" == "$CLAUDE_VERSION" ]] || { echo 'Claude version does not match lock.' >&2; exit 24; }
   [[ "$("$node_anchor/bin/bun" --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
-  [[ "$("$bin_dir/herdr" --version | /usr/bin/gawk '{ print $NF }')" == "$HERDR_VERSION" ]] || { echo 'Herdr version does not match lock.' >&2; exit 24; }
+  herdr_attestation="$(bootstrap_herdr_attestation "$bin_dir/herdr" || true)"
+  IFS=$'\t' read -r herdr_output herdr_version herdr_sha256 herdr_newer_than_lock <<< "$herdr_attestation"
+  [[ -n "$herdr_output" && -n "$herdr_version" && "$herdr_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$herdr_newer_than_lock" =~ ^(true|false)$ ]] || {
+      echo 'Herdr version is below the lock or its attestation is malformed.' >&2
+      exit 24
+    }
 
   if [[ "${bootstrap_tools_prepare_only:-0}" == 1 ]]; then
     close_fence_fd "$state_fd"
@@ -2283,7 +2357,10 @@ install_tools_transaction() {
     printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
-    printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"
+    printf 'herdr=%s\n' "$herdr_output"
+    printf 'herdr_version=%s\n' "$herdr_version"
+    printf 'herdr_sha256=%s\n' "$herdr_sha256"
+    printf 'herdr_newer_than_lock=%s\n' "$herdr_newer_than_lock"
     printf 'powershell=%s\n' "$("$(bootstrap_command_path pwsh)" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
     printf 'receipt_authority_path=%s\n' "$receipt_authority_manifest_path"
     printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum -- "$receipt_authority_manifest_path" | /usr/bin/gawk '{print $1}')"
@@ -2319,6 +2396,11 @@ install_tools_finalize() {
   local manifest_tmp
   local manifest
   local receipt_authority_manifest_path
+  local herdr_attestation
+  local herdr_output
+  local herdr_version
+  local herdr_sha256
+  local herdr_newer_than_lock
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   validate_toolchain_lock || exit 22
@@ -2340,6 +2422,14 @@ install_tools_finalize() {
   fence_require_directory "$state_dir" "$state_fd" 'tools state directory'
   fence_require_directory "$bin_dir" "$bin_fd" 'tools bin directory'
   fence_require_directory "$node_dir" "$node_fd" 'Node directory'
+
+  herdr_attestation="$(bootstrap_herdr_attestation "$bin_dir/herdr" || true)"
+  IFS=$'\t' read -r herdr_output herdr_version herdr_sha256 herdr_newer_than_lock <<< "$herdr_attestation"
+  [[ -n "$herdr_output" && -n "$herdr_version" && "$herdr_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$herdr_newer_than_lock" =~ ^(true|false)$ ]] || {
+      echo 'Herdr version is below the lock or its attestation is malformed.' >&2
+      exit 24
+    }
 
   manifest="$state_dir/toolchain-manifest.txt"
   receipt_authority_manifest_path="$(bootstrap_receipt_authority_path)"
@@ -2386,7 +2476,10 @@ install_tools_finalize() {
     printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
-    printf 'herdr=%s\n' "$("$bin_dir/herdr" --version)"
+    printf 'herdr=%s\n' "$herdr_output"
+    printf 'herdr_version=%s\n' "$herdr_version"
+    printf 'herdr_sha256=%s\n' "$herdr_sha256"
+    printf 'herdr_newer_than_lock=%s\n' "$herdr_newer_than_lock"
     printf 'powershell=%s\n' "$("$(bootstrap_command_path pwsh)" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
     printf 'receipt_authority_path=%s\n' "$receipt_authority_manifest_path"
     printf 'receipt_authority_sha256=%s\n' "$(/usr/bin/sha256sum -- "$receipt_authority_manifest_path" | /usr/bin/gawk '{print $1}')"

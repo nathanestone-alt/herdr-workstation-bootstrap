@@ -189,6 +189,7 @@ EOF
 chmod 0755 \
   "$managed_bin/python3.13" "$managed_bin/py" \
   "$managed_bin/rustup" "$managed_bin/rustc" "$managed_bin/herdr"
+herdr_binary_sha256="$(/usr/bin/sha256sum -- "$managed_bin/herdr" | /usr/bin/gawk '{print $1}')"
 for managed_stub in cargo; do
   printf '#!/usr/bin/bash\nexit 0\n' > "$managed_bin/$managed_stub"
   chmod 0755 "$managed_bin/$managed_stub"
@@ -291,6 +292,9 @@ toolchain_manifest="$fixture_home/.local/state/herdr-workstation-bootstrap/toolc
   printf 'claude=%s\n' "$CLAUDE_VERSION"
   printf 'bun=%s\n' "$BUN_VERSION"
   printf 'herdr=herdr %s\n' "$HERDR_VERSION"
+  printf 'herdr_version=%s\n' "$HERDR_VERSION"
+  printf 'herdr_sha256=%s\n' "$herdr_binary_sha256"
+  printf 'herdr_newer_than_lock=false\n'
   printf 'powershell=%s\n' "$POWERSHELL_VERSION"
   printf 'receipt_authority_path=%s\n' "$fixture_authority_path"
   printf 'receipt_authority_sha256=%s\n' "$authority_sha256"
@@ -355,6 +359,43 @@ grep -Fq "PASS receipt receipt_authority_path=$fixture_authority_path" "$verify_
   { cat "$verify_output" >&2; echo 'Verify fixture lost receipt-authority path parity.' >&2; exit 1; }
 grep -Fq "PASS receipt receipt_authority_sha256=$authority_sha256" "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost receipt-authority digest parity.' >&2; exit 1; }
+grep -Fq "PASS receipt herdr_version=$HERDR_VERSION" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost the locked Herdr version receipt.' >&2; exit 1; }
+grep -Fq "PASS receipt herdr_sha256=$herdr_binary_sha256" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost the locked Herdr digest receipt.' >&2; exit 1; }
+grep -Fq 'PASS receipt herdr_newer_than_lock=false' "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost the equal-floor Herdr marker.' >&2; exit 1; }
+
+# Differential parity case: a user-managed Herdr newer than the lock must pass
+# verification while the manifest records its actual version, digest, and
+# newer-than-lock marker.
+newer_herdr_version='0.8.3'
+cat > "$managed_bin/herdr" <<EOF
+#!/usr/bin/bash
+printf 'herdr %s\\n' '$newer_herdr_version'
+EOF
+chmod 0755 "$managed_bin/herdr"
+newer_herdr_sha256="$(/usr/bin/sha256sum -- "$managed_bin/herdr" | /usr/bin/gawk '{print $1}')"
+/usr/bin/sed -i \
+  -e "s|^herdr=.*$|herdr=herdr $newer_herdr_version|" \
+  -e "s|^herdr_version=.*$|herdr_version=$newer_herdr_version|" \
+  -e "s|^herdr_sha256=.*$|herdr_sha256=$newer_herdr_sha256|" \
+  -e 's|^herdr_newer_than_lock=.*$|herdr_newer_than_lock=true|' \
+  "$toolchain_manifest"
+newer_verify_output="$test_root/verify-newer-output"
+run_verify > "$newer_verify_output" 2>&1 || {
+  cat "$newer_verify_output" >&2
+  echo 'Newer-than-lock Herdr verifier fixture failed.' >&2
+  exit 1
+}
+grep -Fq "PASS receipt herdr=herdr $newer_herdr_version" "$newer_verify_output" ||
+  { cat "$newer_verify_output" >&2; echo 'Verifier did not attest the newer Herdr version.' >&2; exit 1; }
+grep -Fq "PASS receipt herdr_version=$newer_herdr_version" "$newer_verify_output" ||
+  { cat "$newer_verify_output" >&2; echo 'Verifier did not attest the newer Herdr manifest version.' >&2; exit 1; }
+grep -Fq "PASS receipt herdr_sha256=$newer_herdr_sha256" "$newer_verify_output" ||
+  { cat "$newer_verify_output" >&2; echo 'Verifier did not attest the newer Herdr digest.' >&2; exit 1; }
+grep -Fq 'PASS receipt herdr_newer_than_lock=true' "$newer_verify_output" ||
+  { cat "$newer_verify_output" >&2; echo 'Verifier did not attest the newer Herdr marker.' >&2; exit 1; }
 grep -Fxq 'pinned-node-executed-npm' "$pinned_node_marker" ||
   { cat "$verify_output" >&2; echo 'Pinned Node did not execute npm-cli.js.' >&2; exit 1; }
 grep -Fxq 'pinned-node-executed-codex' "$pinned_node_marker" ||

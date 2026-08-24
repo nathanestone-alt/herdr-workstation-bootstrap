@@ -88,6 +88,21 @@ path_is_under() {
   [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
 }
 
+payload_version_at_least() {
+  local actual="$1"
+  local floor="$2"
+  local sorted
+  local lowest
+  [[ "$actual" =~ ^[0-9]+([.][0-9]+)*$ && "$floor" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+  sorted="$(printf '%s\n%s\n' "$floor" "$actual" | LC_ALL=C sort -V)"
+  lowest="${sorted%%$'\n'*}"
+  [[ "$lowest" == "$floor" ]]
+}
+
+payload_version_greater() {
+  payload_version_at_least "$1" "$2" && [[ "$1" != "$2" ]]
+}
+
 path_present() {
   [[ -e "$1" || -L "$1" ]]
 }
@@ -672,6 +687,9 @@ load_toolchain_lock() {
   expected_python_url="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/${PYTHON_ARCHIVE//+/%2B}"
   [[ "$PYTHON_URL" == "$expected_python_url" ]] || fail_closed 'Toolchain lock Python URL is inconsistent.'
   [[ "$UV_SHA256" =~ ^[0-9a-f]{64}$ && "$PYTHON_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_closed 'Toolchain lock runtime checksum is not exact.'
+  [[ "$HERDR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock Herdr version is not exact.'
+  [[ "$HERDR_URL" == "https://github.com/herdrdev/herdr/releases/download/v$HERDR_VERSION/herdr-linux-x86_64" ]] || fail_closed 'Toolchain lock Herdr URL is inconsistent.'
+  [[ "$HERDR_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_closed 'Toolchain lock Herdr checksum is not exact.'
   [[ "$TAILSCALE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed 'Toolchain lock Tailscale version is not exact.'
   for version_key in RUSTUP_VERSION RUST_TOOLCHAIN NODE_VERSION CODEX_VERSION CLAUDE_VERSION BUN_VERSION HERDR_VERSION POWERSHELL_VERSION; do
     [[ "${!version_key}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail_closed "Toolchain lock version is not exact: $version_key"
@@ -728,8 +746,9 @@ validate_locked_receipt_value() {
       [[ "$value" == "$BUN_VERSION" ]] || fail_closed 'Bun receipt value does not match the locked version contract.'
       ;;
     herdr)
-      escaped_version="${HERDR_VERSION//./\\.}"
-      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || fail_closed 'Herdr receipt value does not match the locked version contract.'
+      [[ "$value" =~ ^[^[:space:]]+[[:space:]][0-9]+([.][0-9]+)*$ ]] || fail_closed 'Herdr receipt value is malformed.'
+      payload_version_at_least "$(printf '%s\n' "$value" | awk '{print $NF}')" "$HERDR_VERSION" ||
+        fail_closed 'Herdr receipt value is below the lock floor.'
       ;;
     powershell)
       [[ "$value" == "$POWERSHELL_VERSION" ]] || fail_closed 'PowerShell receipt value does not match the locked version contract.'
@@ -768,12 +787,16 @@ validate_toolchain_receipt() {
   local key
   local value
   local expected
+  local herdr_path
+  local herdr_version
+  local herdr_sha256
+  local herdr_newer_than_lock=false
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
     uv_path python3.13_path py_path uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
-    rustup rustc node npm codex claude bun herdr powershell
+    rustup rustc node npm codex claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -817,6 +840,18 @@ validate_toolchain_receipt() {
   capture_receipt_command bun bun --version
   capture_receipt_command herdr herdr --version
   capture_receipt_command powershell pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  herdr_path="$HOME/.local/bin/herdr"
+  herdr_version="$(printf '%s\n' "${expected_by_key[herdr]}" | awk '{print $NF}')"
+  [[ "$herdr_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || fail_closed 'Herdr receipt version is malformed.'
+  payload_version_at_least "$herdr_version" "$HERDR_VERSION" || fail_closed 'Herdr receipt value is below the lock floor.'
+  herdr_sha256="$(sha256sum -- "$herdr_path" | awk '{print $1}')" || fail_closed 'Herdr digest probe failed.'
+  [[ "$herdr_sha256" =~ ^[0-9a-f]{64}$ ]] || fail_closed 'Herdr digest probe was malformed.'
+  if payload_version_greater "$herdr_version" "$HERDR_VERSION"; then
+    herdr_newer_than_lock=true
+  fi
+  expected_by_key[herdr_version]="$herdr_version"
+  expected_by_key[herdr_sha256]="$herdr_sha256"
+  expected_by_key[herdr_newer_than_lock]="$herdr_newer_than_lock"
   for runtime_key in rustup rustc node npm codex claude bun herdr powershell; do
     validate_locked_receipt_value "$runtime_key"
   done
