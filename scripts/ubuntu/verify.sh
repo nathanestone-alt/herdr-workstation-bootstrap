@@ -460,27 +460,42 @@ record_receipt_first_line() {
 read_receipt_pyvenv_value() {
   local config_path="$1"
   local key="$2"
+  # The consumer of pyvenv.cfg is CPython site.py, which splits each line at the
+  # first '=', folds the key with str.strip().lower(), and resolves duplicate
+  # keys last-wins (python3.13 .../lib/python3.13/site.py:620-626). To attest
+  # only what CPython actually consumes, this reader must not diverge from that
+  # normalization. It therefore (1) refuses any byte CPython's Unicode
+  # str.strip() could fold but a C-locale gawk trim would not — i.e. anything
+  # outside printable ASCII, tab, or CR — closing NBSP/control-char key
+  # smuggling; (2) matches the key case-insensitively like .lower(); and
+  # (3) rejects the file as ambiguous when more than one line resolves to the
+  # requested key, which is stricter than, and never disagrees with, last-wins.
+  # A rejecting path must print NOTHING: the sole caller captures stdout through
+  # `|| true`, discarding the exit status, so any emitted value is trusted. The
+  # `bad` flag defers the non-ASCII rejection to END (an in-rule `exit` would
+  # still run END and print the last matched value), keeping reject == empty.
   /usr/bin/gawk -v key="$key" '
+    /[^ -~\t\r]/ { bad = 1 }
     {
-      eq = index($0, "=")
+      line = $0
+      sub(/\r$/, "", line)
+      eq = index(line, "=")
       if (eq == 0) {
-        lhs = $0
-        sub(/^[[:space:]]+/, "", lhs)
-        sub(/[[:space:]]+$/, "", lhs)
-        if (lhs == key) count++
-        next
+        lhs = line
+      } else {
+        lhs = substr(line, 1, eq - 1)
       }
-      lhs = substr($0, 1, eq - 1)
-      sub(/^[[:space:]]+/, "", lhs)
-      sub(/[[:space:]]+$/, "", lhs)
-      if (lhs != key) next
-      value = substr($0, eq + 1)
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
+      sub(/^[ \t]+/, "", lhs)
+      sub(/[ \t]+$/, "", lhs)
+      if (tolower(lhs) != key) next
+      if (eq == 0) { count++; next }
+      value = substr(line, eq + 1)
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
       result = value
       count++
     }
-    END { if (count == 1) print result; else exit 1 }
+    END { if (bad) exit 2; if (count == 1) print result; else exit 1 }
   ' "$config_path"
 }
 

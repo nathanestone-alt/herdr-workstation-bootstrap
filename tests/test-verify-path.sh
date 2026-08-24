@@ -457,9 +457,10 @@ expect_receipt_rejection authority-path 'FAIL receipt mismatch receipt_authority
 # assignment is rejected as a duplicate rather than silently re-validated.
 for evidence_key in python3.13_kind python3.13_sha256 python3.13_pyvenv_cfg \
   receipt_authority_path receipt_authority_sha256; do
-  /usr/bin/sed -i "/^${evidence_key}=/d" "$toolchain_manifest"
+  evidence_key_re="${evidence_key//./\\.}"
+  /usr/bin/sed -i "/^${evidence_key_re}=/d" "$toolchain_manifest"
   expect_receipt_rejection "missing-${evidence_key}" "FAIL receipt missing $evidence_key"
-  duplicate_line="$(grep -m1 -- "^${evidence_key}=" "$toolchain_manifest")"
+  duplicate_line="$(grep -m1 -- "^${evidence_key_re}=" "$toolchain_manifest")"
   printf '%s\n' "$duplicate_line" >> "$toolchain_manifest"
   expect_receipt_rejection "duplicate-${evidence_key}" "FAIL receipt duplicate key $evidence_key"
 done
@@ -497,6 +498,30 @@ expect_receipt_rejection pyvenv-bare-home 'FAIL receipt evidence pyvenv.cfg cont
 printf 'include-system-site-packages = false\nversion = %s\n' \
   "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
 expect_receipt_rejection pyvenv-missing-home 'FAIL receipt evidence pyvenv.cfg contract'
+# CPython site.py folds pyvenv.cfg keys with key.strip().lower() and resolves
+# duplicates last-wins, so a case- or whitespace-variant duplicate that a naive
+# case-sensitive/ASCII-only reader treats as a single unambiguous line would let
+# the runtime enable system-site-packages (or redirect home) while the verifier
+# attests isolation. Each variant duplicate must be rejected as ambiguous.
+printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\nInclude-System-Site-Packages = true\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-case-variant-site 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\nINCLUDE-SYSTEM-SITE-PACKAGES = true\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-upper-variant-site 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\nHome = /decoy/evil\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-case-variant-home 'FAIL receipt evidence pyvenv.cfg contract'
+# A non-breaking space (U+00A0) is stripped by Python str.strip() but not by a
+# C-locale gawk trim, so 'include-system-site-packages = true' smuggles a
+# second directive past a byte-blind reader; a control separator (U+001F) is the
+# ASCII-range analogue. Any byte outside printable ASCII/tab/CR must be refused.
+printf 'home = %s\ninclude-system-site-packages = false\nversion = %s\ninclude-system-site-packages\xc2\xa0= true\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-nbsp-key-site 'FAIL receipt evidence pyvenv.cfg contract'
+printf 'home = %s\nhome\x1f = /decoy\ninclude-system-site-packages = false\nversion = %s\n' \
+  "$python_runtime_root" "$PYTHON_VERSION" > "$fixture_home/.local/pyvenv.cfg"
+expect_receipt_rejection pyvenv-control-key-home 'FAIL receipt evidence pyvenv.cfg contract'
 /usr/bin/mv -T -- "$test_root/pyvenv.cfg.good" "$fixture_home/.local/pyvenv.cfg"
 
 /usr/bin/mv -T -- "$fixture_authority_path" "$test_root/receipt-authority.json.good"
