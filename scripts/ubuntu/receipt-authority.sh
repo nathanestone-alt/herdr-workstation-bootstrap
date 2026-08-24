@@ -162,6 +162,91 @@ receipt_exec_system() {
     "${receipt_exec_args[@]}"
 }
 
+receipt_trust_validate_source_snapshot_path() {
+  local path="$1"
+  local boundary="$2"
+  local expected_uid="$3"
+  local expected_gid="$4"
+  local authority_kind="$5"
+  local current="$path"
+  local resolved owner group mode
+  [[ "$path" == /* && -d "$path" && ! -L "$path" ]] || {
+    receipt_trust_fail "$authority_kind source snapshot staging path is not an existing directory: $path"
+  }
+  receipt_trust_reject_symlink_components "$path" || {
+    receipt_trust_fail "$authority_kind source snapshot staging path contains a symlink: $path"
+  }
+  while :; do
+    resolved="$($receipt_realpath_bin -e -- "$current" 2>/dev/null || true)"
+    owner="$($receipt_stat_bin -c '%u' -- "$current" 2>/dev/null || true)"
+    group="$($receipt_stat_bin -c '%g' -- "$current" 2>/dev/null || true)"
+    mode="$($receipt_stat_bin -c '%a' -- "$current" 2>/dev/null || true)"
+    if [[ "$resolved" != "$current" || "$owner" != "$expected_uid" || "$group" != "$expected_gid" ||
+      ! "$mode" =~ ^[0-7]+$ || $((8#$mode & 022)) != 0 ]]; then
+      if [[ "$authority_kind" == fixture ]]; then
+        receipt_trust_fail "fixture source snapshot staging parent is not fixture-owned and non-writable: $current"
+      fi
+      receipt_trust_fail "production source snapshot staging parent is not root-owned and non-writable: $current"
+    fi
+    [[ "$current" == "$boundary" ]] && break
+    [[ "$current" != '/' ]] || {
+      receipt_trust_fail "$authority_kind source snapshot staging path escaped its trust boundary: $path"
+    }
+    current="$($receipt_dirname_bin -- "$current")"
+  done
+}
+
+receipt_prepare_source_snapshot_parent() {
+  local policy_suffix='/etc/herdr-workstation/bootstrap-policy.conf'
+  local policy_path="$launcher_capability_policy_path"
+  local prefix authority_root parent boundary expected_uid expected_gid authority_kind
+  [[ "$policy_path" == *"$policy_suffix" ]] || {
+    receipt_trust_fail 'source snapshot authority policy path is not canonical'
+  }
+  prefix="${policy_path%$policy_suffix}"
+  authority_root="$prefix/var/lib/herdr-workstation/bootstrap/staging"
+  if [[ -n "$receipt_prelude_fixture_root" ]]; then
+    boundary="$($receipt_realpath_bin -e -- "$receipt_prelude_fixture_root" 2>/dev/null || true)"
+    [[ -n "$boundary" && "$boundary" == "$receipt_prelude_fixture_root" && "$prefix" == "$boundary" ]] || {
+      receipt_trust_fail 'fixture source snapshot staging root escaped the fixture root'
+    }
+    expected_uid="$launcher_capability_owner_uid"
+    expected_gid="$launcher_capability_owner_gid"
+    authority_kind=fixture
+  else
+    boundary='/'
+    expected_uid=0
+    expected_gid=0
+    authority_kind=production
+  fi
+  receipt_trust_validate_source_snapshot_path "$authority_root" "$boundary" \
+    "$expected_uid" "$expected_gid" "$authority_kind"
+  parent="$authority_root/source-attestation"
+  receipt_trust_reject_symlink_components "$parent" || {
+    receipt_trust_fail "source snapshot staging parent contains a symlink: $parent"
+  }
+  if [[ -e "$parent" || -L "$parent" ]]; then
+    [[ -d "$parent" && ! -L "$parent" ]] || {
+      receipt_trust_fail "source snapshot staging parent is not a directory: $parent"
+    }
+  else
+    receipt_exec_system "$receipt_mkdir_bin" -- "$parent" || {
+      receipt_trust_fail "source snapshot staging parent could not be created: $parent"
+    }
+    receipt_exec_system "$receipt_chmod_bin" 0755 -- "$parent" || {
+      receipt_trust_fail "source snapshot staging parent permission setup failed: $parent"
+    }
+    if [[ "$authority_kind" == production ]]; then
+      receipt_exec_system "$receipt_chown_bin" 0:0 -- "$parent" || {
+        receipt_trust_fail "source snapshot staging parent ownership setup failed: $parent"
+      }
+    fi
+  fi
+  receipt_trust_validate_source_snapshot_path "$parent" "$boundary" \
+    "$expected_uid" "$expected_gid" "$authority_kind"
+  receipt_source_snapshot_parent="$parent"
+}
+
 receipt_exec_role() {
   local receipt_exec_arg
   local -a receipt_exec_args=()
@@ -626,11 +711,14 @@ fi
 attestation_capability_owner_uid="$launcher_capability_owner_uid"
 attestation_capability_owner_gid="$launcher_capability_owner_gid"
 source "$receipt_private_helper"
+receipt_source_snapshot=''
+receipt_source_manifest=''
+receipt_source_snapshot_parent=''
 if (( receipt_repo_mode == 1 )); then
-  attestation_create_git_snapshot "$receipt_repo_root" '' '' || receipt_trust_fail 'receipt entrypoint checkout failed exact committed-blob attestation'
+  receipt_prepare_source_snapshot_parent
+  attestation_create_git_snapshot "$receipt_repo_root" '' '' true "$receipt_source_snapshot_parent" || receipt_trust_fail 'receipt entrypoint checkout failed exact committed-blob attestation'
   receipt_source_snapshot="$attestation_snapshot_dir"
-else
-  receipt_source_snapshot=''
+  receipt_source_manifest="$attestation_snapshot_manifest"
 fi
 mode='install'
 script_path="$receipt_script_path"
@@ -642,9 +730,15 @@ authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 receipt_path='/etc/stmodel/issue-961/receipt.json'
 source_manifest=''
 source_manifest_supplied=0
+source_manifest_internal=0
 payload_root=''
 payload_manifest_arg=''
 source_commit_binding=''
+if (( receipt_repo_mode == 1 )) && [[ -z "$receipt_prelude_source_root" && -z "$receipt_prelude_source_manifest" ]]; then
+  source_manifest="$receipt_source_manifest"
+  source_commit_binding="$launcher_capability_policy_commit"
+  source_manifest_internal=1
+fi
 fixture_root=''
 default_authority_path='/etc/stmodel/issue-961/receipt-authority.json'
 default_receipt_path='/etc/stmodel/issue-961/receipt.json'
@@ -679,7 +773,7 @@ while [[ $# -gt 0 ]]; do
     --user-home) [[ $# -ge 2 ]] || { usage; exit 2; }; user_home="$2"; shift 2 ;;
     --authority-path) [[ $# -ge 2 ]] || { usage; exit 2; }; authority_path="$2"; shift 2 ;;
     --receipt-path) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_path="$2"; shift 2 ;;
-    --source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; source_manifest="$2"; shift 2 ;;
+    --source-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; source_manifest="$2"; source_manifest_internal=0; shift 2 ;;
     --payload-root) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_root="$2"; shift 2 ;;
     --payload-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; payload_manifest_arg="$2"; shift 2 ;;
     --payload-manifest-sha256) [[ $# -ge 2 ]] || { usage; exit 2; }; receipt_prelude_payload_hash="$2"; shift 2 ;;
@@ -736,12 +830,12 @@ attestation_assert_canonical_git || fail 'canonical /usr/bin/git is unavailable'
 source_root="$(/usr/bin/realpath -e -- "$source_root" 2>/dev/null || true)"
 [[ -n "$source_root" && -d "$source_root" ]] || fail 'source root does not exist'
 if [[ -n "$source_manifest" ]]; then
-  source_manifest_supplied=1
+  (( source_manifest_internal == 1 )) || source_manifest_supplied=1
   source_manifest="$(/usr/bin/realpath -e -- "$source_manifest" 2>/dev/null || true)"
   [[ "$source_manifest" == "$source_root/.source-attestation" ]] || fail 'source manifest is not bound to the source snapshot'
   attestation_verify_snapshot "$source_root" "$source_manifest" "$source_commit_binding" || fail 'source snapshot manifest is invalid or externally unbound'
 else
-  attestation_create_git_snapshot "$source_root" '' '' || fail 'source Git checkout failed hardened source attestation'
+  attestation_create_git_snapshot "$source_root" '' '' true "${receipt_source_snapshot_parent:-/tmp}" || fail 'source Git checkout failed hardened source attestation'
   source_root="$attestation_snapshot_dir"
   source_manifest="$attestation_snapshot_manifest"
 fi

@@ -53,6 +53,7 @@ attestation_cleanup_temporary_paths() {
 }
 
 attestation_snapshot_dir=''
+attestation_snapshot_parent=''
 attestation_snapshot_manifest=''
 attestation_snapshot_commit=''
 attestation_snapshot_url=''
@@ -404,7 +405,9 @@ attestation_config_is_safe() {
 
 attestation_snapshot_cleanup() {
   local path="${1:-${attestation_snapshot_dir:-}}"
-  [[ -n "$path" && "$path" == /tmp/* && -d "$path" ]] || return 0
+  local parent="${attestation_snapshot_parent:-/tmp}"
+  [[ -n "$path" && -n "$parent" && -d "$path" &&
+    "${path%/*}" == "$parent" && "${path##*/}" == herdr-source-snapshot.* ]] || return 0
   "$attestation_chmod_bin" -R u+w -- "$path" 2>/dev/null || true
   "$attestation_rm_bin" -rf -- "$path"
 }
@@ -518,7 +521,9 @@ attestation_create_git_snapshot() {
   local expected_url="${2:-}"
   local expected_ref="${3:-}"
   local require_live="${4:-true}"
+  local snapshot_parent_arg="${5:-/tmp}"
   local canonical_source_path git_dir common_git_dir git_toplevel git_absolute_dir git_inside_worktree git_bare git_shallow actual_url actual_ref
+  local canonical_snapshot_parent
   local git_pointer git_pointer_path commondir_spec
   local tree_file index_file stage_file snapshot_path manifest_path
   local record meta path mode type oid digest snapshot_mode
@@ -527,6 +532,7 @@ attestation_create_git_snapshot() {
   local file_count=0
 
   attestation_snapshot_dir=''
+  attestation_snapshot_parent=''
   attestation_snapshot_manifest=''
   attestation_snapshot_commit=''
   attestation_snapshot_url=''
@@ -535,6 +541,20 @@ attestation_create_git_snapshot() {
   attestation_common_git_dir=''
   attestation_reject_git_environment || return 1
   attestation_assert_canonical_git || return 1
+  [[ "$snapshot_parent_arg" == /* && -d "$snapshot_parent_arg" && ! -L "$snapshot_parent_arg" ]] || {
+    echo "Source snapshot parent is missing or unsafe: $snapshot_parent_arg" >&2
+    return 1
+  }
+  canonical_snapshot_parent="$($attestation_realpath_bin -e -- "$snapshot_parent_arg" 2>/dev/null || true)"
+  [[ -n "$canonical_snapshot_parent" && "$canonical_snapshot_parent" == "$snapshot_parent_arg" ]] || {
+    echo "Source snapshot parent is not lexically canonical: $snapshot_parent_arg" >&2
+    return 1
+  }
+  attestation_reject_symlink_components "$canonical_snapshot_parent" || {
+    echo "Source snapshot parent contains a symlinked path component: $snapshot_parent_arg" >&2
+    return 1
+  }
+  attestation_snapshot_parent="$canonical_snapshot_parent"
   [[ "$source_path" == /* && -d "$source_path" && ! -L "$source_path" ]] || {
     echo "Git checkout is not an absolute real directory: $source_path" >&2
     return 1
@@ -628,7 +648,7 @@ attestation_create_git_snapshot() {
     return 1
   }
   attestation_register_temporary_path "$stage_file"
-  snapshot_path="$($attestation_mktemp_bin -d /tmp/herdr-source-snapshot.XXXXXX)" || {
+  snapshot_path="$($attestation_mktemp_bin -d "$attestation_snapshot_parent/herdr-source-snapshot.XXXXXX")" || {
     "$attestation_rm_bin" -f -- "$tree_file" "$index_file" "$stage_file"
     return 1
   }

@@ -180,7 +180,8 @@ EOF
   chmod 0755 "$receipt_hostile_path/$receipt_hostile_command"
 done
 if ! /usr/bin/env -i HOME="$fixture_home" PATH="$receipt_hostile_path:/usr/bin:/bin" \
-  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --help > "$test_root/receipt-help-output" 2>&1; then
+  BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- --help \
+  --fixture-root "$fixture_root" > "$test_root/receipt-help-output" 2>&1; then
   cat "$test_root/receipt-help-output" >&2
   exit 1
 fi
@@ -223,6 +224,15 @@ run_authority() {
   /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
     BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- "$@" \
     --source-root "$source_root" \
+    --user-home "$fixture_home" \
+    --authority-path "$authority_path" \
+    --receipt-path "$receipt_path" \
+    --fixture-root "$fixture_root"
+}
+
+run_entrypoint_authority() {
+  /usr/bin/env -i HOME="$fixture_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' LC_ALL=C TZ=UTC \
+    BASH_ENV= ENV= "$launcher" --entrypoint receipt-authority -- "$@" \
     --user-home "$fixture_home" \
     --authority-path "$authority_path" \
     --receipt-path "$receipt_path" \
@@ -362,6 +372,23 @@ run_bundle_stage_mutation() {
     echo "Bundle mutation unexpectedly passed: $label" >&2
     exit 1
   }
+}
+
+# Exercise the production entrypoint topology without supplying a source root:
+# the staged Git checkout is hardened once, then its manifest is carried into
+# the main authority pass. The managed snapshot child must be cleaned at exit.
+run_entrypoint_authority --install
+fixture_source_snapshot_parent="$fixture_stage_authority_root/source-attestation"
+[[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$fixture_source_snapshot_parent")" == \
+  "$(/usr/bin/id -u):$(/usr/bin/id -g):755" ]] || {
+  echo 'Fixture source snapshot parent is not authority-owned mode 0755.' >&2
+  exit 1
+}
+fixture_source_snapshot_residue="$(/usr/bin/find "$fixture_source_snapshot_parent" -mindepth 1 -maxdepth 1 \
+  -type d -name 'herdr-source-snapshot.*' -print -quit)"
+[[ -z "$fixture_source_snapshot_residue" ]] || {
+  echo "Receipt entrypoint left fixture source snapshot residue: $fixture_source_snapshot_residue" >&2
+  exit 1
 }
 
 run_authority --install
@@ -683,6 +710,18 @@ else
     production_authority_path="$production_prefix/output/etc/stmodel/issue-961/receipt-authority.json"
     production_receipt_path="$production_prefix/output/etc/stmodel/issue-961/receipt.json"
   }
+  run_production_entrypoint_authority() {
+    local mode="$1"
+    local production_parent="${2:-$production_stage_authority_parent}"
+    local production_name="${3:-herdr-test-production-simulation}"
+    prepare_production_payload_environment "$production_parent" "$production_name"
+    /usr/bin/env -i HOME="$production_home" PATH='/usr/sbin:/usr/bin:/sbin:/bin' \
+      LC_ALL=C TZ=UTC BASH_ENV= ENV= \
+      "$production_launcher" --entrypoint receipt-authority -- "$mode" \
+      --user-home "$production_home" \
+      --authority-path "$production_authority_path" \
+      --receipt-path "$production_receipt_path"
+  }
   run_payload_authority() {
     local mode="$1"
     local root="$2"
@@ -748,6 +787,13 @@ else
   # writable /tmp must be rejected at that ancestor. This rejection fixture is
   # never reused for the positive production simulation below.
   prepare_production_payload_environment /tmp herdr-test-production-ancestry-rejection
+  expect_failure_diagnostic production-source-snapshot-writable-ancestry \
+    'receipt authority trust prelude: production source snapshot staging parent is not root-owned and non-writable: /tmp' \
+    run_production_entrypoint_authority --check /tmp herdr-test-production-ancestry-rejection
+  [[ ! -e "$production_prefix/var/lib/herdr-workstation/bootstrap/staging/source-attestation" ]] || {
+    echo 'Unsafe /tmp source snapshot ancestry was silently repaired before rejection.' >&2
+    exit 1
+  }
   expect_failure_diagnostic production-writable-ancestry \
     'receipt authority: production runtime bundle staging parent is not root-owned and non-writable: /tmp' \
     run_payload_authority --check "$payload_probe" "$payload_probe_hash" "$payload_probe_commit" \
@@ -759,6 +805,22 @@ else
   production_policy=''
   production_authority_path=''
   production_receipt_path=''
+  run_production_entrypoint_authority --install
+  production_source_snapshot_parent="$production_prefix/var/lib/herdr-workstation/bootstrap/staging/source-attestation"
+  [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$production_source_snapshot_parent")" == 0:0:755 ]] || {
+    echo 'Production source snapshot parent is not root-owned mode 0755.' >&2
+    exit 1
+  }
+  production_source_snapshot_residue="$(/usr/bin/find "$production_source_snapshot_parent" -mindepth 1 -maxdepth 1 \
+    -type d -name 'herdr-source-snapshot.*' -print -quit)"
+  [[ -z "$production_source_snapshot_residue" ]] || {
+    echo "Production receipt entrypoint left source snapshot residue: $production_source_snapshot_residue" >&2
+    exit 1
+  }
+  [[ "$(/usr/bin/jq -r '.source_commit_sha' "$production_receipt_path")" == "$source_commit" ]] || {
+    echo 'Production receipt entrypoint did not bind the approved source commit.' >&2
+    exit 1
+  }
   # The hardened source snapshot strips every write bit, so the real payload
   # entrypoint and capability helper are root-owned 0555.  Payload receipt
   # capability must accept exactly that mode and must still reject the
@@ -887,5 +949,12 @@ printf '# source-root mismatch\n' >> "$source_root/scripts/ubuntu/receipt-author
 git -C "$source_root" add scripts/ubuntu/receipt-authority.sh
 git -C "$source_root" commit -qm 'fixture source script mismatch'
 expect_failure 'source-root script mismatch' run_authority --check
+
+fixture_source_snapshot_residue="$(/usr/bin/find "$fixture_source_snapshot_parent" -mindepth 1 -maxdepth 1 \
+  -type d -name 'herdr-source-snapshot.*' -print -quit)"
+[[ -z "$fixture_source_snapshot_residue" ]] || {
+  echo "Receipt authority left source snapshot residue after the fail-closed suite: $fixture_source_snapshot_residue" >&2
+  exit 1
+}
 
 echo 'receipt authority install, reconciliation, provenance and fail-closed tamper tests passed.'
