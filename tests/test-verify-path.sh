@@ -129,6 +129,8 @@ node_root="$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64"
 node_bin="$node_root/bin"
 npm_cli="$node_root/lib/node_modules/npm/bin/npm-cli.js"
 codex_js="$node_root/lib/node_modules/@openai/codex/bin/codex.js"
+codex_version_file="$fixture_home/.local/state/herdr-workstation-bootstrap/fixture-codex-version"
+printf '%s\n' "$CODEX_VERSION" > "$codex_version_file"
 pinned_node_marker="$test_root/pinned-node-executions"
 mkdir -p "$node_bin" "$(dirname "$npm_cli")" "$(dirname "$codex_js")"
 cat > "$node_bin/node" <<EOF
@@ -136,6 +138,7 @@ cat > "$node_bin/node" <<EOF
 set -euo pipefail
 fixture_npm_cli='$npm_cli'
 fixture_codex_js='$codex_js'
+fixture_codex_version_file='$codex_version_file'
 fixture_marker='$pinned_node_marker'
 script="\$1"
 if [[ "\$script" == '--version' ]]; then
@@ -150,7 +153,8 @@ case "\$script_real" in
     ;;
   "\$fixture_codex_js")
     printf '%s\\n' 'pinned-node-executed-codex' >> "\$fixture_marker"
-    printf 'codex-cli %s\\n' '$CODEX_VERSION'
+    codex_version="\$(/usr/bin/head -n 1 "\$fixture_codex_version_file")"
+    printf 'codex-cli %s\\n' "\$codex_version"
     ;;
   *)
     echo "Pinned fixture Node received unexpected arguments: \$*" >&2
@@ -289,6 +293,8 @@ toolchain_manifest="$fixture_home/.local/state/herdr-workstation-bootstrap/toolc
   printf 'node=v%s\n' "$NODE_VERSION"
   printf 'npm=11.6.0\n'
   printf 'codex=codex-cli %s\n' "$CODEX_VERSION"
+  printf 'codex_version=%s\n' "$CODEX_VERSION"
+  printf 'codex_newer_than_lock=false\n'
   printf 'claude=%s\n' "$CLAUDE_VERSION"
   printf 'bun=%s\n' "$BUN_VERSION"
   printf 'herdr=herdr %s\n' "$HERDR_VERSION"
@@ -349,6 +355,10 @@ grep -Fq 'PASS receipt npm=11.6.0' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost npm receipt parity.' >&2; exit 1; }
 grep -Fq "PASS receipt codex=codex-cli $CODEX_VERSION" "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost Codex receipt parity.' >&2; exit 1; }
+grep -Fq "PASS receipt codex_version=$CODEX_VERSION" "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost the locked Codex version receipt.' >&2; exit 1; }
+grep -Fq 'PASS receipt codex_newer_than_lock=false' "$verify_output" ||
+  { cat "$verify_output" >&2; echo 'Verify fixture lost the equal-floor Codex marker.' >&2; exit 1; }
 grep -Fq 'PASS receipt python3.13_kind=regular-file' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost Python kind receipt parity.' >&2; exit 1; }
 grep -Fq "PASS receipt python3.13_sha256=$python_launcher_sha256" "$verify_output" ||
@@ -365,6 +375,28 @@ grep -Fq "PASS receipt herdr_sha256=$herdr_binary_sha256" "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost the locked Herdr digest receipt.' >&2; exit 1; }
 grep -Fq 'PASS receipt herdr_newer_than_lock=false' "$verify_output" ||
   { cat "$verify_output" >&2; echo 'Verify fixture lost the equal-floor Herdr marker.' >&2; exit 1; }
+
+# Differential parity case: a user-managed Codex newer than the lock must pass
+# verification while the manifest records its effective version and marker.
+newer_codex_version='0.149.1'
+printf '%s\n' "$newer_codex_version" > "$codex_version_file"
+/usr/bin/sed -i \
+  -e "s|^codex=.*$|codex=codex-cli $newer_codex_version|" \
+  -e "s|^codex_version=.*$|codex_version=$newer_codex_version|" \
+  -e 's|^codex_newer_than_lock=.*$|codex_newer_than_lock=true|' \
+  "$toolchain_manifest"
+newer_codex_verify_output="$test_root/verify-codex-newer-output"
+run_verify > "$newer_codex_verify_output" 2>&1 || {
+  cat "$newer_codex_verify_output" >&2
+  echo 'Newer-than-lock Codex verifier fixture failed.' >&2
+  exit 1
+}
+grep -Fq "PASS receipt codex=codex-cli $newer_codex_version" "$newer_codex_verify_output" ||
+  { cat "$newer_codex_verify_output" >&2; echo 'Verifier did not attest the newer Codex version.' >&2; exit 1; }
+grep -Fq "PASS receipt codex_version=$newer_codex_version" "$newer_codex_verify_output" ||
+  { cat "$newer_codex_verify_output" >&2; echo 'Verifier did not attest the newer Codex manifest version.' >&2; exit 1; }
+grep -Fq 'PASS receipt codex_newer_than_lock=true' "$newer_codex_verify_output" ||
+  { cat "$newer_codex_verify_output" >&2; echo 'Verifier did not attest the newer Codex marker.' >&2; exit 1; }
 
 # Differential parity case: a user-managed Herdr newer than the lock must pass
 # verification while the manifest records its actual version, digest, and

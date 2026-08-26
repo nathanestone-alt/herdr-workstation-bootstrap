@@ -176,6 +176,22 @@ bootstrap_version_greater() {
   bootstrap_version_at_least "$1" "$2" && [[ "$1" != "$2" ]]
 }
 
+bootstrap_codex_attestation() {
+  local node_path="$1"
+  local codex_path="$2"
+  local output
+  local version
+  local newer_than_lock=false
+  output="$("$node_path" "$codex_path" --version 2>/dev/null)" || return 1
+  [[ "$output" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]] || return 1
+  version="${BASH_REMATCH[1]}"
+  bootstrap_version_at_least "$version" "$CODEX_VERSION" || return 1
+  if bootstrap_version_greater "$version" "$CODEX_VERSION"; then
+    newer_than_lock=true
+  fi
+  printf '%s\t%s\t%s\n' "$output" "$version" "$newer_than_lock"
+}
+
 bootstrap_herdr_version() {
   local herdr_path="$1"
   local output
@@ -688,6 +704,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+bootstrap_codex_allow_downgrade=0
 
 bootstrap_current_uid="$($bootstrap_id_bin -u)"
 bootstrap_current_gid="$($bootstrap_id_bin -g)"
@@ -1550,6 +1568,35 @@ bootstrap_herdr_attestation() {
   printf '%s\t%s\t%s\t%s\n' "$output" "$version" "$sha256" "$newer_than_lock"
 }
 
+converge_codex() {
+  local node_anchor="$1"
+  local node_lifecycle_dir="$2"
+  local allow_downgrade="${3:-0}"
+  local codex_attestation=''
+  local installed_version=''
+  local newer_than_lock=false
+  [[ "$allow_downgrade" =~ ^[01]$ ]] || {
+    echo 'Codex convergence received an invalid downgrade action.' >&2
+    return 24
+  }
+  if [[ -x "$node_anchor/bin/codex" ]]; then
+    codex_attestation="$(bootstrap_codex_attestation \
+      "$node_anchor/bin/node" "$node_anchor/bin/codex" 2>/dev/null || true)"
+  fi
+  IFS=$'\t' read -r _ installed_version newer_than_lock <<< "$codex_attestation"
+  if [[ "$allow_downgrade" != 1 &&
+    ( "$installed_version" == "$CODEX_VERSION" || "$newer_than_lock" == true ) ]]; then
+    if [[ "$newer_than_lock" == true ]]; then
+      printf 'Keeping user-managed Codex %s; lock floor is %s.\n' \
+        "$installed_version" "$CODEX_VERSION" >&2
+    fi
+    return 0
+  fi
+  PATH="$node_lifecycle_dir:$bootstrap_trusted_path" \
+    "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact \
+    --prefix "$node_anchor" "@openai/codex@$CODEX_VERSION"
+}
+
 converge_herdr() {
   local expected_fd="${1:-}"
   local herdr_path="$bin_dir/herdr"
@@ -2102,6 +2149,10 @@ install_tools_transaction() {
   local herdr_version
   local herdr_sha256
   local herdr_newer_than_lock
+  local codex_attestation
+  local codex_output
+  local codex_version
+  local codex_newer_than_lock
   ps_bin="$(bootstrap_command_path ps)"
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
@@ -2270,9 +2321,9 @@ install_tools_transaction() {
     echo 'Node lifecycle shim does not resolve to the pinned Node executable.' >&2
     exit 24
   }
+  converge_codex "$node_anchor" "$node_lifecycle_dir" "${bootstrap_codex_allow_downgrade:-0}"
   PATH="$node_lifecycle_dir:$bootstrap_trusted_path" \
     "$node_anchor/bin/node" "$node_anchor/bin/npm" install --global --save-exact --prefix "$node_anchor" \
-    "@openai/codex@$CODEX_VERSION" \
     "@anthropic-ai/claude-code@$CLAUDE_VERSION" \
     "bun@$BUN_VERSION"
   for package_dir in '@openai/codex' '@anthropic-ai/claude-code' bun; do
@@ -2289,7 +2340,14 @@ install_tools_transaction() {
 
   converge_herdr "$bin_fd"
 
-  [[ "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version | /usr/bin/gawk '{ print $NF }')" == "$CODEX_VERSION" ]] || { echo 'Codex version does not match lock.' >&2; exit 24; }
+  codex_attestation="$(bootstrap_codex_attestation \
+    "$node_anchor/bin/node" "$node_anchor/bin/codex" || true)"
+  IFS=$'\t' read -r codex_output codex_version codex_newer_than_lock <<< "$codex_attestation"
+  [[ -n "$codex_output" && -n "$codex_version" &&
+    "$codex_newer_than_lock" =~ ^(true|false)$ ]] || {
+      echo 'Codex version is below the lock or its attestation is malformed.' >&2
+      exit 24
+    }
   [[ "$("$node_anchor/bin/claude" --version | /usr/bin/gawk '{ print $1 }')" == "$CLAUDE_VERSION" ]] || { echo 'Claude version does not match lock.' >&2; exit 24; }
   [[ "$("$node_anchor/bin/bun" --version)" == "$BUN_VERSION" ]] || { echo 'Bun version does not match lock.' >&2; exit 24; }
   herdr_attestation="$(bootstrap_herdr_attestation "$bin_dir/herdr" || true)"
@@ -2354,7 +2412,9 @@ install_tools_transaction() {
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
     printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
-    printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
+    printf 'codex=%s\n' "$codex_output"
+    printf 'codex_version=%s\n' "$codex_version"
+    printf 'codex_newer_than_lock=%s\n' "$codex_newer_than_lock"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
     printf 'herdr=%s\n' "$herdr_output"
@@ -2401,6 +2461,10 @@ install_tools_finalize() {
   local herdr_version
   local herdr_sha256
   local herdr_newer_than_lock
+  local codex_attestation
+  local codex_output
+  local codex_version
+  local codex_newer_than_lock
   profile_dir="$HOME/.config/herdr-workstation"
   node_dir="$HOME/.local/lib/node-v${NODE_VERSION}-linux-x64"
   validate_toolchain_lock || exit 22
@@ -2423,6 +2487,14 @@ install_tools_finalize() {
   fence_require_directory "$bin_dir" "$bin_fd" 'tools bin directory'
   fence_require_directory "$node_dir" "$node_fd" 'Node directory'
 
+  codex_attestation="$(bootstrap_codex_attestation \
+    "$node_anchor/bin/node" "$node_anchor/bin/codex" || true)"
+  IFS=$'\t' read -r codex_output codex_version codex_newer_than_lock <<< "$codex_attestation"
+  [[ -n "$codex_output" && -n "$codex_version" &&
+    "$codex_newer_than_lock" =~ ^(true|false)$ ]] || {
+      echo 'Codex version is below the lock or its attestation is malformed.' >&2
+      exit 24
+    }
   herdr_attestation="$(bootstrap_herdr_attestation "$bin_dir/herdr" || true)"
   IFS=$'\t' read -r herdr_output herdr_version herdr_sha256 herdr_newer_than_lock <<< "$herdr_attestation"
   [[ -n "$herdr_output" && -n "$herdr_version" && "$herdr_sha256" =~ ^[0-9a-f]{64}$ &&
@@ -2473,7 +2545,9 @@ install_tools_finalize() {
     printf 'rustc=%s\n' "$("$HOME/.cargo/bin/rustc" --version)"
     printf 'node=%s\n' "$("$node_anchor/bin/node" --version)"
     printf 'npm=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/npm" --version)"
-    printf 'codex=%s\n' "$("$node_anchor/bin/node" "$node_anchor/bin/codex" --version)"
+    printf 'codex=%s\n' "$codex_output"
+    printf 'codex_version=%s\n' "$codex_version"
+    printf 'codex_newer_than_lock=%s\n' "$codex_newer_than_lock"
     printf 'claude=%s\n' "$("$node_anchor/bin/claude" --version)"
     printf 'bun=%s\n' "$("$node_anchor/bin/bun" --version)"
     printf 'herdr=%s\n' "$herdr_output"
@@ -2512,14 +2586,32 @@ install_tools() {
   install_tools_transaction
 }
 
+install_codex_downgrade() {
+  if [[ "$bootstrap_root_mode" == 1 ]]; then
+    bootstrap_run_as_runtime_phase codex-downgrade-runtime
+    install_receipt_from_snapshots
+    bootstrap_run_as_runtime_phase tools-finalize
+    return
+  fi
+  bootstrap_codex_allow_downgrade=1
+  install_tools_transaction
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "$phase" in
     base) install_base ;;
     validate-lock) validate_toolchain_lock; echo 'Ubuntu toolchain lock validation passed.' ;;
     tools) install_tools ;;
+    codex-downgrade) install_codex_downgrade ;;
     all) install_base; install_tools ;;
     base-user) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'base-user is runtime-only.' >&2; exit 24; }; install_base_user ;;
     tools-prepare) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-prepare is runtime-only.' >&2; exit 24; }; bootstrap_tools_prepare_only=1; install_tools_transaction ;;
+    codex-downgrade-runtime)
+      [[ "$bootstrap_root_mode" == 0 ]] || { echo 'codex-downgrade-runtime is runtime-only.' >&2; exit 24; }
+      bootstrap_codex_allow_downgrade=1
+      bootstrap_tools_prepare_only=1
+      install_tools_transaction
+      ;;
     tools-finalize) [[ "$bootstrap_root_mode" == 0 ]] || { echo 'tools-finalize is runtime-only.' >&2; exit 24; }; install_tools_finalize ;;
     *) echo "Unsupported phase: $phase" >&2; exit 2 ;;
   esac

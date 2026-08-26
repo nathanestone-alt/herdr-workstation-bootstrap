@@ -583,8 +583,16 @@ validate_locked_receipt_value() {
       [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || { echo "FAIL receipt locked contract $key"; return 1; }
       ;;
     codex)
-      escaped_version="${CODEX_VERSION//./\\.}"
-      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || { echo "FAIL receipt locked contract $key"; return 1; }
+      if [[ "$value" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]]; then
+        actual_version="${BASH_REMATCH[1]}"
+        bootstrap_version_at_least "$actual_version" "$CODEX_VERSION" || {
+          echo "FAIL receipt locked contract $key"
+          return 1
+        }
+      else
+        echo "FAIL receipt locked contract $key"
+        return 1
+      fi
       ;;
     claude)
       escaped_version="${CLAUDE_VERSION//./\\.}"
@@ -670,6 +678,8 @@ validate_runtime_receipt() {
   local herdr_version
   local herdr_sha256
   local herdr_newer_than_lock
+  local codex_version
+  local codex_newer_than_lock=false
   local receipt_failures=0
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
@@ -678,7 +688,7 @@ validate_runtime_receipt() {
     receipt_authority_path receipt_authority_sha256
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
-    rustup rustc node npm codex claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
+    rustup rustc node npm codex codex_version codex_newer_than_lock claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -729,6 +739,17 @@ validate_runtime_receipt() {
   if (( runtime_probe_failed )); then
     return 1
   fi
+  codex_version="$(printf '%s\n' "${expected_by_key[codex]}" | /usr/bin/gawk '{print $NF}')"
+  if [[ ! "$codex_version" =~ ^[0-9]+([.][0-9]+)*$ ]] ||
+    ! bootstrap_version_at_least "$codex_version" "$CODEX_VERSION"; then
+    echo 'FAIL receipt locked contract codex'
+    receipt_failures=$((receipt_failures + 1))
+  fi
+  if bootstrap_version_greater "$codex_version" "$CODEX_VERSION"; then
+    codex_newer_than_lock=true
+  fi
+  expected_by_key[codex_version]="$codex_version"
+  expected_by_key[codex_newer_than_lock]="$codex_newer_than_lock"
   herdr_path="$(verify_resolve_command herdr 2>/dev/null || true)"
   herdr_attestation=''
   if [[ -n "$herdr_path" ]]; then

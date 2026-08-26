@@ -579,6 +579,10 @@ make_version_tool "$fixture_home/.cargo/bin/rustc" "rustc $RUST_TOOLCHAIN (fixtu
 node_dir="$fixture_home/.local/lib/node-v$NODE_VERSION-linux-x64"
 npm_invocation_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/pinned-node-npm.marker"
 codex_invocation_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/pinned-node-codex.marker"
+codex_version_file="$fixture_home/.local/state/herdr-workstation-bootstrap/fixture-codex-version"
+codex_npm_args_marker="$fixture_home/.local/state/herdr-workstation-bootstrap/fixture-codex-npm-args"
+printf '%s\n' "$CODEX_VERSION" > "$codex_version_file"
+: > "$codex_npm_args_marker"
 cat > "$node_dir/bin/node" <<EOF
 #!/usr/bin/bash
 set -euo pipefail
@@ -586,6 +590,8 @@ fixture_node_dir='$node_dir'
 fixture_ambient_node_dir='$fixture_ambient_node_dir'
 fixture_npm_marker='$npm_invocation_marker'
 fixture_codex_marker='$codex_invocation_marker'
+fixture_codex_version_file='$codex_version_file'
+fixture_codex_npm_args_marker='$codex_npm_args_marker'
 case "\${1:-}" in
   --version)
     printf 'v%s\\n' '$NODE_VERSION'
@@ -639,6 +645,12 @@ case "\${1:-}" in
         }
         printf '%s\\n' 'pinned-node-executed-npm-install' > "\$fixture_npm_marker"
         printf '%s\\n' 'pinned-node-lifecycle-node' >> "\$fixture_npm_marker"
+        printf '%s\\n' "\$*" >> "\$fixture_codex_npm_args_marker"
+        for npm_arg in "\$@"; do
+          if [[ "\$npm_arg" == '@openai/codex@$CODEX_VERSION' ]]; then
+            printf '%s\\n' '$CODEX_VERSION' > "\$fixture_codex_version_file"
+          fi
+        done
         ;;
       --version)
         printf '%s\\n' 'pinned-node-executed-npm-version' >> "\$fixture_npm_marker"
@@ -661,7 +673,8 @@ case "\${1:-}" in
       exit 24
     }
     printf '%s\n' 'pinned-node-executed-codex-version' >> "\$fixture_codex_marker"
-    printf '%s\n' 'codex-cli $CODEX_VERSION'
+    codex_version="\$(/usr/bin/head -n 1 "\$fixture_codex_version_file")"
+    printf 'codex-cli %s\\n' "\$codex_version"
     ;;
   *)
     echo "Pinned Node received unexpected arguments: \$*" >&2
@@ -780,7 +793,54 @@ grep -Fqx 'pinned-node-executed-npm-install' "$npm_invocation_marker"
 grep -Fqx 'pinned-node-lifecycle-node' "$npm_invocation_marker"
 grep -Fqx 'pinned-node-executed-npm-version' "$npm_invocation_marker"
 grep -Fqx "codex=codex-cli $CODEX_VERSION" "$manifest"
+grep -Fqx "codex_version=$CODEX_VERSION" "$manifest"
+grep -Fqx 'codex_newer_than_lock=false' "$manifest"
+! grep -Fq -- "@openai/codex@$CODEX_VERSION" "$codex_npm_args_marker"
 grep -Fqx 'pinned-node-executed-codex-version' "$codex_invocation_marker"
+
+# Codex is a floor: an installed newer version is preserved, omitted from the
+# ordinary npm convergence request, and written back to the regenerated
+# manifest with an explicit newer-than-lock marker.
+newer_codex_version='0.149.1'
+printf '%s\n' "$newer_codex_version" > "$codex_version_file"
+: > "$codex_npm_args_marker"
+if ! run_tools > "$test_root/tools-newer.out" 2>&1; then
+  cat "$test_root/tools-newer.out" >&2
+  exit 1
+fi
+grep -Fqx "codex=codex-cli $newer_codex_version" "$manifest"
+grep -Fqx "codex_version=$newer_codex_version" "$manifest"
+grep -Fqx 'codex_newer_than_lock=true' "$manifest"
+! grep -Fq -- "@openai/codex@$CODEX_VERSION" "$codex_npm_args_marker"
+[[ "$(< "$codex_version_file")" == "$newer_codex_version" ]]
+
+# An installed older version is reconciled to the locked version and is the
+# only floor case that includes Codex in the npm request.
+printf '%s\n' '0.147.9' > "$codex_version_file"
+: > "$codex_npm_args_marker"
+if ! run_tools > "$test_root/tools-older.out" 2>&1; then
+  cat "$test_root/tools-older.out" >&2
+  exit 1
+fi
+grep -Fqx "codex=codex-cli $CODEX_VERSION" "$manifest"
+grep -Fqx "codex_version=$CODEX_VERSION" "$manifest"
+grep -Fqx 'codex_newer_than_lock=false' "$manifest"
+grep -Fq -- "@openai/codex@$CODEX_VERSION" "$codex_npm_args_marker"
+[[ "$(< "$codex_version_file")" == "$CODEX_VERSION" ]]
+
+# Regenerating after a preserved newer install must not retain stale locked
+# receipt values.
+printf '%s\n' "$newer_codex_version" > "$codex_version_file"
+: > "$codex_npm_args_marker"
+if ! run_tools > "$test_root/tools-newer-regenerated.out" 2>&1; then
+  cat "$test_root/tools-newer-regenerated.out" >&2
+  exit 1
+fi
+grep -Fqx "codex=codex-cli $newer_codex_version" "$manifest"
+grep -Fqx "codex_version=$newer_codex_version" "$manifest"
+grep -Fqx 'codex_newer_than_lock=true' "$manifest"
+! grep -Fq -- "@openai/codex@$CODEX_VERSION" "$codex_npm_args_marker"
+[[ "$(< "$codex_version_file")" == "$newer_codex_version" ]]
 
 # Both PowerShell probes must have reached the fixture binary, and nothing else
 # may have. The receipt authority records the '--version' output it measured

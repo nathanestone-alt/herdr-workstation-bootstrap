@@ -180,9 +180,18 @@ write_toolchain_receipt() {
   local herdr_version
   local herdr_sha256
   local herdr_newer_than_lock=false
+  local codex_output
+  local codex_version
+  local codex_newer_than_lock=false
   # shellcheck disable=SC1090
   source "$fixture_root/config/ubuntu-toolchain.lock"
   lock_sha256="$(sha256sum "$fixture_root/config/ubuntu-toolchain.lock" | awk '{print $1}')"
+  codex_output="$("$home/.local/bin/codex" --version)"
+  codex_version="$(printf '%s\n' "$codex_output" | awk '{print $NF}')"
+  if [[ "$(printf '%s\n%s\n' "$CODEX_VERSION" "$codex_version" | LC_ALL=C sort -V | head -n 1)" == "$CODEX_VERSION" &&
+    "$codex_version" != "$CODEX_VERSION" ]]; then
+    codex_newer_than_lock=true
+  fi
   herdr_output="$("$home/.local/bin/herdr" --version)"
   herdr_version="$(printf '%s\n' "$herdr_output" | awk '{print $NF}')"
   herdr_sha256="$(sha256sum -- "$home/.local/bin/herdr" | awk '{print $1}')"
@@ -217,7 +226,9 @@ write_toolchain_receipt() {
     printf 'rustc=rustc %s (fixturehash 2026-08-19)\n' "$RUST_TOOLCHAIN"
     printf 'node=v%s\n' "$NODE_VERSION"
     printf 'npm=11.6.0\n'
-    printf 'codex=codex-cli %s\n' "$CODEX_VERSION"
+    printf 'codex=%s\n' "$codex_output"
+    printf 'codex_version=%s\n' "$codex_version"
+    printf 'codex_newer_than_lock=%s\n' "$codex_newer_than_lock"
     printf 'claude=%s\n' "$CLAUDE_VERSION"
     printf 'bun=%s\n' "$BUN_VERSION"
     printf 'herdr=%s\n' "$herdr_output"
@@ -717,6 +728,24 @@ set -e
 assert_no_owned_transaction_residue "$candidate_receipt_home"
 printf 'Full toolchain receipt compatibility: starting_status=%s (rejected), candidate_status=%s (accepted).\n' \
   "$starting_receipt_status" "$candidate_receipt_status"
+
+# Differential floor case: the payload consumer accepts a user-managed Codex
+# newer than the lock and requires the effective manifest fields.
+make_fixture
+newer_codex_receipt_home="$(FIXTURE_CODEX_VERSION=0.149.1 new_home producer-shaped-codex-newer)"
+newer_codex_receipt_output="$test_root/producer-shaped-codex-newer.out"
+set +e
+HOME="$newer_codex_receipt_home" PATH="$newer_codex_receipt_home/.local/bin:$PATH" \
+  bash "$fixture_root/scripts/ubuntu/install-payload.sh" > "$newer_codex_receipt_output" 2>&1
+newer_codex_receipt_status=$?
+set -e
+[[ "$newer_codex_receipt_status" == 0 ]] || { cat "$newer_codex_receipt_output" >&2; exit 1; }
+newer_codex_manifest="$newer_codex_receipt_home/.local/state/herdr-workstation-bootstrap/toolchain-manifest.txt"
+grep -Fqx 'codex=codex-cli 0.149.1' "$newer_codex_manifest"
+grep -Fqx 'codex_version=0.149.1' "$newer_codex_manifest"
+grep -Fqx 'codex_newer_than_lock=true' "$newer_codex_manifest"
+printf 'Codex floor parity: locked=%s, newer=%s (both accepted).\n' \
+  "$candidate_receipt_status" "$newer_codex_receipt_status"
 
 # Differential floor case: the payload consumer accepts a user-managed Herdr
 # newer than the lock and requires the actual manifest fields.

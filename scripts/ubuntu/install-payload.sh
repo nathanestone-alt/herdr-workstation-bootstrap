@@ -719,6 +719,7 @@ validate_locked_receipt_value() {
   local key="$1"
   local value="${expected_by_key[$key]}"
   local escaped_version
+  local actual_version
   case "$key" in
     rustup)
       escaped_version="${RUSTUP_VERSION//./\\.}"
@@ -735,8 +736,13 @@ validate_locked_receipt_value() {
       [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || fail_closed 'npm receipt value is not a bounded semantic version.'
       ;;
     codex)
-      escaped_version="${CODEX_VERSION//./\\.}"
-      [[ "$value" =~ ^[^[:space:]]+[[:space:]]${escaped_version}$ ]] || fail_closed 'Codex receipt value does not match the locked version contract.'
+      if [[ "$value" =~ ^[^[:space:]]+[[:space:]]([0-9]+([.][0-9]+)*)$ ]]; then
+        actual_version="${BASH_REMATCH[1]}"
+        payload_version_at_least "$actual_version" "$CODEX_VERSION" ||
+          fail_closed 'Codex receipt value is below the lock floor.'
+      else
+        fail_closed 'Codex receipt value is malformed.'
+      fi
       ;;
     claude)
       escaped_version="${CLAUDE_VERSION//./\\.}"
@@ -791,12 +797,14 @@ validate_toolchain_receipt() {
   local herdr_version
   local herdr_sha256
   local herdr_newer_than_lock=false
+  local codex_version
+  local codex_newer_than_lock=false
   local -a required_keys=(
     receipt_format lock_sha256 host_platform host_architecture
     uv_path python3.13_path py_path uv_version python3.13_version
     py_3.13_version py_3.13_probe uv_platform uv_url uv_sha256
     python_version python_platform python_release python_archive python_url python_sha256 tailscale
-    rustup rustc node npm codex claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
+    rustup rustc node npm codex codex_version codex_newer_than_lock claude bun herdr herdr_version herdr_sha256 herdr_newer_than_lock powershell
   )
   local -A expected_by_key=()
   local -A seen_keys=()
@@ -840,6 +848,15 @@ validate_toolchain_receipt() {
   capture_receipt_command bun bun --version
   capture_receipt_command herdr herdr --version
   capture_receipt_command powershell pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  codex_version="$(printf '%s\n' "${expected_by_key[codex]}" | awk '{print $NF}')"
+  [[ "$codex_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || fail_closed 'Codex receipt version is malformed.'
+  payload_version_at_least "$codex_version" "$CODEX_VERSION" || fail_closed 'Codex receipt value is below the lock floor.'
+  codex_newer_than_lock=false
+  if payload_version_greater "$codex_version" "$CODEX_VERSION"; then
+    codex_newer_than_lock=true
+  fi
+  expected_by_key[codex_version]="$codex_version"
+  expected_by_key[codex_newer_than_lock]="$codex_newer_than_lock"
   herdr_path="$HOME/.local/bin/herdr"
   herdr_version="$(printf '%s\n' "${expected_by_key[herdr]}" | awk '{print $NF}')"
   [[ "$herdr_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || fail_closed 'Herdr receipt version is malformed.'
