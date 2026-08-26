@@ -230,7 +230,7 @@ function Assert-HerdrOneDriveReady {
     }
     if ($TestMode) {
         if ($null -eq $ReadyProbe) {
-            return [pscustomobject][ordered]@{ Status = 'test-mode-bypassed' }
+            throw 'Test mode requires a OneDrive readiness probe.'
         }
         $observed = & $ReadyProbe
         if ($null -eq $observed -or ($observed -is [bool] -and -not $observed)) {
@@ -482,6 +482,9 @@ function Get-HerdrManifestRecord {
     $stageIdentityText = if ($null -ne $stage.PSObject.Properties['file_identity'] -and $null -ne $stage.file_identity) { [string]$stage.file_identity } else { $null }
     if ($null -ne $source.PSObject.Properties['number_of_links'] -and [int64]$source.number_of_links -gt 1) {
         throw 'Staging manifest source has multiple hard links.'
+    }
+    if ($null -ne $stage.PSObject.Properties['number_of_links'] -and [int64]$stage.number_of_links -gt 1) {
+        throw 'Staging manifest bridge-stage has multiple hard links.'
     }
     if ([int64]$source.size_bytes -lt 0 -or [int64]$stage.size_bytes -lt 0 -or [int64]$source.size_bytes -ne [int64]$stage.size_bytes) {
         throw 'Staging manifest source and bridge sizes do not match.'
@@ -969,12 +972,15 @@ function Invoke-HerdrExcelJob {
     if (Test-Path -LiteralPath $reviewJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Review-job collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $outboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "Outbox collision for '$($job.JobId)'." }
     if (Test-Path -LiteralPath $oneDriveOutboxJobPath -PathType Any -ErrorAction SilentlyContinue) { throw "OneDrive Outbox collision for '$($job.JobId)'." }
-    if ($null -ne $HostOwnedAccessProbe) {
+    $preExecutionAccessObserved = if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical)
     }
     else {
         Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical) `
-            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode | Out-Null
+            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode
+    }
+    if ($preExecutionAccessObserved -isnot [bool] -or -not $preExecutionAccessObserved) {
+        throw 'Host-owned bridge access probe did not report verified write denial.'
     }
     $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical `
         -ExpectedIdentity $manifest.SourceIdentity -AllowedCloudFilesRoot $oneDriveExchangeCanonical
@@ -985,26 +991,33 @@ function Invoke-HerdrExcelJob {
     if ($stageBefore.Sha256 -cne $manifest.StagedHash -or $stageBefore.SizeBytes -ne $manifest.StagedSizeBytes -or
         $stageBefore.LastWriteTimeUtc -cne $manifest.StagedLastWriteTimeUtc) { throw 'Bridge-stage workbook hash changed or timestamp changed before execution.' }
     $reviewJobPath = Ensure-HerdrManagedDirectory -Path $reviewJobPath `
-        -TrustedRoot $reviewCanonical -Description 'Excel review-job directory'
-    $lastMileProtected = $false
+        -TrustedRoot $reviewCanonical -RequireLeafCreation -Description 'Excel review-job directory'
+    $lastMileProtectionObserved = $null
     if ($null -ne $HostOwnedTreeProtector) {
-        & $HostOwnedTreeProtector $reviewJobPath $identityConfiguration.InteractiveUserSid
-        $lastMileProtected = $true
+        $lastMileProtectionObserved = & $HostOwnedTreeProtector $reviewJobPath $identityConfiguration.InteractiveUserSid
     }
     elseif (-not $TestMode) {
         Protect-HostOwnedTree -TargetPath $reviewJobPath `
             -OperatorSid ([Security.Principal.SecurityIdentifier]::new($identityConfiguration.InteractiveUserSid))
-        $lastMileProtected = $true
+        # Protect-HerdrHostOwnedTree returns only after converging and checking
+        # the host-owned ACLs, so completion is the production observation.
+        $lastMileProtectionObserved = $true
     }
     else {
         throw 'Test mode requires a host-owned tree protection probe.'
     }
-    if ($null -ne $HostOwnedAccessProbe) {
+    if ($lastMileProtectionObserved -isnot [bool] -or -not $lastMileProtectionObserved) {
+        throw 'Host-owned tree protection probe did not report verified protection.'
+    }
+    $lastMileImmutableObserved = if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical, $reviewJobPath)
     }
     else {
         Assert-HerdrBridgeCannotWrite -Paths @($toolsCanonical, $reviewCanonical, $reviewJobPath) `
-            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode | Out-Null
+            -ExpectedBridgeAccountSid $identityConfiguration.BridgeAccountSid -TestMode:$TestMode
+    }
+    if ($lastMileImmutableObserved -isnot [bool] -or -not $lastMileImmutableObserved) {
+        throw 'Host-owned bridge access probe did not report verified write denial for the review job.'
     }
     $extension = $manifest.Extension
     $lastMilePath = Get-HerdrCanonicalPath -Path (Join-Path $reviewJobPath ('input' + $extension))
@@ -1077,8 +1090,8 @@ function Invoke-HerdrExcelJob {
                 sha256 = $lastMileAfter.Sha256
                 last_write_time_utc = $lastMileAfter.LastWriteTimeUtc
                 size_bytes = $lastMileAfter.SizeBytes
-                protected = $lastMileProtected
-                immutable_for_bridge_account = $lastMileProtected
+                protected = [bool]$lastMileProtectionObserved
+                immutable_for_bridge_account = [bool]$lastMileImmutableObserved
             }
             result = [ordered]@{
                 path = $resultPath
@@ -1091,6 +1104,7 @@ function Invoke-HerdrExcelJob {
             }
             provenance = $manifest.Provenance
             trust_approval = $job.TrustApproval
+            trust_approval_verified = $false
             security = [ordered]@{
                 interactive_session_required = $true
                 designated_interactive_user_sid = $identityConfiguration.InteractiveUserSid

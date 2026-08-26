@@ -29,26 +29,37 @@ was performed by this change.
   `operation`, and `staging_manifest`; the only operation is `recalculate`.
 - Result provenance: `herdr-excel-job-result-v1`, with source, bridge-stage,
   protected last-mile, result, OneDrive-Outbox, security, and optional named
-  `trust_approval` records.
+  `trust_approval` records plus `trust_approval_verified=false`.
 - Job log: `herdr-excel-job-log-v1`.
 
-The protected last-mile record explicitly carries
-`immutable_for_bridge_account=true`; the runner opens only that local copy.
-The Inbox original is never moved or deleted.
+The result's protected last-mile record carries `protected` and
+`immutable_for_bridge_account` as the observed boolean results of the
+host-owned tree-protection and bridge-write-denial checks; a test-mode value is
+only the corresponding probe observation. The runner opens only that local
+copy. The Inbox original is never moved or deleted.
+
+`trust_approval`, when present, is a declarative caller assertion. It is
+shape-checked only, corroborated by nothing host-owned, and must not be treated
+as proof of human approval. `trust_approval_verified` is always `false` in
+this schema. A host-owned approval store is deferred to #957 live commissioning.
 
 ## Windows-only seams
 
 Ubuntu `pwsh` tests use explicit `-TestMode` seams: staging's
-`BetweenSourceReads`; runner `InteractiveSessionProbe`/`IdentityProbe`,
-`OneDriveReadyProbe`, `HostOwnedAccessProbe`, `HostOwnedTreeProtector`,
-`ExcelInvoker`, `ExcelProcessProbe`, and `AfterExcelHook`; and ACL
-`AclReader`, `GroupSidReader`, and `BridgeIdentityProbe`. Production wrappers
-do not expose `-TestMode` or path overrides. Native OneDrive attributes,
-no-follow handles, final paths, file identities, session/process identities,
-Authz, and ACLs stay in the Windows implementation; seams only supply
-deterministic test observations and cannot authorize an operation. Hermetic
-runner execution requires the tree-protection seam, so a test cannot emit a
-protected-last-mile claim without modeling that gate.
+`BetweenSourceReads` (the helper rejects it without `-TestMode`); runner
+`InteractiveSessionProbe`/`IdentityProbe`, `OneDriveReadyProbe`,
+`HostOwnedAccessProbe`, `HostOwnedTreeProtector`, `ExcelInvoker`,
+`ExcelProcessProbe`, and `AfterExcelHook`; and ACL `AclReader`,
+`GroupSidReader`, and `BridgeIdentityProbe`. The OneDrive and host-owned
+protection gates reject missing observations in test mode, and the access and
+protection probes must report a successful observation before it is recorded.
+Production wrappers do not expose `-TestMode` or path overrides. Native
+OneDrive attributes, no-follow handles, final paths, file identities,
+session/process identities, Authz, and ACLs stay in the Windows
+implementation; seams only supply deterministic test observations and cannot
+authorize an operation. Hermetic runner execution requires the tree-protection
+seam, so a test cannot emit a protected-last-mile claim without modeling that
+gate.
 
 ## File hashes
 
@@ -59,13 +70,13 @@ record intentionally does not self-list its own hash.
 | Path | SHA-256 |
 |---|---|
 | `config/windows-review-runtime.example.json` | `c891cc842279ff36af03eae7d16b415db504276aa3982efc764265af7f415c89` |
-| `scripts/windows/HerdrReviewStaging.ps1` | `4c75d64721bddee7bdbcb99a0c7d8f2eb9f3738599d252290c2aa2a5137d839c` |
+| `scripts/windows/HerdrReviewStaging.ps1` | `a515a62a05ffd798a13465a980ffb673ef3563dc8a9eafc7f026c309a56dddea` |
 | `scripts/windows/Stage-HerdrReviewWorkbook.ps1` | `3131be6149d1d1a7c4693809f3bee09b50e381176df2cec220094912b6fcbf89` |
-| `scripts/windows/HerdrExcelJobRunner.ps1` | `3f94861157e9ebaf7fb63a2a89ca73ff88b93bbeb61bd69d4563e4da5735b675` |
+| `scripts/windows/HerdrExcelJobRunner.ps1` | `e7d96816b3883eef97760ef53a420f34eee56cde73f7b3416ed23e156bd361ec` |
 | `scripts/windows/Invoke-HerdrExcelJob.ps1` | `78a47af85b02789c765829bb5f7bd480115e4771faa303a2180848b69bc22130` |
 | `scripts/windows/HerdrHostOwnedAclPolicy.ps1` | `100f8d875daec671f0b1209c3bbe7e8c4f3c8aad580e02920325ae03c094af05` |
-| `tests/Test-HerdrReviewStaging.ps1` | `7d699d05f90fb7236aac4525fe924bde9cee4ba75e7657440677eef6fcafae56` |
-| `tests/Test-HerdrExcelJobRunner.ps1` | `0bd4032ab6ece01fe5b86a08e779829ac157fc7c78b509119a18ab7045525baf` |
+| `tests/Test-HerdrReviewStaging.ps1` | `5eab29c6fe7cbd0e9fad12bb42c12765c2ad116db3133423b50cf2a9fe1abb42` |
+| `tests/Test-HerdrExcelJobRunner.ps1` | `3a667077074c31221df296f67d7774f59acf36ea16e6e2018b2e9e436bea2bf1` |
 
 ## Exact validation commands
 

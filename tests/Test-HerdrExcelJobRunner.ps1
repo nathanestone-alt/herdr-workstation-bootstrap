@@ -42,10 +42,12 @@ $expectedReviewJobPath = [IO.Path]::GetFullPath((Join-Path $reviewJobs 'job-001'
 $accessProbe = {
     param([object[]]$Paths)
     foreach ($path in $Paths) { [void]$accessCalls.Add([string]$path) }
+    $true
 }.GetNewClosure()
 $protectionProbe = {
     param([string]$Path, [string]$OperatorSid)
     [void]$protectedReviewJobPaths.Add([IO.Path]::GetFullPath($Path))
+    $true
 }.GetNewClosure()
 $successAccessProbe = {
     param([object[]]$Paths)
@@ -59,8 +61,10 @@ $successAccessProbe = {
         }
         [void]$accessCalls.Add([string]$path)
     }
+    $true
 }.GetNewClosure()
 $interactiveProbe = { $true }
+$oneDriveReadyProbe = { $true }
 $copyHerdrFileExclusive = Get-Command Copy-HerdrFileExclusive -CommandType Function -ErrorAction Stop
 $excelProbe = {
     param([string]$InputPath, [string]$ResultPath)
@@ -135,6 +139,11 @@ try {
             -IdentityConfiguration ([pscustomobject]@{ InteractiveUserSid = 'S-1-5-21-961-1001'; InteractiveSessionId = 7 }) `
             -TestMode -ReadyProbe { $false } | Out-Null
     } 'not ready' 'OneDrive readiness gate'
+    Assert-Throws {
+        Assert-HerdrOneDriveReady -OneDriveExchangeRoot $oneDriveExchange -OneDriveAccount 'configured@example.invalid' `
+            -IdentityConfiguration ([pscustomobject]@{ InteractiveUserSid = 'S-1-5-21-961-1001'; InteractiveSessionId = 7 }) `
+            -TestMode | Out-Null
+    } 'readiness probe' 'OneDrive readiness requires probe'
     $jsonReaderProbePath = Join-Path $root 'json-reader-probe.json'
     [IO.File]::WriteAllText($jsonReaderProbePath, '{"schema":"probe"}', [Text.UTF8Encoding]::new($false))
     $jsonReaderOwner = [IO.FileStream]::new($jsonReaderProbePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -164,7 +173,8 @@ try {
     $successResult = Invoke-HerdrExcelJob -JobPath $success.Job -RuntimeConfigurationPath $runtimeConfig `
         -TestMode `
         -InteractiveSessionProbe $interactiveProbe `
-        -HostOwnedAccessProbe $successAccessProbe -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+        -HostOwnedAccessProbe $successAccessProbe -HostOwnedTreeProtector $protectionProbe `
+        -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     Assert-True ($successResult.Status -ceq 'succeeded') 'The hermetic runner did not succeed.'
     Assert-True (Test-Path -LiteralPath $successResult.ResultPath -PathType Leaf) 'The runner result is missing.'
     Assert-True (Test-Path -LiteralPath $successResult.ManifestPath -PathType Leaf) 'The runner provenance manifest is missing.'
@@ -172,11 +182,15 @@ try {
     Assert-True (Test-Path -LiteralPath $successResult.OneDriveResultPath -PathType Leaf) 'The OneDrive Outbox result is missing.'
     Assert-True (Test-Path -LiteralPath $successResult.OneDriveManifestPath -PathType Leaf) 'The OneDrive Outbox manifest is missing.'
     $resultManifest = [IO.File]::ReadAllText($successResult.ManifestPath)
+    $resultDocument = $resultManifest | ConvertFrom-Json
     $jobLog = [IO.File]::ReadAllText($successResult.LogPath)
     $oneDriveManifest = [IO.File]::ReadAllText($successResult.OneDriveManifestPath)
     Assert-True ($resultManifest.Contains('herdr-excel-job-result-v1', [StringComparison]::Ordinal)) 'Result manifest schema is missing.'
     Assert-True ($resultManifest.Contains('macros', [StringComparison]::Ordinal) -and $resultManifest.Contains('disabled', [StringComparison]::Ordinal)) 'Macro default deny is not recorded.'
     Assert-True ($resultManifest.Contains('immutable_for_bridge_account', [StringComparison]::Ordinal)) 'Last-mile bridge immutability is not recorded.'
+    Assert-True ($resultDocument.last_mile.protected -eq $true) 'Last-mile protection did not record the observed true result.'
+    Assert-True ($resultDocument.last_mile.immutable_for_bridge_account -eq $true) 'Last-mile bridge immutability did not record the observed true result.'
+    Assert-True ($resultDocument.trust_approval_verified -eq $false) 'Trust approval verification was not explicitly recorded as false.'
     Assert-True (-not $resultManifest.Contains($secret, [StringComparison]::Ordinal)) 'Result manifest leaked workbook content.'
     Assert-True (-not $jobLog.Contains($secret, [StringComparison]::Ordinal)) 'Job log leaked workbook content.'
     Assert-True ($oneDriveManifest -ceq $resultManifest) 'The OneDrive Outbox manifest differs from the bridge manifest.'
@@ -279,6 +293,9 @@ try {
     $approvedManifest = [IO.File]::ReadAllText($approvedResult.ManifestPath)
     Assert-True ($approvedManifest.Contains('fixture-approval-961', [StringComparison]::Ordinal)) `
         'Named trust approval was not retained in result provenance.'
+    $approvedDocument = $approvedManifest | ConvertFrom-Json
+    Assert-True ($approvedDocument.trust_approval_verified -eq $false) `
+        'Declarative trust approval was incorrectly marked as verified.'
 
     $noInteractive = New-TestJob
     Assert-Throws {

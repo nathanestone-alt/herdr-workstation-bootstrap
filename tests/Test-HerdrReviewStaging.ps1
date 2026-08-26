@@ -179,9 +179,14 @@ try {
     $unstableSource = Join-Path $inbox 'unstable.xlsx'
     [IO.File]::WriteAllBytes($unstableSource, [Text.Encoding]::UTF8.GetBytes('stable-before'))
     Assert-Throws {
+        Invoke-HerdrReviewStaging -SourcePath $unstableSource -JobId 'job-unstable-no-test-mode' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0 `
+            -BetweenSourceReads { param([string]$Path) }
+    } 'Test probes are permitted only in explicit test mode' 'staging seam test-mode gate'
+    Assert-Throws {
         Invoke-HerdrReviewStaging -SourcePath $unstableSource -JobId 'job-unstable' -OneDriveExchangeRoot $oneDriveExchange `
             -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0 `
-            -BetweenSourceReads { param([string]$Path) [IO.File]::WriteAllBytes($Path, [Text.Encoding]::UTF8.GetBytes('changed-after')) }
+            -TestMode -BetweenSourceReads { param([string]$Path) [IO.File]::WriteAllBytes($Path, [Text.Encoding]::UTF8.GetBytes('changed-after')) }
     } 'unstable' 'stability gate'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-unstable'))) 'Unstable staging left a partial job directory.'
 

@@ -2047,9 +2047,13 @@ function Invoke-HerdrReviewStaging {
         [string]$Branch = 'NOT-PROVIDED',
         [string]$Commit = 'NOT-PROVIDED',
         [ValidateRange(0, 60000)][int]$StabilityIntervalMilliseconds = 1000,
+        [switch]$TestMode,
         [scriptblock]$BetweenSourceReads
     )
 
+    if ($null -ne $BetweenSourceReads -and -not $TestMode) {
+        throw 'Test probes are permitted only in explicit test mode.'
+    }
     Assert-HerdrJobId -JobId $JobId | Out-Null
     Assert-HerdrMetadataValue -Value $Repository -Name 'Repository' | Out-Null
     Assert-HerdrMetadataValue -Value $Branch -Name 'Branch' | Out-Null
