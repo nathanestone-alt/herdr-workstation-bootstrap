@@ -86,7 +86,7 @@ function New-TestJob {
         source_branch = 'main'
         source_commit = 'abc123'
     })
-    return [pscustomobject]@{ Job = $jobPath; Source = $source; Staged = $staged }
+    return [pscustomobject]@{ Job = $jobPath; JobId = $jobId; Source = $source; Staged = $staged }
 }
 
 try {
@@ -176,6 +176,7 @@ try {
     $oneDriveManifest = [IO.File]::ReadAllText($successResult.OneDriveManifestPath)
     Assert-True ($resultManifest.Contains('herdr-excel-job-result-v1', [StringComparison]::Ordinal)) 'Result manifest schema is missing.'
     Assert-True ($resultManifest.Contains('macros', [StringComparison]::Ordinal) -and $resultManifest.Contains('disabled', [StringComparison]::Ordinal)) 'Macro default deny is not recorded.'
+    Assert-True ($resultManifest.Contains('immutable_for_bridge_account', [StringComparison]::Ordinal)) 'Last-mile bridge immutability is not recorded.'
     Assert-True (-not $resultManifest.Contains($secret, [StringComparison]::Ordinal)) 'Result manifest leaked workbook content.'
     Assert-True (-not $jobLog.Contains($secret, [StringComparison]::Ordinal)) 'Job log leaked workbook content.'
     Assert-True ($oneDriveManifest -ceq $resultManifest) 'The OneDrive Outbox manifest differs from the bridge manifest.'
@@ -186,6 +187,56 @@ try {
     Assert-True ($accessCalls.Count -ge 2) 'Host-owned ACL policy was not checked before execution.'
     $cliOutput = $successResult | ConvertTo-Json -Compress
     Assert-True (-not $cliOutput.Contains($secret, [StringComparison]::Ordinal)) 'Runner output leaked workbook content.'
+
+    Assert-Throws {
+        Assert-HerdrInteractiveIdentity -Configuration ([pscustomobject]@{
+            InteractiveUserSid = 'S-1-5-21-961-1001'
+            InteractiveSessionId = 7
+        }) -TestMode -IdentityProbe { $null } | Out-Null
+    } 'interactive Windows session' 'null interactive-session proof'
+    Assert-Throws {
+        Assert-HerdrExcelProcessIdentity -Excel ([pscustomobject]@{}) -Configuration ([pscustomobject]@{
+            InteractiveUserSid = 'S-1-5-21-961-1001'
+            InteractiveSessionId = 7
+        }) -TestMode -ExcelProcessProbe { $null } | Out-Null
+    } 'process identity proof' 'null Excel-process proof'
+
+    $stageMismatch = New-TestJob
+    [IO.File]::WriteAllBytes($stageMismatch.Staged.StagedPath, [Text.Encoding]::UTF8.GetBytes('changed bridge stage'))
+    Assert-Throws {
+        Invoke-HerdrExcelJob -JobPath $stageMismatch.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+            -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
+            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+    } 'Bridge-stage workbook hash changed' 'bridge-stage hash gate'
+
+    $lastMileMutation = New-TestJob
+    $lastMilePath = Join-Path (Join-Path $reviewJobs $lastMileMutation.JobId) 'input.xlsx'
+    $mutateLastMile = {
+        [IO.File]::WriteAllBytes($lastMilePath, [Text.Encoding]::UTF8.GetBytes('changed protected copy'))
+    }.GetNewClosure()
+    Assert-Throws {
+        Invoke-HerdrExcelJob -JobPath $lastMileMutation.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+            -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
+            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateLastMile
+    } 'Protected last-mile workbook' 'protected last-mile hash gate'
+
+    $reviewCollision = New-TestJob
+    New-Item -ItemType Directory -Path (Join-Path $reviewJobs $reviewCollision.JobId) -Force | Out-Null
+    Assert-Throws {
+        Invoke-HerdrExcelJob -JobPath $reviewCollision.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+            -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
+            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+    } 'Review-job collision' 'review-job collision'
+
+    $misboundJob = New-TestJob
+    $misboundPath = Join-Path (Join-Path $exchange 'in') 'misbound-job.json'
+    [IO.File]::Copy($misboundJob.Job, $misboundPath)
+    Assert-Throws {
+        Read-HerdrExcelJob -JobPath $misboundPath -ExchangeRoot $exchange | Out-Null
+    } 'job-ID directory' 'job definition binding'
 
     $unknownOperation = New-TestJob
     $unknownDocument = [IO.File]::ReadAllText($unknownOperation.Job) | ConvertFrom-Json
@@ -202,6 +253,32 @@ try {
     Assert-Throws {
         Read-HerdrExcelJob -JobPath $unknownField.Job -ExchangeRoot $exchange
     } 'unknown field' 'arbitrary command field'
+
+    $powershellField = New-TestJob
+    $powershellDocument = [IO.File]::ReadAllText($powershellField.Job) | ConvertFrom-Json
+    $powershellDocument | Add-Member -NotePropertyName powershell -NotePropertyValue 'Get-Process'
+    Write-TestJson -Path $powershellField.Job -Value $powershellDocument
+    Assert-Throws {
+        Read-HerdrExcelJob -JobPath $powershellField.Job -ExchangeRoot $exchange
+    } 'unknown field' 'arbitrary PowerShell field'
+
+    $approvedJob = New-TestJob
+    $approvedDocument = [IO.File]::ReadAllText($approvedJob.Job) | ConvertFrom-Json
+    $approvedDocument | Add-Member -NotePropertyName trust_approval -NotePropertyValue ([pscustomobject]@{
+        approval_name = 'fixture-approval-961'
+        approver = 'fixture-reviewer'
+        approved_utc = '2026-08-26T00:00:00Z'
+        scope = 'fixture-only'
+        reason = 'hermetic regression fixture'
+    })
+    Write-TestJson -Path $approvedJob.Job -Value $approvedDocument
+    $approvedResult = Invoke-HerdrExcelJob -JobPath $approvedJob.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+        -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
+        -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+    $approvedManifest = [IO.File]::ReadAllText($approvedResult.ManifestPath)
+    Assert-True ($approvedManifest.Contains('fixture-approval-961', [StringComparison]::Ordinal)) `
+        'Named trust approval was not retained in result provenance.'
 
     $noInteractive = New-TestJob
     Assert-Throws {
@@ -226,10 +303,10 @@ try {
     $mutateSource = { [IO.File]::WriteAllBytes($sourceMutation.Source, [Text.Encoding]::UTF8.GetBytes('changed source')) }.GetNewClosure()
     Assert-Throws {
         Invoke-HerdrExcelJob -JobPath $sourceMutation.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
-            -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
-            -TestMode `
-            -InteractiveSessionProbe $interactiveProbe `
-            -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateSource
+        -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+        -TestMode `
+        -InteractiveSessionProbe $interactiveProbe `
+        -HostOwnedAccessProbe $accessProbe -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateSource
     } 'changed during execution' 'canonical source after-hash gate'
 
     $aclRoot = Join-Path $root 'acl-fixture'

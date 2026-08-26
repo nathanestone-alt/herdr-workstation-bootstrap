@@ -49,6 +49,34 @@ function Get-HerdrOptionalJsonString {
     return (Assert-HerdrMetadataValue -Value ([string]$property.Value) -Name $Name)
 }
 
+function Get-HerdrRequiredJsonTimestamp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value -or
+        ($property.Value -isnot [string] -and $property.Value -isnot [DateTime])) {
+        throw "$Description requires an ISO-8601 timestamp field '$Name'."
+    }
+    try {
+        $parsed = if ($property.Value -is [DateTime]) {
+            [DateTime]$property.Value
+        }
+        else {
+            [DateTime]::Parse([string]$property.Value, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind)
+        }
+    }
+    catch {
+        throw "$Description field '$Name' is not a valid ISO-8601 timestamp."
+    }
+    return $parsed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Read-HerdrJsonFile {
     [CmdletBinding()]
     param(
@@ -276,8 +304,10 @@ function Assert-HerdrInteractiveIdentity {
     }
     if ($TestMode) {
         $observed = if ($null -ne $IdentityProbe) { & $IdentityProbe } else { Test-HerdrInteractiveSession }
-        if ($observed -is [bool] -and -not $observed) { throw 'Designated interactive Windows session is unavailable.' }
-        if ($null -ne $observed -and $observed -isnot [bool]) {
+        if ($null -eq $observed -or ($observed -is [bool] -and -not $observed)) {
+            throw 'Designated interactive Windows session is unavailable.'
+        }
+        if ($observed -isnot [bool]) {
             foreach ($name in @('CurrentUserSid', 'ExplorerUserSid')) {
                 $property = $observed.PSObject.Properties[$name]
                 if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value) -and
@@ -376,6 +406,11 @@ function Get-HerdrManifestRecord {
     Assert-HerdrPathDoesNotOverlap -Left $outboxCanonical -Right $archiveCanonical -Description 'OneDrive Outbox and Archive'
     $allowedManifestRoot = Get-HerdrCanonicalPath -Path (Join-Path (Join-Path $exchangeCanonical 'in') $JobId)
     Assert-HerdrPhysicalPathUnderRoot -CandidatePath $manifestCanonical -RootPath $allowedManifestRoot -Description 'Staging manifest boundary' | Out-Null
+    $manifestParent = Get-HerdrCanonicalPath -Path (Split-Path -Parent $manifestCanonical)
+    if (-not $manifestParent.Equals($allowedManifestRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($manifestCanonical) -cne 'staging-provenance.json') {
+        throw 'Staging manifest must be the job-specific staging-provenance.json file.'
+    }
     if ([IO.Path]::GetExtension($manifestCanonical).ToLowerInvariant() -ne '.json') {
         throw 'Staging manifest is outside the job-specific exchange input directory.'
     }
@@ -424,6 +459,10 @@ function Get-HerdrManifestRecord {
     if (-not $stagedPath.Equals($manifestStagedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Staging manifest bridge path is outside the job-specific exchange input directory.'
     }
+    if (-not (Get-HerdrCanonicalPath -Path (Split-Path -Parent $stagedPath)).Equals($allowedManifestRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileNameWithoutExtension($stagedPath) -cne 'input') {
+        throw 'Staging manifest bridge path must be the job-specific input workbook.'
+    }
     $allowedExtensions = @($document.allowed_extensions | ForEach-Object { ([string]$_).ToLowerInvariant() })
     $expectedExtensions = @(Get-HerdrWorkbookExtensionAllowlist)
     if (@(Compare-Object -ReferenceObject $expectedExtensions -DifferenceObject $allowedExtensions).Count -ne 0) {
@@ -437,6 +476,8 @@ function Get-HerdrManifestRecord {
     $sourceHash = Assert-HerdrSha256 -Hash (Get-HerdrRequiredJsonString -Object $source -Name 'sha256' -Description 'Source record') -Name 'Source hash'
     $stageHash = Assert-HerdrSha256 -Hash (Get-HerdrRequiredJsonString -Object $stage -Name 'sha256' -Description 'Bridge-stage record') -Name 'Bridge-stage hash'
     if ($sourceHash -cne $stageHash) { throw 'Staging manifest source and bridge hashes do not match.' }
+    $sourceLastWriteTimeUtc = Get-HerdrRequiredJsonTimestamp -Object $source -Name 'last_write_time_utc' -Description 'Source record'
+    $stageLastWriteTimeUtc = Get-HerdrRequiredJsonTimestamp -Object $stage -Name 'last_write_time_utc' -Description 'Bridge-stage record'
     $sourceIdentityText = if ($null -ne $source.PSObject.Properties['file_identity'] -and $null -ne $source.file_identity) { [string]$source.file_identity } else { $null }
     $stageIdentityText = if ($null -ne $stage.PSObject.Properties['file_identity'] -and $null -ne $stage.file_identity) { [string]$stage.file_identity } else { $null }
     if ($null -ne $source.PSObject.Properties['number_of_links'] -and [int64]$source.number_of_links -gt 1) {
@@ -459,9 +500,11 @@ function Get-HerdrManifestRecord {
         SourcePath = $sourcePath
         SourceHash = $sourceHash
         SourceSizeBytes = [int64]$source.size_bytes
+        SourceLastWriteTimeUtc = $sourceLastWriteTimeUtc
         StagedPath = $stagedPath
         StagedHash = $stageHash
         StagedSizeBytes = [int64]$stage.size_bytes
+        StagedLastWriteTimeUtc = $stageLastWriteTimeUtc
         SourceRoot = $inboxCanonical
         ExchangeRoot = $exchangeCanonical
         Extension = $stageExtension
@@ -506,6 +549,11 @@ function Read-HerdrExcelJob {
     }
     $jobId = Get-HerdrRequiredJsonString -Object $document -Name 'job_id' -Description 'Excel job'
     Assert-HerdrJobId -JobId $jobId | Out-Null
+    $jobDirectory = Get-HerdrCanonicalPath -Path (Split-Path -Parent $jobCanonical)
+    $expectedJobDirectory = Get-HerdrCanonicalPath -Path (Join-Path $jobInputRoot $jobId)
+    if (-not $jobDirectory.Equals($expectedJobDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Excel job must be stored in the job-ID directory under the exchange input root.'
+    }
     if ((Get-HerdrRequiredJsonString -Object $document -Name 'operation' -Description 'Excel job') -cne 'recalculate') {
         throw 'Excel operation is not in the finite allowlist.'
     }
@@ -519,7 +567,7 @@ function Read-HerdrExcelJob {
             status = 'explicit'
             approval_name = Get-HerdrRequiredJsonString -Object $approvalDocument -Name 'approval_name' -Description 'Trust approval'
             approver = Get-HerdrRequiredJsonString -Object $approvalDocument -Name 'approver' -Description 'Trust approval'
-            approved_utc = Get-HerdrRequiredJsonString -Object $approvalDocument -Name 'approved_utc' -Description 'Trust approval'
+            approved_utc = Get-HerdrRequiredJsonTimestamp -Object $approvalDocument -Name 'approved_utc' -Description 'Trust approval'
             scope = Get-HerdrRequiredJsonString -Object $approvalDocument -Name 'scope' -Description 'Trust approval'
             reason = Get-HerdrRequiredJsonString -Object $approvalDocument -Name 'reason' -Description 'Trust approval'
         }
@@ -716,7 +764,7 @@ function Assert-HerdrExcelProcessIdentity {
     }
     if ($TestMode -and $null -ne $ExcelProcessProbe) {
         $observed = & $ExcelProcessProbe $Excel
-        if ($observed -is [bool] -and -not $observed) { throw 'Excel process identity proof failed.' }
+        if ($null -eq $observed -or ($observed -is [bool] -and -not $observed)) { throw 'Excel process identity proof failed.' }
         return $observed
     }
     if (-not $IsWindows) { throw 'Excel process identity proof is Windows-only.' }
@@ -930,18 +978,26 @@ function Invoke-HerdrExcelJob {
     }
     $sourceBefore = Get-HerdrFileSnapshot -Path $manifest.SourcePath -TrustedRoot $oneDriveInboxCanonical `
         -ExpectedIdentity $manifest.SourceIdentity -AllowedCloudFilesRoot $oneDriveExchangeCanonical
-    if ($sourceBefore.Sha256 -cne $manifest.SourceHash -or $sourceBefore.SizeBytes -ne $manifest.SourceSizeBytes) { throw 'Canonical source workbook hash changed before execution.' }
+    if ($sourceBefore.Sha256 -cne $manifest.SourceHash -or $sourceBefore.SizeBytes -ne $manifest.SourceSizeBytes -or
+        $sourceBefore.LastWriteTimeUtc -cne $manifest.SourceLastWriteTimeUtc) { throw 'Canonical source workbook hash changed or timestamp changed before execution.' }
     $stageBefore = Get-HerdrFileSnapshot -Path $manifest.StagedPath `
         -TrustedRoot (Join-Path (Join-Path $exchangeCanonical 'in') $job.JobId) -ExpectedIdentity $manifest.StagedIdentity
-    if ($stageBefore.Sha256 -cne $manifest.StagedHash -or $stageBefore.SizeBytes -ne $manifest.StagedSizeBytes) { throw 'Bridge-stage workbook hash changed before execution.' }
+    if ($stageBefore.Sha256 -cne $manifest.StagedHash -or $stageBefore.SizeBytes -ne $manifest.StagedSizeBytes -or
+        $stageBefore.LastWriteTimeUtc -cne $manifest.StagedLastWriteTimeUtc) { throw 'Bridge-stage workbook hash changed or timestamp changed before execution.' }
     $reviewJobPath = Ensure-HerdrManagedDirectory -Path $reviewJobPath `
         -TrustedRoot $reviewCanonical -Description 'Excel review-job directory'
+    $lastMileProtected = $false
     if ($null -ne $HostOwnedTreeProtector) {
         & $HostOwnedTreeProtector $reviewJobPath $identityConfiguration.InteractiveUserSid
+        $lastMileProtected = $true
     }
     elseif (-not $TestMode) {
         Protect-HostOwnedTree -TargetPath $reviewJobPath `
             -OperatorSid ([Security.Principal.SecurityIdentifier]::new($identityConfiguration.InteractiveUserSid))
+        $lastMileProtected = $true
+    }
+    else {
+        throw 'Test mode requires a host-owned tree protection probe.'
     }
     if ($null -ne $HostOwnedAccessProbe) {
         & $HostOwnedAccessProbe @($toolsCanonical, $reviewCanonical, $reviewJobPath)
@@ -1021,6 +1077,8 @@ function Invoke-HerdrExcelJob {
                 sha256 = $lastMileAfter.Sha256
                 last_write_time_utc = $lastMileAfter.LastWriteTimeUtc
                 size_bytes = $lastMileAfter.SizeBytes
+                protected = $lastMileProtected
+                immutable_for_bridge_account = $lastMileProtected
             }
             result = [ordered]@{
                 path = $resultPath

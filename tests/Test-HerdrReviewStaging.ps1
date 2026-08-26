@@ -25,6 +25,69 @@ function Write-TestJson([string]$Path, [object]$Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
 }
 
+function Assert-HerdrExtensionMutationFailsFixture([string]$StagingSourcePath) {
+    $mutationRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-staging-mutation-$([Guid]::NewGuid().ToString('N'))"
+    $mutatedSourcePath = Join-Path $mutationRoot 'HerdrReviewStaging.mutated.ps1'
+    $fixturePath = Join-Path $mutationRoot 'fixture.ps1'
+    try {
+        New-Item -ItemType Directory -Path $mutationRoot -Force | Out-Null
+        $sourceText = [IO.File]::ReadAllText($StagingSourcePath)
+        $guard = @'
+        if ($extension -notin (Get-HerdrWorkbookExtensionAllowlist)) {
+            throw "Workbook extension '$extension' is not allowed."
+        }
+'@
+        $revertedGuard = @'
+        if ($extension -notin (Get-HerdrWorkbookExtensionAllowlist)) {
+            return $item
+        }
+'@
+        if (-not $sourceText.Contains($guard, [StringComparison]::Ordinal)) {
+            throw 'The extension guard mutation fixture no longer matches production source.'
+        }
+        [IO.File]::WriteAllText($mutatedSourcePath, $sourceText.Replace($guard, $revertedGuard), [Text.UTF8Encoding]::new($false))
+        $fixture = @'
+#Requires -Version 7.0
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$MutatedScript)
+$ErrorActionPreference = 'Stop'
+. $MutatedScript
+$root = Join-Path ([IO.Path]::GetTempPath()) "herdr-staging-mutation-fixture-$([Guid]::NewGuid().ToString('N'))"
+$exchangeRoot = Join-Path $root 'onedrive\Herdr Review Exchange'
+$inbox = Join-Path $exchangeRoot 'Inbox'
+$outbox = Join-Path $exchangeRoot 'Outbox'
+$archive = Join-Path $exchangeRoot 'Archive'
+$localExchange = Join-Path $root 'exchange'
+$source = Join-Path $inbox 'unsupported.txt'
+try {
+    New-Item -ItemType Directory -Path $inbox, $outbox, $archive, $localExchange -Force | Out-Null
+    [IO.File]::WriteAllText($source, 'fixture')
+    try {
+        Invoke-HerdrReviewStaging -SourcePath $source -JobId 'mutation-fixture' -OneDriveExchangeRoot $exchangeRoot `
+            -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $outbox -OneDriveArchiveRoot $archive `
+            -ExchangeRoot $localExchange -StabilityIntervalMilliseconds 0 | Out-Null
+        exit 1
+    }
+    catch {
+        if (-not $_.Exception.Message.Contains('not allowed', [StringComparison]::OrdinalIgnoreCase)) { exit 2 }
+        exit 0
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+}
+'@
+        [IO.File]::WriteAllText($fixturePath, $fixture, [Text.UTF8Encoding]::new($false))
+        & pwsh -NoLogo -NoProfile -File $fixturePath -MutatedScript $mutatedSourcePath
+        if ($LASTEXITCODE -ne 1) {
+            throw "The fixture did not fail after reverting the extension guard (exit $LASTEXITCODE)."
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $mutationRoot) { Remove-Item -LiteralPath $mutationRoot -Recurse -Force }
+    }
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-staging-test-$([Guid]::NewGuid().ToString('N'))"
 $oneDriveExchange = Join-Path $root 'onedrive\Herdr Review Exchange'
 $inbox = Join-Path $oneDriveExchange 'Inbox'
@@ -96,6 +159,10 @@ try {
         Invoke-HerdrReviewStaging -SourcePath $source -JobId '../escape' -OneDriveExchangeRoot $oneDriveExchange `
             -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
     } 'job ID is invalid' 'job ID traversal'
+    Assert-Throws {
+        Invoke-HerdrReviewStaging -SourcePath $source -JobId 'CON.xlsx' -OneDriveExchangeRoot $oneDriveExchange `
+            -OneDriveInboxRoot $inbox -ExchangeRoot $exchange -StabilityIntervalMilliseconds 0
+    } 'reserved Windows device name' 'reserved device job ID'
     $outside = Join-Path $root 'outside.xlsx'
     [IO.File]::WriteAllBytes($outside, $sourceBytes)
     Assert-Throws {
@@ -184,6 +251,7 @@ try {
     } 'parameter' 'production staging test-mode bypass'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $exchange 'in\job-cli'))) `
         'Production staging reached the staging function after a rejected test-mode bypass.'
+    Assert-HerdrExtensionMutationFailsFixture -StagingSourcePath (Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1')
     Write-Host 'Herdr review staging regression test passed.'
 }
 finally {

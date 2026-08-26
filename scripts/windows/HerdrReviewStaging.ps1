@@ -1109,6 +1109,12 @@ function Assert-HerdrJobId {
         $JobId.EndsWith('.') -or $JobId.EndsWith(' ')) {
         throw 'Job ID is invalid; use 1-64 ASCII letters, digits, dot, underscore, or hyphen, without a trailing dot or space.'
     }
+    $windowsDeviceNames = @('CON', 'PRN', 'AUX', 'NUL') +
+        (1..9 | ForEach-Object { "COM$_" }) + (1..9 | ForEach-Object { "LPT$_" })
+    $deviceStem = ($JobId -split '\.', 2)[0].ToUpperInvariant()
+    if ($deviceStem -in $windowsDeviceNames) {
+        throw "Job ID is invalid; '$JobId' is a reserved Windows device name."
+    }
     return $JobId
 }
 
@@ -1709,6 +1715,11 @@ function Copy-HerdrNativeFileExclusive {
     else {
         Get-HerdrCanonicalPath -Path $TrustedDestinationRoot
     }
+    $sourceBoundary = $null
+    if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $sourceBoundary = Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
+            -Description 'Copy source boundary before read' -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot
+    }
     $destinationParent = Open-HerdrNativeDirectoryChain -RootPath $operationRoot -TargetPath $parent `
         -Description 'Copy destination parent' -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
     $temporaryName = '.herdr-copy-' + [Guid]::NewGuid().ToString('N') + '.tmp'
@@ -1770,7 +1781,7 @@ function Copy-HerdrNativeFileExclusive {
         if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
             Assert-HerdrPhysicalPathUnderRoot -CandidatePath $source -RootPath $TrustedRoot `
                 -ExpectedCandidate $sourceIdentity -Description 'Copy source boundary after read' `
-                -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot | Out-Null
+                -ExpectedRoot $sourceBoundary.Root -AllowedCloudFilesRoot $SourceAllowedCloudFilesRoot | Out-Null
         }
     }
     $destinationProof = Get-HerdrPhysicalPathProof -Path $destination -AllowedCloudFilesRoot $DestinationAllowedCloudFilesRoot
