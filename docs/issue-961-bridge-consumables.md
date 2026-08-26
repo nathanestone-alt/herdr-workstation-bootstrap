@@ -76,7 +76,7 @@ record intentionally does not self-list its own hash.
 | `scripts/windows/Invoke-HerdrExcelJob.ps1` | `78a47af85b02789c765829bb5f7bd480115e4771faa303a2180848b69bc22130` |
 | `scripts/windows/HerdrHostOwnedAclPolicy.ps1` | `100f8d875daec671f0b1209c3bbe7e8c4f3c8aad580e02920325ae03c094af05` |
 | `tests/Test-HerdrReviewStaging.ps1` | `5eab29c6fe7cbd0e9fad12bb42c12765c2ad116db3133423b50cf2a9fe1abb42` |
-| `tests/Test-HerdrExcelJobRunner.ps1` | `3a667077074c31221df296f67d7774f59acf36ea16e6e2018b2e9e436bea2bf1` |
+| `tests/Test-HerdrExcelJobRunner.ps1` | `8497ba7db38e8686c774d981f2ddc513b66543393adcab435561b475ff015283` |
 
 ## Exact validation commands
 

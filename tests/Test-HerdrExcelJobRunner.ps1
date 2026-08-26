@@ -218,11 +218,18 @@ try {
     $stageMismatch = New-TestJob
     [IO.File]::WriteAllBytes($stageMismatch.Staged.StagedPath, [Text.Encoding]::UTF8.GetBytes('changed bridge stage'))
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $stageMismatch.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        Invoke-HerdrExcelJob -JobPath $stageMismatch.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
             -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
-            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+            -HostOwnedTreeProtector $protectionProbe -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     } 'Bridge-stage workbook hash changed' 'bridge-stage hash gate'
+
+    $configurationDisagreement = New-TestJob
+    Assert-Throws {
+        Invoke-HerdrExcelJob -JobPath $configurationDisagreement.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $tools -TestMode
+    } 'Explicit exchange_root disagrees with host-owned runtime configuration.' 'explicit/configured exchange-root disagreement gate'
 
     $lastMileMutation = New-TestJob
     $lastMilePath = Join-Path (Join-Path $reviewJobs $lastMileMutation.JobId) 'input.xlsx'
@@ -230,19 +237,22 @@ try {
         [IO.File]::WriteAllBytes($lastMilePath, [Text.Encoding]::UTF8.GetBytes('changed protected copy'))
     }.GetNewClosure()
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $lastMileMutation.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        Invoke-HerdrExcelJob -JobPath $lastMileMutation.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
             -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
-            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateLastMile
+            -HostOwnedTreeProtector $protectionProbe -OneDriveReadyProbe $oneDriveReadyProbe `
+            -ExcelInvoker $excelProbe -AfterExcelHook $mutateLastMile
     } 'Protected last-mile workbook' 'protected last-mile hash gate'
 
     $reviewCollision = New-TestJob
     New-Item -ItemType Directory -Path (Join-Path $reviewJobs $reviewCollision.JobId) -Force | Out-Null
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $reviewCollision.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        Invoke-HerdrExcelJob -JobPath $reviewCollision.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
             -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
-            -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+            -HostOwnedTreeProtector $protectionProbe -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     } 'Review-job collision' 'review-job collision'
 
     $misboundJob = New-TestJob
@@ -286,10 +296,11 @@ try {
         reason = 'hermetic regression fixture'
     })
     Write-TestJson -Path $approvedJob.Job -Value $approvedDocument
-    $approvedResult = Invoke-HerdrExcelJob -JobPath $approvedJob.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+    $approvedResult = Invoke-HerdrExcelJob -JobPath $approvedJob.Job -RuntimeConfigurationPath $runtimeConfig `
+        -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
         -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
         -TestMode -InteractiveSessionProbe $interactiveProbe -HostOwnedAccessProbe $accessProbe `
-        -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe
+        -HostOwnedTreeProtector $protectionProbe -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     $approvedManifest = [IO.File]::ReadAllText($approvedResult.ManifestPath)
     Assert-True ($approvedManifest.Contains('fixture-approval-961', [StringComparison]::Ordinal)) `
         'Named trust approval was not retained in result provenance.'
@@ -299,31 +310,35 @@ try {
 
     $noInteractive = New-TestJob
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $noInteractive.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        Invoke-HerdrExcelJob -JobPath $noInteractive.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
             -TestMode `
             -InteractiveSessionProbe { $false } `
-            -HostOwnedAccessProbe $accessProbe -ExcelInvoker $excelProbe
+            -HostOwnedAccessProbe $accessProbe -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     } 'interactive Windows session' 'interactive-session gate'
 
     $bridgeWrite = New-TestJob
     $bridgeProbe = { param([object[]]$Paths) throw 'bridge write probe failed' }
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $bridgeWrite.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+        Invoke-HerdrExcelJob -JobPath $bridgeWrite.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
             -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
             -TestMode `
             -InteractiveSessionProbe $interactiveProbe `
-            -HostOwnedAccessProbe $bridgeProbe -ExcelInvoker $excelProbe
+            -HostOwnedAccessProbe $bridgeProbe -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe
     } 'bridge write probe failed' 'bridge ACL gate'
 
     $sourceMutation = New-TestJob
     $mutateSource = { [IO.File]::WriteAllBytes($sourceMutation.Source, [Text.Encoding]::UTF8.GetBytes('changed source')) }.GetNewClosure()
     Assert-Throws {
-        Invoke-HerdrExcelJob -JobPath $sourceMutation.Job -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
-        -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
-        -TestMode `
-        -InteractiveSessionProbe $interactiveProbe `
-        -HostOwnedAccessProbe $accessProbe -HostOwnedTreeProtector $protectionProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateSource
+        Invoke-HerdrExcelJob -JobPath $sourceMutation.Job -RuntimeConfigurationPath $runtimeConfig `
+            -ExchangeRoot $exchange -ReviewJobsRoot $reviewJobs `
+            -ToolsRoot $tools -OneDriveInboxRoot $inbox -OneDriveOutboxRoot $oneDriveOutbox -OneDriveArchiveRoot $oneDriveArchive `
+            -TestMode `
+            -InteractiveSessionProbe $interactiveProbe `
+            -HostOwnedAccessProbe $accessProbe -HostOwnedTreeProtector $protectionProbe `
+            -OneDriveReadyProbe $oneDriveReadyProbe -ExcelInvoker $excelProbe -AfterExcelHook $mutateSource
     } 'changed during execution' 'canonical source after-hash gate'
 
     $aclRoot = Join-Path $root 'acl-fixture'
