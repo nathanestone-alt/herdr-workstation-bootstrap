@@ -80,11 +80,11 @@ record intentionally does not self-list its own hash.
 | `config/windows-review-runtime.example.json` | `c891cc842279ff36af03eae7d16b415db504276aa3982efc764265af7f415c89` |
 | `scripts/windows/HerdrReviewStaging.ps1` | `a515a62a05ffd798a13465a980ffb673ef3563dc8a9eafc7f026c309a56dddea` |
 | `scripts/windows/Stage-HerdrReviewWorkbook.ps1` | `3131be6149d1d1a7c4693809f3bee09b50e381176df2cec220094912b6fcbf89` |
-| `scripts/windows/HerdrExcelJobRunner.ps1` | `e7d96816b3883eef97760ef53a420f34eee56cde73f7b3416ed23e156bd361ec` |
+| `scripts/windows/HerdrExcelJobRunner.ps1` | `0415457d4753fcb944eeb88204f0271640462107e7e17aa4efd1fea7794a65f9` |
 | `scripts/windows/Invoke-HerdrExcelJob.ps1` | `78a47af85b02789c765829bb5f7bd480115e4771faa303a2180848b69bc22130` |
 | `scripts/windows/HerdrHostOwnedAclPolicy.ps1` | `100f8d875daec671f0b1209c3bbe7e8c4f3c8aad580e02920325ae03c094af05` |
 | `tests/Test-HerdrReviewStaging.ps1` | `5eab29c6fe7cbd0e9fad12bb42c12765c2ad116db3133423b50cf2a9fe1abb42` |
-| `tests/Test-HerdrExcelJobRunner.ps1` | `8497ba7db38e8686c774d981f2ddc513b66543393adcab435561b475ff015283` |
+| `tests/Test-HerdrExcelJobRunner.ps1` | `140344a2a3f826245e1e71050432373e45f2943da72078f75d58b59457a82b4b` |
 
 ## Exact validation commands
 
