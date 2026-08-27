@@ -135,8 +135,16 @@ unmanaged_conflict="$(awk -v begin='# BEGIN herdr-bootstrap excel-share' \
 ' /etc/fstab 2>/dev/null || true)"
 [[ -z "$unmanaged_conflict" ]] || fail 'an unmanaged /etc/fstab entry conflicts with the commissioned mount'
 
-mount_info="$(findmnt -n -o SOURCE,FSTYPE,OPTIONS --target "$mount_point" 2>/dev/null || true)"
-[[ -n "$mount_info" ]] || fail 'findmnt returned no information for the commissioned mount'
+# Access the path first so an armed-but-idle automount trigger mounts the
+# share. The autofs trigger and the cifs mount stack on the same target and
+# findmnt --target reports BOTH, so each is queried by type: the armed
+# trigger is part of the commissioned state (x-systemd.automount in the
+# managed fstab entry), and the cifs line carries the session to verify.
+ls -- "$mount_point" >/dev/null 2>&1 || true
+autofs_info="$(findmnt -n -t autofs -o SOURCE --target "$mount_point" 2>/dev/null || true)"
+[[ -n "$autofs_info" ]] || fail 'x-systemd.automount trigger is not armed at the commissioned mount point'
+mount_info="$(findmnt -n -t cifs -o SOURCE,FSTYPE,OPTIONS --target "$mount_point" 2>/dev/null || true)"
+[[ -n "$mount_info" ]] || fail 'findmnt returned no cifs mount for the commissioned mount point'
 read -r mounted_source mounted_fstype mounted_options <<< "$mount_info"
 [[ "$mounted_source" == "//${windows_host}/${share_name}" ]] ||
   fail "mounted source is not //${windows_host}/${share_name}"
