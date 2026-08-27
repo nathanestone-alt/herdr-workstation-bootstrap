@@ -145,7 +145,7 @@ read -r mounted_source mounted_fstype mounted_options <<< "$mount_info"
 has_option() {
   local needle="$1"
   case ",${mounted_options}," in
-    *,${needle},*) return 0 ;;
+    *,"${needle}",*) return 0 ;;
     *) return 1 ;;
   esac
 }
