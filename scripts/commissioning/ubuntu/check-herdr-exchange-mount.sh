@@ -14,6 +14,7 @@ Options:
   --share NAME             SMB share (default: HerdrExchange)
   --mount-point PATH       Mount point (default: /srv/herdr-exchange)
   --credentials-file PATH  Credential path (default: /etc/herdr-exchange.credentials)
+  --bridge-user NAME       Expected SMB session account (default: HerdrBridge)
   --owner NAME             Expected Ubuntu mount owner (default: current user)
 EOF
   exit 2
@@ -28,6 +29,7 @@ windows_host="herdr-win"
 share_name="HerdrExchange"
 mount_point="/srv/herdr-exchange"
 credentials_file="/etc/herdr-exchange.credentials"
+bridge_user="HerdrBridge"
 owner_name="$(id -un)"
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +52,11 @@ while [[ $# -gt 0 ]]; do
     --credentials-file)
       [[ $# -ge 2 ]] || usage
       credentials_file="$2"
+      shift 2
+      ;;
+    --bridge-user)
+      [[ $# -ge 2 ]] || usage
+      bridge_user="$2"
       shift 2
       ;;
     --owner)
@@ -143,7 +150,10 @@ has_option() {
   esac
 }
 
-has_option "credentials=${credentials_file}" || fail 'mounted credentials option does not use the approved credential path'
+# mount.cifs consumes credentials= in userspace; it never appears in the live
+# kernel options. The managed fstab assert above pins the credential path; the
+# live session is verified by the account it authenticated as.
+has_option "username=${bridge_user}" || fail "live mount session is not authenticated as ${bridge_user}"
 has_option seal || fail 'SMB signing/encryption option seal is absent from the live mount'
 has_option "uid=${owner_uid}" || fail 'live mount uid does not match the commissioned owner'
 has_option "gid=${owner_gid}" || fail 'live mount gid does not match the commissioned owner'
