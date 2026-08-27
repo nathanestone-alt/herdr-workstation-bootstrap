@@ -183,7 +183,16 @@ if mountpoint -q "$mount_point"; then
   fi
 fi
 sudo systemctl daemon-reload
-if ! sudo mount "$mount_point"; then
+# Mounting the path directly would leave the generated .automount unit dead
+# until reboot, so any later unmount would never reconnect on access. Arm the
+# trigger and let path access perform the mount, proving reconnect semantics.
+automount_unit="$(systemd-escape --path --suffix=automount "$mount_point")"
+if ! sudo systemctl restart "$automount_unit"; then
+  echo 'The replacement credential and fstab are installed, but the automount unit failed to start. Correct the reported systemd error and rerun this script; do not rotate the Windows password again.' >&2
+  exit 24
+fi
+if ! ls -- "$mount_point" >/dev/null ||
+  [[ "$(findmnt -n -o FSTYPE --target "$mount_point" 2>/dev/null)" != cifs ]]; then
   echo 'The replacement credential and fstab are installed, but the live mount failed. Correct the reported mount error and rerun this script; do not rotate the Windows password again.' >&2
   exit 24
 fi
