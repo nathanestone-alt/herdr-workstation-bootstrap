@@ -214,6 +214,34 @@ try {
             InteractiveSessionId = 7
         }) -TestMode -ExcelProcessProbe { $null } | Out-Null
     } 'process identity proof' 'null Excel-process proof'
+    $staleExcelProcessProbe = {
+        param([object]$Request)
+        if ($null -eq $Request -or $Request.Operation -cne 'enumerate') { throw 'Unexpected Excel process probe operation.' }
+        [pscustomobject]@{ ProcessIds = [int[]]@(4312, 4313) }
+    }
+    $staleExcelProcessIds = @(Get-HerdrExcelProcessIds -TestMode -ExcelProcessProbe $staleExcelProcessProbe)
+    Assert-Throws {
+        Assert-HerdrExcelPreflightClear -ProcessIds $staleExcelProcessIds | Out-Null
+    } '4312' 'stale Excel pre-flight guard'
+    $clearExcelProcessProbe = {
+        param([object]$Request)
+        if ($null -eq $Request -or $Request.Operation -cne 'enumerate') { throw 'Unexpected Excel process probe operation.' }
+        [pscustomobject]@{ ProcessIds = [int[]]@() }
+    }
+    $clearExcelProcessIds = @(Get-HerdrExcelProcessIds -TestMode -ExcelProcessProbe $clearExcelProcessProbe)
+    Assert-True ((Assert-HerdrExcelPreflightClear -ProcessIds $clearExcelProcessIds) -eq $true) `
+        'Excel pre-flight guard did not pass with zero pre-existing processes.'
+    $attachedExcelProcessProbe = {
+        param([object]$Excel)
+        [pscustomobject]@{ ProcessId = 4312; UserSid = 'S-1-5-21-961-1001'; SessionId = 7; Name = 'EXCEL' }
+    }
+    Assert-Throws {
+        $attachedProof = Assert-HerdrExcelProcessIdentity -Excel ([pscustomobject]@{}) -Configuration ([pscustomobject]@{
+            InteractiveUserSid = 'S-1-5-21-961-1001'
+            InteractiveSessionId = 7
+        }) -TestMode -ExcelProcessProbe $attachedExcelProcessProbe
+        Assert-HerdrExcelProcessFreshness -ProcessIdentity $attachedProof -PreExistingProcessIds ([int[]]@(4312)) | Out-Null
+    } 'pre-existing EXCEL.EXE PID 4312' 'post-create Excel process freshness assertion'
 
     $stageMismatch = New-TestJob
     [IO.File]::WriteAllBytes($stageMismatch.Staged.StagedPath, [Text.Encoding]::UTF8.GetBytes('changed bridge stage'))

@@ -753,6 +753,123 @@ function Disable-HerdrExcelConnections {
     }
 }
 
+function Get-HerdrExcelProcessIds {
+    [CmdletBinding()]
+    param(
+        [switch]$TestMode,
+        [scriptblock]$ExcelProcessProbe
+    )
+
+    if ($null -ne $ExcelProcessProbe -and -not $TestMode) {
+        throw 'Excel process probes are permitted only in explicit test mode.'
+    }
+    if ($TestMode) {
+        if ($null -eq $ExcelProcessProbe) {
+            throw 'Test mode requires an Excel process probe.'
+        }
+        try {
+            $observed = @(& $ExcelProcessProbe ([pscustomobject]@{ Operation = 'enumerate' }))
+        }
+        catch {
+            throw 'Excel process enumeration probe failed; refusing to continue.'
+        }
+        if ($observed.Count -eq 0) {
+            throw 'Excel process enumeration probe returned no observation; refusing to continue.'
+        }
+        $processIdProperty = if ($observed.Count -eq 1) {
+            $observed[0].PSObject.Properties['ProcessIds']
+        }
+        else { $null }
+        if ($null -ne $processIdProperty) {
+            if ($null -eq $processIdProperty.Value) {
+                throw 'Excel process enumeration probe returned a null observation; refusing to continue.'
+            }
+            $observed = @($processIdProperty.Value)
+        }
+        $processIds = [Collections.Generic.List[int]]::new()
+        foreach ($candidate in @($observed)) {
+            $value = $candidate
+            $idProperty = $candidate.PSObject.Properties['Id']
+            if ($null -ne $idProperty) {
+                $value = $idProperty.Value
+            }
+            else {
+                $processIdProperty = $candidate.PSObject.Properties['ProcessId']
+                if ($null -ne $processIdProperty) {
+                    $value = $processIdProperty.Value
+                }
+            }
+            if ($value -is [bool]) {
+                throw 'Excel process enumeration probe returned a non-PID observation; refusing to continue.'
+            }
+            try { $processId = [int]$value } catch { throw 'Excel process enumeration probe returned a non-PID observation; refusing to continue.' }
+            if ($processId -le 0) {
+                throw 'Excel process enumeration probe returned an invalid PID; refusing to continue.'
+            }
+            [void]$processIds.Add($processId)
+        }
+        return @($processIds | Select-Object -Unique)
+    }
+    if (-not $IsWindows) { throw 'Excel process enumeration is Windows-only.' }
+    try {
+        $processIds = [Collections.Generic.List[int]]::new()
+        foreach ($process in @(Get-Process -ErrorAction Stop)) {
+            if ([string]$process.ProcessName -ieq 'EXCEL') {
+                $processId = [int]$process.Id
+                if ($processId -le 0) { throw 'invalid Excel process ID' }
+                [void]$processIds.Add($processId)
+            }
+        }
+    }
+    catch {
+        throw 'Could not enumerate EXCEL.EXE processes before COM attach; refusing to continue.'
+    }
+    return @($processIds | Select-Object -Unique)
+}
+
+function Assert-HerdrExcelPreflightClear {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ProcessIds
+    )
+
+    if ($null -eq $ProcessIds) {
+        throw 'Excel process enumeration returned no usable observation; refusing to continue.'
+    }
+    if ($ProcessIds.Count -gt 0) {
+        $pidText = @($ProcessIds | ForEach-Object { [string]$_ }) -join ', '
+        throw "Existing EXCEL.EXE process(es) detected before COM attach (PID(s): $pidText). Clean up the listed Excel processes before retrying; the runner will not terminate them."
+    }
+    return $true
+}
+
+function Assert-HerdrExcelProcessFreshness {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$ProcessIdentity,
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$PreExistingProcessIds
+    )
+
+    if ($null -eq $ProcessIdentity) {
+        throw 'Excel process freshness proof was unavailable.'
+    }
+    $processIdProperty = $ProcessIdentity.PSObject.Properties['ProcessId']
+    if ($null -eq $processIdProperty) {
+        $processIdProperty = $ProcessIdentity.PSObject.Properties['Id']
+    }
+    if ($null -eq $processIdProperty -or $null -eq $processIdProperty.Value -or $processIdProperty.Value -is [bool]) {
+        throw 'Excel process freshness proof did not include a valid attached process ID.'
+    }
+    try { $processId = [int]$processIdProperty.Value } catch { throw 'Excel process freshness proof did not include a valid attached process ID.' }
+    if ($processId -le 0) {
+        throw 'Excel process freshness proof did not include a valid attached process ID.'
+    }
+    if ($PreExistingProcessIds -contains $processId) {
+        throw "Excel COM attached to pre-existing EXCEL.EXE PID $processId; clean up stale Excel instances before retrying. The runner will not terminate them."
+    }
+    return $true
+}
+
 function Assert-HerdrExcelProcessIdentity {
     [CmdletBinding()]
     param(
@@ -799,10 +916,16 @@ function Invoke-HerdrExcelRecalculate {
     )
 
     if (-not $IsWindows) { throw 'Excel COM execution is Windows-only.' }
+    $preExistingExcelProcessIds = @(Get-HerdrExcelProcessIds -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe)
+    Assert-HerdrExcelPreflightClear -ProcessIds $preExistingExcelProcessIds | Out-Null
     $excel = $null
     $workbook = $null
     try {
         $excel = New-Object -ComObject Excel.Application
+        $attachedProcessIdentity = Assert-HerdrExcelProcessIdentity -Excel $excel -Configuration $IdentityConfiguration `
+            -TestMode:$TestMode -ExcelProcessProbe $ExcelProcessProbe
+        Assert-HerdrExcelProcessFreshness -ProcessIdentity $attachedProcessIdentity `
+            -PreExistingProcessIds $preExistingExcelProcessIds | Out-Null
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
         $excel.EnableEvents = $false

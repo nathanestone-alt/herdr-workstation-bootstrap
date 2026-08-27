@@ -61,6 +61,14 @@ authorize an operation. Hermetic runner execution requires the tree-protection
 seam, so a test cannot emit a protected-last-mile claim without modeling that
 gate.
 
+Before a production Excel COM attach, the runner enumerates visible `EXCEL.EXE`
+processes and fails closed if any already exist, naming their PIDs and directing
+operator cleanup; it never terminates them. After COM creation it re-resolves
+the attached PID through the Excel window handle and rejects any PID that was
+present before attach. Test mode supplies the enumeration and identity
+observations through `ExcelProcessProbe`; missing or failed observations are
+also fail-closed.
+
 ## File hashes
 
 These SHA-256 values are computed from the final committed blobs and are the
