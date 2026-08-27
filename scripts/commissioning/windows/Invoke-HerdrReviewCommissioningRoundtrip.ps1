@@ -94,8 +94,11 @@ try {
     Assert-HerdrRoundtripEqual 'local and OneDrive provenance manifest bytes' $resultManifestText $oneDriveManifestText
     $resultManifest = $resultManifestText | ConvertFrom-Json
     Assert-HerdrRoundtripEqual 'result manifest schema' 'herdr-excel-job-result-v1' $resultManifest.schema
-    Assert-HerdrRoundtripEqual 'result source hash' $stagingManifest.source.sha256 $resultManifest.source.sha256
-    Assert-HerdrRoundtripEqual 'result staged hash' $stagingManifest.bridge_stage.sha256 $resultManifest.staged.sha256
+    Assert-HerdrRoundtripEqual 'result source hash before job' $stagingManifest.source.sha256 $resultManifest.source.sha256_before
+    Assert-HerdrRoundtripEqual 'result source hash after job' $stagingManifest.source.sha256 $resultManifest.source.sha256_after
+    Assert-HerdrRoundtripEqual 'result staged hash' $stagingManifest.bridge_stage.sha256 $resultManifest.bridge_stage.sha256
+    Assert-HerdrRoundtripEqual 'protected last-mile hash' $stagingManifest.bridge_stage.sha256 $resultManifest.last_mile.sha256
+    Assert-HerdrRoundtripEqual 'protected last-mile protection flag' $true $resultManifest.last_mile.protected
     Assert-HerdrRoundtripEqual 'result repository provenance' $Repository $resultManifest.provenance.repository
     Assert-HerdrRoundtripEqual 'result branch provenance' $Branch $resultManifest.provenance.branch
     Assert-HerdrRoundtripEqual 'result commit provenance' $Commit $resultManifest.provenance.commit
@@ -133,7 +136,7 @@ try {
         checks = @(
             'Inbox source preserved with unchanged SHA-256',
             'bridge staging hash equals Inbox hash',
-            'protected Excel review-job copy completed',
+            'protected Excel review-job copy completed with staged-input hash and protection flag',
             'local and OneDrive Outbox provenance manifests are byte-identical',
             'OneDrive Outbox result hash equals manifest hash',
             'Excel default-deny security fields are present'
