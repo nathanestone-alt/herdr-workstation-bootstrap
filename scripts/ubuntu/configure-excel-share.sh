@@ -186,13 +186,19 @@ sudo systemctl daemon-reload
 # Mounting the path directly would leave the generated .automount unit dead
 # until reboot, so any later unmount would never reconnect on access. Arm the
 # trigger and let path access perform the mount, proving reconnect semantics.
-automount_unit="$(systemd-escape --path --suffix=automount "$mount_point")"
+if ! automount_unit="$(systemd-escape --path --suffix=automount "$mount_point")" ||
+  [[ -z "$automount_unit" ]]; then
+  echo 'The replacement credential and fstab are installed, but the automount unit name could not be derived (systemd-escape failed). Correct the reported error and rerun this script; do not rotate the Windows password again.' >&2
+  exit 24
+fi
 if ! sudo systemctl restart "$automount_unit"; then
   echo 'The replacement credential and fstab are installed, but the automount unit failed to start. Correct the reported systemd error and rerun this script; do not rotate the Windows password again.' >&2
   exit 24
 fi
+# findmnt --target reports BOTH stacked mounts (autofs trigger + cifs) on
+# this platform, so the query must be type-filtered to select the cifs mount.
 if ! ls -- "$mount_point" >/dev/null ||
-  [[ "$(findmnt -n -o FSTYPE --target "$mount_point" 2>/dev/null)" != cifs ]]; then
+  [[ "$(findmnt -n -t cifs -o FSTYPE --target "$mount_point" 2>/dev/null)" != cifs ]]; then
   echo 'The replacement credential and fstab are installed, but the live mount failed. Correct the reported mount error and rerun this script; do not rotate the Windows password again.' >&2
   exit 24
 fi
