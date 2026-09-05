@@ -66,7 +66,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-windows-authority-native-$([
 try {
     Assert-True ($runtimeToken.UserSid -ceq $ExpectedRuntimeUserSid) 'Runtime token SID differs from the commissioned SID.'
     $expectedRuntimeGroupAttributes = [uint32]0x00000010
-    $expectedRunnerGroupAttributes = [uint32]0x00000007
+    $expectedRunnerGroupAttributes = [uint32]0x0000000f
     Assert-True $runtimeToken.AdministratorsGroupPresent 'Runtime token lacks the expected Administrators group entry.'
     Assert-True $runtimeToken.AdministratorsGroupDenyOnly 'Runtime token Administrators group is not deny-only.'
     Assert-True (-not $runtimeToken.AdministratorsGroupEnabled) 'Runtime token Administrators group is unexpectedly enabled.'
