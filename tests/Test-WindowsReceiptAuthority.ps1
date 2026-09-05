@@ -22,6 +22,31 @@ Assert-True ($canonical -ceq '{"a":{"a":1,"z":2},"b":1}') 'Canonical JSON did no
 Assert-True ((Get-HerdrStringSha256 -Value '') -ceq 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') `
     'UTF-8 string hashing does not match SHA-256.'
 
+$canonicalExpiry = '2026-10-05T04:20:46Z'
+$expiryJson = '{"expires_at_utc":"' + $canonicalExpiry + '"}'
+$coercedExpiry = ($expiryJson | ConvertFrom-Json -AsHashtable).expires_at_utc
+Assert-True ($coercedExpiry -is [datetime]) 'Fixture no longer reproduces ConvertFrom-Json timestamp coercion.'
+Assert-True ([string]$coercedExpiry -cne $canonicalExpiry) 'Fixture did not reproduce the DateTime-to-locale-string corruption.'
+$parsedExpiry = Assert-HerdrWindowsReceiptExpiry -ReceiptJson $expiryJson -Now ([datetime]'2026-09-05T04:20:46Z')
+Assert-True ($parsedExpiry.Kind -eq [DateTimeKind]::Utc -and $parsedExpiry.ToString('o').StartsWith('2026-10-05T04:20:46')) `
+    'Canonical future receipt expiry was not preserved and parsed as UTC.'
+Assert-Throws {
+    Assert-HerdrWindowsReceiptExpiry -ReceiptJson '{"expires_at_utc":"2026-09-05T04:20:46Z"}' -Now ([datetime]'2026-09-05T04:20:46Z')
+} 'expired' 'expired receipt timestamp'
+foreach ($invalidExpiry in @(
+    '{}',
+    '{"expires_at_utc":null}',
+    '{"expires_at_utc":20261005}',
+    '{"expires_at_utc":"2026-10-05T04:20:46.000Z"}',
+    '{"expires_at_utc":"2026-10-05T04:20:46+00:00"}',
+    '{"expires_at_utc":"10/05/2026 04:20:46"}',
+    '{"expires_at_utc":"2026-02-30T04:20:46Z"}'
+)) {
+    Assert-Throws {
+        Assert-HerdrWindowsReceiptExpiry -ReceiptJson $invalidExpiry -Now ([datetime]'2026-09-05T04:20:46Z')
+    } 'expires_at_utc' "invalid receipt timestamp $invalidExpiry"
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-windows-authority-$([Guid]::NewGuid().ToString('N'))"
 try {
     New-Item -ItemType Directory -Path (Join-Path $root 'payload') -Force | Out-Null

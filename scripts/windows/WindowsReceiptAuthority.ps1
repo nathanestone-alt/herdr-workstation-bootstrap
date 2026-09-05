@@ -58,6 +58,41 @@ function Get-HerdrStringSha256 {
     finally { $algorithm.Dispose() }
 }
 
+function Assert-HerdrWindowsReceiptExpiry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReceiptJson,
+        [datetime]$Now = [DateTime]::UtcNow
+    )
+
+    $document = [Text.Json.JsonDocument]::Parse($ReceiptJson)
+    try {
+        try { $element = $document.RootElement.GetProperty('expires_at_utc') }
+        catch { throw 'Installed Windows receipt expires_at_utc is missing.' }
+        if ($element.ValueKind -ne [Text.Json.JsonValueKind]::String) {
+            throw 'Installed Windows receipt expires_at_utc must be a JSON string.'
+        }
+        $value = $element.GetString()
+        if ($value -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') {
+            throw 'Installed Windows receipt expires_at_utc is not canonical UTC.'
+        }
+        try {
+            $expires = [DateTime]::ParseExact(
+                $value,
+                'yyyy-MM-ddTHH:mm:ssZ',
+                [Globalization.CultureInfo]::InvariantCulture,
+                ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)
+            )
+        }
+        catch [FormatException] {
+            throw 'Installed Windows receipt expires_at_utc is not canonical UTC.'
+        }
+        if ($expires -le $Now.ToUniversalTime()) { throw 'Installed Windows receipt is expired.' }
+        return $expires
+    }
+    finally { $document.Dispose() }
+}
+
 function Assert-HerdrAuthorityHex {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Value, [Parameter(Mandatory)][ValidateSet(40, 64)][int]$Length, [Parameter(Mandatory)][string]$Label)
@@ -458,7 +493,8 @@ function Assert-HerdrWindowsAuthority {
         $receiptHandle = [IO.File]::Open($receiptPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         $receiptHash = ([BitConverter]::ToString($hashAlgorithm.ComputeHash($receiptHandle))).Replace('-', '').ToLowerInvariant()
         if ($receiptHash -cne [string]$authority.receipt_sha256) { throw 'Installed authority receipt hash differs from the held receipt.' }
-        $receipt = [IO.File]::ReadAllText($receiptPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -AsHashtable
+        $receiptJson = [IO.File]::ReadAllText($receiptPath, [Text.UTF8Encoding]::new($false))
+        $receipt = $receiptJson | ConvertFrom-Json -AsHashtable
         if ($receipt.receipt_id -cne $authority.receipt_id -or $receipt.source_commit_sha -cne $authority.source_commit_sha -or
             $receipt.payload_manifest_sha256 -cne $authority.payload_manifest_sha256 -or
             $receipt.bridge_allowlist_sha256 -cne $authority.bridge_allowlist_sha256 -or
@@ -473,8 +509,7 @@ function Assert-HerdrWindowsAuthority {
             $receipt.uv.version_output_sha256 -cne $authority.uv.version_output_sha256) {
             throw 'Installed authority does not exactly bind the receipt identities.'
         }
-        $expires = [DateTime]::ParseExact([string]$receipt.expires_at_utc, 'yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        if ($expires.ToUniversalTime() -le [DateTime]::UtcNow) { throw 'Installed Windows receipt is expired.' }
+        Assert-HerdrWindowsReceiptExpiry -ReceiptJson $receiptJson | Out-Null
         $roleHash = Get-HerdrStringSha256 -Value (ConvertTo-HerdrCanonicalJson -Value $receipt.role_identities)
         if ($roleHash -cne $authority.role_manifest_sha256) { throw 'Installed receipt role manifest hash is invalid.' }
         foreach ($identity in @($receipt.python313, $receipt.python313.launcher, $receipt.uv) + @($receipt.role_identities.Values)) {
