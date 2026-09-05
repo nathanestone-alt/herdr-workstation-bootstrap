@@ -154,3 +154,53 @@ function Assert-HostOwnedReadOnlyTree {
         }
     }
 }
+
+function Assert-HerdrAuthorityNamespaceRuntimeAccess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AuthorityRoot,
+        [Parameter(Mandatory)][object]$RuntimeToken
+    )
+
+    if (-not $IsWindows) { throw 'Authority namespace access checks require Windows.' }
+    $root = Get-HerdrCanonicalPath -Path $AuthorityRoot
+    $components = @(Get-HerdrPathComponents -Path $root)
+    if ($components.Count -lt 4) { throw "Authority namespace has too few fixed-path components: '$root'." }
+    $handles = [Collections.Generic.List[object]]::new()
+    try {
+        # Each retained handle omits FILE_SHARE_DELETE, so every existing ancestor
+        # remains bound against rename/replacement while the complete proof runs.
+        foreach ($component in $components) {
+            $proof = Get-HerdrPhysicalPathProof -Path $component
+            if (-not $proof.Exists -or -not $proof.Leaf.IsDirectory) {
+                throw "Authority namespace ancestor is not a directory: '$component'."
+            }
+            $raw = [Herdr.Security.NativeMethods]::OpenDirectoryForRelative($component)
+            $handle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($raw, $true)
+            $null = $handles.Add($handle)
+            $identity = [Herdr.Security.NativeMethods]::ReadFileIdentity($handle.DangerousGetHandle())
+            if (('{0:x8}:{1:x16}' -f $identity.VolumeSerialNumber, $identity.FileIndex) -cne [string]$proof.Leaf.FileIdentity) {
+                throw "Authority namespace ancestor identity changed while opening: '$component'."
+            }
+        }
+
+        # Ancestors need not be globally read-only. Deny only rights that can
+        # rename/delete an existing child or rewrite its security boundary.
+        $namespaceMutationMask = [uint32]0x000D0040
+        foreach ($component in @($components | Select-Object -SkipLast 1)) {
+            Assert-HerdrRuntimeTokenCannotMutate -RuntimeToken $RuntimeToken -Path $component `
+                -ProhibitedMask $namespaceMutationMask -Description 'authority namespace ancestor' | Out-Null
+        }
+
+        # The dedicated Issue961 namespace and every object in it must be wholly
+        # immutable to the actual runtime token.
+        $rootItem = Get-Item -LiteralPath $root -Force
+        foreach ($item in @($rootItem) + @(Get-ChildItem -LiteralPath $root -Force -Recurse)) {
+            Assert-HerdrRuntimeTokenCannotMutate -RuntimeToken $RuntimeToken -Path $item.FullName `
+                -Description 'authority object' | Out-Null
+        }
+    }
+    finally {
+        foreach ($handle in $handles) { $handle.Dispose() }
+    }
+}

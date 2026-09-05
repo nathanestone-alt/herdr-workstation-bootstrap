@@ -127,6 +127,18 @@ function Invoke-HerdrAuthorityCommand {
     return ($output -join "`n").Trim()
 }
 
+function Get-HerdrRuntimeProfilePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid)
+
+    if (-not $IsWindows) { throw 'Runtime profile resolution requires Windows.' }
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($RuntimeSid.Value)"
+    $profileValue = [string](Get-ItemPropertyValue -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop)
+    if ([string]::IsNullOrWhiteSpace($profileValue)) { throw "Runtime profile path is missing for SID '$($RuntimeSid.Value)'." }
+    $expanded = [Environment]::ExpandEnvironmentVariables($profileValue)
+    return Assert-HerdrAuthoritySafePath -Path $expanded
+}
+
 function Test-HerdrPayloadManifest {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$PayloadRoot, [Parameter(Mandatory)][string]$ManifestPath)
@@ -216,16 +228,41 @@ function Get-HerdrPython313Identity {
 
 function Get-HerdrUvIdentity {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory)][string]$RuntimeProfilePath,
+        [Parameter(Mandatory)][string]$ExpectedTargetSha256
+    )
 
-    $command = Get-HerdrAuthorityCommand -Name @('uv.exe', 'uv') -Label 'uv' -AllowReparseLeaf
+    Assert-HerdrAuthorityHex -Value $ExpectedTargetSha256 -Length 64 -Label 'ExpectedUvTargetSha256'
+    $profile = Assert-HerdrAuthoritySafePath -Path $RuntimeProfilePath
+    $linkPath = Get-HerdrCanonicalPath -Path (Join-Path $profile 'AppData\Local\Microsoft\WinGet\Links\uv.exe')
+    Assert-HerdrAuthoritySafePath -Path (Split-Path -Parent $linkPath) | Out-Null
+    if (-not [IO.File]::Exists($linkPath)) { throw "The approved WinGet uv command link is missing: '$linkPath'." }
+    $linkItem = Get-Item -LiteralPath $linkPath -Force -ErrorAction Stop
+    $isReparse = ($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    if (-not $isReparse -or $linkItem.PSIsContainer) {
+        throw "The approved WinGet uv command leaf is not a reparse link: '$linkPath'."
+    }
+    $command = [pscustomobject][ordered]@{ Path = $linkPath; Item = $linkItem; IsReparse = $true }
     $target = Resolve-HerdrAuthorityReparseTarget -Command $command -Label 'uv'
+    $packageRoot = Assert-HerdrAuthoritySafePath -Path (Join-Path $profile 'AppData\Local\Microsoft\WinGet\Packages')
+    if (-not (Test-HerdrPathSameOrDescendant -Candidate $target -Ancestor $packageRoot)) {
+        throw "The WinGet uv link target is outside the approved package root: '$target'."
+    }
+    $relativeTarget = [IO.Path]::GetRelativePath($packageRoot, $target)
+    if ($relativeTarget -notmatch '(?i)^astral-sh[.]uv_Microsoft[.]Winget[.]Source_[A-Za-z0-9]+\\(?:[^\\]+\\)*uv[.]exe$') {
+        throw "The WinGet uv link target has an unexpected package topology: '$target'."
+    }
+    $targetSha256 = Get-HerdrAuthoritySha256 -Path $target
+    if ($targetSha256 -cne $ExpectedTargetSha256) {
+        throw "The WinGet uv target bytes differ from the independently commissioned SHA-256: '$target'."
+    }
     $version = Invoke-HerdrAuthorityCommand -Path $target -ArgumentList @('--version') -Label 'uv version probe'
     return [ordered]@{
         command_path = $command.Path
-        command_path_is_reparse = [bool]$command.IsReparse
+        command_path_is_reparse = $true
         executable = $target
-        sha256 = Get-HerdrAuthoritySha256 -Path $target
+        sha256 = $targetSha256
         version = (($version -split "`r?`n")[0]).Trim()
         version_output_sha256 = Get-HerdrStringSha256 -Value $version
     }
@@ -310,45 +347,99 @@ function New-HerdrWindowsAuthorityValue {
     }
 }
 
-function Write-HerdrAuthorityAtomicFile {
+function Write-HerdrAuthorityStagedFile {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content, [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content)
 
-    $parent = Split-Path -Parent $Path
-    Ensure-HerdrManagedDirectory -Path $parent -Description '#961 authority directory' | Out-Null
-    Assert-HerdrAuthoritySafePath -Path $parent | Out-Null
-    Protect-HostOwnedReadOnlyTree -TargetPath $parent -ReaderSid $RuntimeSid
-    $temporary = Join-Path $parent ('.issue-961-authority-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content + "`n")
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content + "`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+}
+
+function Publish-HerdrAuthorityFirstInstall {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AuthorityPath,
+        [Parameter(Mandatory)][string]$AuthorityContent,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [Parameter(Mandatory)][string]$ReceiptContent,
+        [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid,
+        [Parameter(Mandatory)][object]$RuntimeToken
+    )
+
+    $authority = Get-HerdrCanonicalPath -Path $AuthorityPath
+    $receipt = Get-HerdrCanonicalPath -Path $ReceiptPath
+    $target = Split-Path -Parent $authority
+    if ($target -cne (Split-Path -Parent $receipt) -or
+        [IO.Path]::GetFileName($authority) -cne 'receipt-authority.json' -or
+        [IO.Path]::GetFileName($receipt) -cne 'bootstrap-receipt.json') {
+        throw 'Authority publication paths do not form the fixed #961 pair.'
+    }
+    if ([IO.Directory]::Exists($target) -or [IO.File]::Exists($authority) -or [IO.File]::Exists($receipt)) {
+        throw 'The #961 authority pair already exists; first-install-only publication refuses replacement.'
+    }
+
+    $namespaceParent = Split-Path -Parent $target
+    Ensure-HerdrManagedDirectory -Path $namespaceParent -Description '#961 authority namespace parent' | Out-Null
+    Assert-HerdrAuthoritySafePath -Path $namespaceParent | Out-Null
+    $heldAncestors = [Collections.Generic.List[object]]::new()
+    $stage = Join-Path $namespaceParent ('.issue-961-authority-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $published = $false
+    try {
+        foreach ($component in @(Get-HerdrPathComponents -Path $namespaceParent)) {
+            $raw = [Herdr.Security.NativeMethods]::OpenDirectoryForRelative($component)
+            $null = $heldAncestors.Add([Microsoft.Win32.SafeHandles.SafeFileHandle]::new($raw, $true))
         }
-        finally { $stream.Dispose() }
-        Assert-HerdrAuthoritySafePath -Path $temporary | Out-Null
-        Protect-HostOwnedReadOnlyTree -TargetPath $parent -ReaderSid $RuntimeSid
-        Assert-HerdrAuthoritySafePath -Path $parent | Out-Null
-        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, $null, $true) }
-        else { [IO.File]::Move($temporary, $Path) }
-        Protect-HostOwnedReadOnlyTree -TargetPath $parent -ReaderSid $RuntimeSid
-        Assert-HerdrAuthoritySafePath -Path $Path | Out-Null
+        Ensure-HerdrManagedDirectory -Path $stage -Description '#961 staged authority generation' -RequireLeafCreation | Out-Null
+        $stageReceipt = Join-Path $stage 'bootstrap-receipt.json'
+        $stageAuthority = Join-Path $stage 'receipt-authority.json'
+        Write-HerdrAuthorityStagedFile -Path $stageReceipt -Content $ReceiptContent
+        Write-HerdrAuthorityStagedFile -Path $stageAuthority -Content $AuthorityContent
+        Protect-HostOwnedReadOnlyTree -TargetPath $stage -ReaderSid $RuntimeSid
+
+        $stagedReceiptHash = Get-HerdrAuthoritySha256 -Path $stageReceipt
+        $stagedAuthority = [IO.File]::ReadAllText($stageAuthority, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -AsHashtable
+        $stagedReceipt = [IO.File]::ReadAllText($stageReceipt, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -AsHashtable
+        if ([string]$stagedAuthority.receipt_path -cne $script:WindowsReceiptPath -or
+            [string]$stagedAuthority.receipt_sha256 -cne $stagedReceiptHash -or
+            [string]$stagedAuthority.receipt_id -cne [string]$stagedReceipt.receipt_id -or
+            [string]$stagedAuthority.authority_id -cne $script:WindowsReceiptAuthorityId) {
+            throw 'The staged #961 authority generation is not internally coherent.'
+        }
+        Assert-HerdrAuthorityNamespaceRuntimeAccess -AuthorityRoot $stage -RuntimeToken $RuntimeToken
+        if ([IO.Directory]::Exists($target) -or [IO.File]::Exists($authority) -or [IO.File]::Exists($receipt)) {
+            throw 'The #961 authority namespace appeared during first-install publication.'
+        }
+        [IO.Directory]::Move($stage, $target)
+        $published = $true
     }
     finally {
-        if ([IO.File]::Exists($temporary)) { Remove-Item -LiteralPath $temporary -Force }
+        foreach ($handle in $heldAncestors) { $handle.Dispose() }
+        if (-not $published -and [IO.Directory]::Exists($stage)) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+        }
     }
 }
 
 function Assert-HerdrWindowsAuthority {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$AuthorityPath, [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid)
+    param(
+        [Parameter(Mandatory)][string]$AuthorityPath,
+        [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid,
+        [Parameter(Mandatory)][object]$RuntimeToken,
+        [Parameter(Mandatory)][string]$RuntimeProfilePath
+    )
 
     if ((Get-HerdrCanonicalPath -Path $AuthorityPath) -cne $script:WindowsReceiptAuthorityPath) {
         throw 'The #961 Windows authority check cannot be redirected from its fixed path.'
     }
     Assert-HerdrAuthoritySafePath -Path $AuthorityPath | Out-Null
     Assert-HostOwnedReadOnlyTree -TargetPath (Split-Path -Parent $AuthorityPath) -ReaderSid $RuntimeSid
+    Assert-HerdrAuthorityNamespaceRuntimeAccess -AuthorityRoot (Split-Path -Parent $AuthorityPath) -RuntimeToken $RuntimeToken
     $authorityHandle = [IO.File]::Open($AuthorityPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $receiptHandle = $null
     $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
@@ -375,7 +466,11 @@ function Assert-HerdrWindowsAuthority {
             $receipt.runtime_identity.sid -cne $authority.runtime_identity.sid -or
             $receipt.python313.sha256 -cne $authority.python313.sha256 -or
             $receipt.python313.launcher.sha256 -cne $authority.python313.launcher.sha256 -or
-            $receipt.uv.sha256 -cne $authority.uv.sha256) {
+            $receipt.uv.sha256 -cne $authority.uv.sha256 -or
+            $receipt.uv.command_path -cne $authority.uv.command_path -or
+            $receipt.uv.executable -cne $authority.uv.executable -or
+            [bool]$receipt.uv.command_path_is_reparse -ne [bool]$authority.uv.command_path_is_reparse -or
+            $receipt.uv.version_output_sha256 -cne $authority.uv.version_output_sha256) {
             throw 'Installed authority does not exactly bind the receipt identities.'
         }
         $expires = [DateTime]::ParseExact([string]$receipt.expires_at_utc, 'yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
@@ -388,15 +483,14 @@ function Assert-HerdrWindowsAuthority {
                 throw "Installed executable identity hash changed: '$identityPath'."
             }
         }
-        $uvCommandPath = Get-HerdrCanonicalPath -Path ([string]$receipt.uv.command_path)
-        $uvItem = Get-Item -LiteralPath $uvCommandPath -Force
-        $uvCommand = [pscustomobject][ordered]@{
-            Path = $uvCommandPath
-            Item = $uvItem
-            IsReparse = (($uvItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ([bool]$receipt.uv.command_path_is_reparse -ne $true) {
+            throw 'Installed uv command receipt does not require a reparse link.'
         }
-        if ([bool]$receipt.uv.command_path_is_reparse -ne [bool]$uvCommand.IsReparse -or
-            (Resolve-HerdrAuthorityReparseTarget -Command $uvCommand -Label 'uv') -cne [string]$receipt.uv.executable) {
+        $actualUv = Get-HerdrUvIdentity -RuntimeProfilePath $RuntimeProfilePath -ExpectedTargetSha256 ([string]$receipt.uv.sha256)
+        if ([string]$actualUv.command_path -cne [string]$receipt.uv.command_path -or
+            [string]$actualUv.executable -cne [string]$receipt.uv.executable -or
+            [string]$actualUv.version -cne [string]$receipt.uv.version -or
+            [string]$actualUv.version_output_sha256 -cne [string]$receipt.uv.version_output_sha256) {
             throw 'Installed uv command no longer resolves to the receipted target.'
         }
     }

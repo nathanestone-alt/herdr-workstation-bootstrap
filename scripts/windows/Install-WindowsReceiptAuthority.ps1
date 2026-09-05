@@ -8,7 +8,11 @@ param(
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPayloadManifestSha256,
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedRoleAllowlistSha256,
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedProducerScriptSha256,
+    [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedUvTargetSha256,
     [ValidatePattern('^HERDR-WIN\\rdp-natha$')][string]$RuntimeAccount = 'HERDR-WIN\rdp-natha',
+    [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$RuntimeProcessId,
+    [Parameter(Mandatory)][string]$ExpectedRuntimeProcessCreationTimeUtc,
+    [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ExpectedRuntimeSessionId,
     [ValidateSet('bash', 'gh', 'node', 'rtk')][string[]]$AdditionalRole = @(),
     [ValidatePattern('^C:\\ProgramData\\STModel\\Issue961\\receipt-authority[.]json$')]
     [string]$AuthorityPath = 'C:\ProgramData\STModel\Issue961\receipt-authority.json',
@@ -19,6 +23,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'HerdrReviewStaging.ps1')
+. (Join-Path $PSScriptRoot 'HerdrWindowsRuntimeTokenAccess.ps1')
 . (Join-Path $PSScriptRoot 'HerdrHostOwnedAclPolicy.ps1')
 . (Join-Path $PSScriptRoot 'WindowsReceiptAuthority.ps1')
 
@@ -37,48 +42,65 @@ if ($authority -cne $script:WindowsReceiptAuthorityPath -or $receipt -cne $scrip
 }
 $runtimeSid = ([Security.Principal.NTAccount]::new($RuntimeAccount)).Translate([Security.Principal.SecurityIdentifier])
 if ([string]::IsNullOrWhiteSpace($runtimeSid.Value)) { throw "Runtime account SID could not be resolved: '$RuntimeAccount'." }
+$runtimeProfile = Get-HerdrRuntimeProfilePath -RuntimeSid $runtimeSid
+$runtimeToken = Open-HerdrRuntimeTokenProof -ProcessId $RuntimeProcessId `
+    -ExpectedCreationTimeUtc $ExpectedRuntimeProcessCreationTimeUtc `
+    -ExpectedSessionId $ExpectedRuntimeSessionId -ExpectedUserSid $runtimeSid
 
-if ($Mode -eq 'Check') {
-    Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid
-    Write-Host "Windows #961 receipt authority check passed: $authority"
-    exit 0
+try {
+    if ($Mode -eq 'Check') {
+        Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid `
+            -RuntimeToken $runtimeToken -RuntimeProfilePath $runtimeProfile
+        Write-Host ("Windows #961 receipt authority check passed: {0} runtime_pid={1} runtime_creation_utc={2} runtime_session={3} " +
+            "runtime_sid={4} elevation_type={5} administrators_enabled={6} administrators_deny_only={7}" -f
+            $authority, $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc, $ExpectedRuntimeSessionId,
+            $runtimeSid.Value, $runtimeToken.ElevationType, $runtimeToken.AdministratorsGroupEnabled, $runtimeToken.AdministratorsGroupDenyOnly)
+        return
+    }
+
+    Assert-HerdrAuthorityHex -Value $ExpectedSourceCommit -Length 40 -Label 'ExpectedSourceCommit'
+    Assert-HerdrAuthorityHex -Value $ExpectedPayloadManifestSha256 -Length 64 -Label 'ExpectedPayloadManifestSha256'
+    Assert-HerdrAuthorityHex -Value $ExpectedRoleAllowlistSha256 -Length 64 -Label 'ExpectedRoleAllowlistSha256'
+    Assert-HerdrAuthorityHex -Value $ExpectedProducerScriptSha256 -Length 64 -Label 'ExpectedProducerScriptSha256'
+    Assert-HerdrAuthorityHex -Value $ExpectedUvTargetSha256 -Length 64 -Label 'ExpectedUvTargetSha256'
+
+    $git = Get-HerdrAuthorityCommand -Name @('git.exe', 'git') -Label 'Git'
+    $actualCommit = Invoke-HerdrAuthorityCommand -Path $git.Path -ArgumentList @('-C', $source, 'rev-parse', 'HEAD') -Label 'Git source commit probe'
+    if ($actualCommit -cne $ExpectedSourceCommit) { throw "Source commit differs from commissioned commit: $actualCommit." }
+    $status = Invoke-HerdrAuthorityCommand -Path $git.Path -ArgumentList @('-C', $source, 'status', '--porcelain=v1', '--untracked-files=no') -Label 'Git source cleanliness probe'
+    if (-not [string]::IsNullOrWhiteSpace($status)) { throw 'Source checkout has tracked modifications; authority publication refused.' }
+
+    $manifestPath = Assert-HerdrAuthoritySafePath -Path (Join-Path $source 'config\payload-manifest.sha256')
+    $allowlistPath = Assert-HerdrAuthoritySafePath -Path (Join-Path $source 'config\receipt-authority-role-allowlist.txt')
+    $actualManifestSha256 = Get-HerdrAuthoritySha256 -Path $manifestPath
+    if ($actualManifestSha256 -cne $ExpectedPayloadManifestSha256) { throw 'Payload manifest differs from the independently commissioned SHA-256.' }
+    Test-HerdrPayloadManifest -PayloadRoot (Join-Path $source 'payload') -ManifestPath $manifestPath
+    $allowlistSha256 = Get-HerdrAuthoritySha256 -Path $allowlistPath
+    if ($allowlistSha256 -cne $ExpectedRoleAllowlistSha256) { throw 'Role allowlist differs from the independently commissioned SHA-256.' }
+    $producerScriptSha256 = Get-HerdrAuthoritySha256 -Path $MyInvocation.MyCommand.Path
+    if ($producerScriptSha256 -cne $ExpectedProducerScriptSha256) { throw 'Producer script differs from the independently commissioned SHA-256.' }
+    $definitions = Get-HerdrRoleDefinitions -AllowlistPath $allowlistPath
+    $roles = Get-HerdrRoleManifest -Definitions $definitions -RequiredRole (@('git', 'pwsh') + @($AdditionalRole)) -SourceCommit $actualCommit
+    $python = Get-HerdrPython313Identity
+    $uv = Get-HerdrUvIdentity -RuntimeProfilePath $runtimeProfile -ExpectedTargetSha256 $ExpectedUvTargetSha256
+    if ($python.version -cne '3.13.15') { throw "Commissioned CPython version must be 3.13.15, got '$($python.version)'." }
+    if ($uv.version -cnotmatch '^uv 0[.]12[.]5(?:\s|$)') { throw "Commissioned uv version must be 0.12.5, got '$($uv.version)'." }
+    $receiptValue = New-HerdrWindowsReceiptValues -SourceRoot $source -SourceCommit $actualCommit `
+        -PayloadManifestSha256 $actualManifestSha256 -BridgeAllowlistSha256 $allowlistSha256 `
+        -ReceiptPath $receipt -RuntimeAccount $RuntimeAccount -RuntimeSid $runtimeSid -Python313 $python -Uv $uv `
+        -RoleIdentities $roles -ProducerScriptSha256 $producerScriptSha256
+    $receiptJson = ConvertTo-HerdrCanonicalJson -Value $receiptValue
+    $receiptSha256 = Get-HerdrStringSha256 -Value ($receiptJson + "`n")
+    $authorityValue = New-HerdrWindowsAuthorityValue -Receipt $receiptValue -ReceiptPath $receipt -ReceiptSha256 $receiptSha256
+    $authorityJson = ConvertTo-HerdrCanonicalJson -Value $authorityValue
+    Publish-HerdrAuthorityFirstInstall -AuthorityPath $authority -AuthorityContent $authorityJson `
+        -ReceiptPath $receipt -ReceiptContent $receiptJson -RuntimeSid $runtimeSid -RuntimeToken $runtimeToken
+    Write-Host ("Windows #961 receipt authority installed: authority={0} receipt={1} source={2} runtime_pid={3} " +
+        "runtime_creation_utc={4} runtime_session={5} runtime_sid={6} elevation_type={7} administrators_enabled={8} administrators_deny_only={9}" -f
+        $authority, $receipt, $actualCommit, $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc,
+        $ExpectedRuntimeSessionId, $runtimeSid.Value, $runtimeToken.ElevationType,
+        $runtimeToken.AdministratorsGroupEnabled, $runtimeToken.AdministratorsGroupDenyOnly)
 }
-
-Assert-HerdrAuthorityHex -Value $ExpectedSourceCommit -Length 40 -Label 'ExpectedSourceCommit'
-Assert-HerdrAuthorityHex -Value $ExpectedPayloadManifestSha256 -Length 64 -Label 'ExpectedPayloadManifestSha256'
-Assert-HerdrAuthorityHex -Value $ExpectedRoleAllowlistSha256 -Length 64 -Label 'ExpectedRoleAllowlistSha256'
-Assert-HerdrAuthorityHex -Value $ExpectedProducerScriptSha256 -Length 64 -Label 'ExpectedProducerScriptSha256'
-
-$git = Get-HerdrAuthorityCommand -Name @('git.exe', 'git') -Label 'Git'
-$actualCommit = Invoke-HerdrAuthorityCommand -Path $git.Path -ArgumentList @('-C', $source, 'rev-parse', 'HEAD') -Label 'Git source commit probe'
-if ($actualCommit -cne $ExpectedSourceCommit) { throw "Source commit differs from commissioned commit: $actualCommit." }
-$status = Invoke-HerdrAuthorityCommand -Path $git.Path -ArgumentList @('-C', $source, 'status', '--porcelain=v1', '--untracked-files=no') -Label 'Git source cleanliness probe'
-if (-not [string]::IsNullOrWhiteSpace($status)) { throw 'Source checkout has tracked modifications; authority publication refused.' }
-
-$manifestPath = Assert-HerdrAuthoritySafePath -Path (Join-Path $source 'config\payload-manifest.sha256')
-$allowlistPath = Assert-HerdrAuthoritySafePath -Path (Join-Path $source 'config\receipt-authority-role-allowlist.txt')
-$actualManifestSha256 = Get-HerdrAuthoritySha256 -Path $manifestPath
-if ($actualManifestSha256 -cne $ExpectedPayloadManifestSha256) { throw 'Payload manifest differs from the independently commissioned SHA-256.' }
-Test-HerdrPayloadManifest -PayloadRoot (Join-Path $source 'payload') -ManifestPath $manifestPath
-$allowlistSha256 = Get-HerdrAuthoritySha256 -Path $allowlistPath
-if ($allowlistSha256 -cne $ExpectedRoleAllowlistSha256) { throw 'Role allowlist differs from the independently commissioned SHA-256.' }
-$producerScriptSha256 = Get-HerdrAuthoritySha256 -Path $MyInvocation.MyCommand.Path
-if ($producerScriptSha256 -cne $ExpectedProducerScriptSha256) { throw 'Producer script differs from the independently commissioned SHA-256.' }
-$definitions = Get-HerdrRoleDefinitions -AllowlistPath $allowlistPath
-$roles = Get-HerdrRoleManifest -Definitions $definitions -RequiredRole (@('git', 'pwsh') + @($AdditionalRole)) -SourceCommit $actualCommit
-$python = Get-HerdrPython313Identity
-$uv = Get-HerdrUvIdentity
-if ($python.version -cne '3.13.15') { throw "Commissioned CPython version must be 3.13.15, got '$($python.version)'." }
-if ($uv.version -cnotmatch '^uv 0[.]12[.]5(?:\s|$)') { throw "Commissioned uv version must be 0.12.5, got '$($uv.version)'." }
-$receiptValue = New-HerdrWindowsReceiptValues -SourceRoot $source -SourceCommit $actualCommit `
-    -PayloadManifestSha256 $actualManifestSha256 -BridgeAllowlistSha256 $allowlistSha256 `
-    -ReceiptPath $receipt -RuntimeAccount $RuntimeAccount -RuntimeSid $runtimeSid -Python313 $python -Uv $uv `
-    -RoleIdentities $roles -ProducerScriptSha256 $producerScriptSha256
-$receiptJson = ConvertTo-HerdrCanonicalJson -Value $receiptValue
-Write-HerdrAuthorityAtomicFile -Path $receipt -Content $receiptJson -RuntimeSid $runtimeSid
-$receiptSha256 = Get-HerdrAuthoritySha256 -Path $receipt
-$authorityValue = New-HerdrWindowsAuthorityValue -Receipt $receiptValue -ReceiptPath $receipt -ReceiptSha256 $receiptSha256
-$authorityJson = ConvertTo-HerdrCanonicalJson -Value $authorityValue
-Write-HerdrAuthorityAtomicFile -Path $authority -Content $authorityJson -RuntimeSid $runtimeSid
-Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid
-Write-Host "Windows #961 receipt authority installed: authority=$authority receipt=$receipt source=$actualCommit runtime_sid=$($runtimeSid.Value)"
+finally {
+    $runtimeToken.Dispose()
+}
