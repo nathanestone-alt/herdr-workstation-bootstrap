@@ -68,6 +68,7 @@ foreach ($required in @(
     'RuntimeProcessId',
     'ExpectedRuntimeProcessCreationTimeUtc',
     'ExpectedRuntimeSessionId',
+    'Commissioned uv version must be 0.12.6',
     'Open-HerdrRuntimeTokenProof',
     'Publish-HerdrAuthorityFirstInstall',
     'Protect-HostOwnedReadOnlyTree',

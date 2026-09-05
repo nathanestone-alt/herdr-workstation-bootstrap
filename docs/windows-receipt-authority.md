@@ -10,6 +10,8 @@ the independently commissioned values. It probes the real `py.exe -3.13` result,
 the launcher and resolved CPython executable, requires the approved runtime profile's canonical
 `Microsoft\WinGet\Links\uv.exe` reparse leaf, constrains its target to the `astral-sh.uv`
 WinGet package topology, and binds the real target to an independently commissioned SHA-256.
+The commissioned installed target is `uv 0.12.6`; this exact version is required without
+reinstalling, downgrading, or accepting an arbitrary PATH executable.
 It also hashes each required host role from the reviewed #961
 role allowlist. The authority records the actual SID resolved for the already-approved
 `HERDR-WIN\rdp-natha` runtime account.
@@ -72,6 +74,13 @@ receipt SHA-256 values, `icacls` output for the Issue961 directory and both file
 runtime account SID, `py.exe`/CPython paths and hashes, and the uv command-link and resolved
 target paths/hashes, and the runtime process PID/creation/session/SID/elevation/group-attribute
 proof. The source fixture test is not a substitute for that native acceptance.
+
+`tests\Test-WindowsAuthorityNative.ps1` is the bounded native-positive commissioning fixture.
+Pass it the freshly re-observed limited `rdp-natha` process ID, round-trip UTC creation time,
+session ID, and SID. Without those live-process inputs it prints `nativeNOTRUN` and cannot be
+reported as a full #1074 native PASS. The fixture uses the production token, ACL, uv resolver,
+and publisher helpers against private temporary paths; it copies the independently hashed
+installed uv bytes and never changes the live WinGet link, package, or production authority.
 
 ## Producer/consumer contract
 

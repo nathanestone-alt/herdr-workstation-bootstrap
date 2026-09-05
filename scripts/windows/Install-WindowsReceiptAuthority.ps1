@@ -84,7 +84,7 @@ try {
     $python = Get-HerdrPython313Identity
     $uv = Get-HerdrUvIdentity -RuntimeProfilePath $runtimeProfile -ExpectedTargetSha256 $ExpectedUvTargetSha256
     if ($python.version -cne '3.13.15') { throw "Commissioned CPython version must be 3.13.15, got '$($python.version)'." }
-    if ($uv.version -cnotmatch '^uv 0[.]12[.]5(?:\s|$)') { throw "Commissioned uv version must be 0.12.5, got '$($uv.version)'." }
+    if ($uv.version -cnotmatch '^uv 0[.]12[.]6(?:\s|$)') { throw "Commissioned uv version must be 0.12.6, got '$($uv.version)'." }
     $receiptValue = New-HerdrWindowsReceiptValues -SourceRoot $source -SourceCommit $actualCommit `
         -PayloadManifestSha256 $actualManifestSha256 -BridgeAllowlistSha256 $allowlistSha256 `
         -ReceiptPath $receipt -RuntimeAccount $RuntimeAccount -RuntimeSid $runtimeSid -Python313 $python -Uv $uv `
