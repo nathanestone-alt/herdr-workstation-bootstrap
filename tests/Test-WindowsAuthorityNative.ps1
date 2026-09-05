@@ -61,7 +61,10 @@ $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $runnerCreation = $runnerProcess.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
 $runnerToken = Open-HerdrRuntimeTokenProof -ProcessId $PID -ExpectedCreationTimeUtc $runnerCreation `
     -ExpectedSessionId $runnerProcess.SessionId -ExpectedUserSid $runnerSid
-$root = Join-Path ([IO.Path]::GetTempPath()) "herdr-windows-authority-native-$([Guid]::NewGuid().ToString('N'))"
+$programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+if ([string]::IsNullOrWhiteSpace($programData)) { throw 'Windows ProgramData path is unavailable.' }
+$root = Join-Path $programData "HerdrWindowsAuthorityNative-$([Guid]::NewGuid().ToString('N'))"
+if (Test-Path -LiteralPath $root) { throw "Private native fixture root already exists: '$root'." }
 
 try {
     Assert-True ($runtimeToken.UserSid -ceq $ExpectedRuntimeUserSid) 'Runtime token SID differs from the commissioned SID.'
@@ -81,6 +84,8 @@ try {
             $runnerToken.AdministratorsGroupAttributes, $expectedRunnerGroupAttributes)
 
     New-Item -ItemType Directory -Path $root | Out-Null
+    Protect-HostOwnedReadOnlyTree -TargetPath $root -ReaderSid $runtimeSid
+    Assert-HostOwnedReadOnlyTree -TargetPath $root -ReaderSid $runtimeSid
     $tokenCase = Join-Path $root 'token-case'
     New-Item -ItemType Directory -Path $tokenCase | Out-Null
     Protect-HostOwnedReadOnlyTree -TargetPath $tokenCase -ReaderSid $runtimeSid
@@ -140,7 +145,11 @@ try {
     Assert-True ($uv.version -ceq $ExpectedUvVersionOutput) `
         "Positive uv identity returned an unexpected version: '$($uv.version)'."
 
-    $successRoot = Join-Path $root 'success\Issue961'
+    $successParent = Join-Path $root 'success'
+    New-Item -ItemType Directory -Path $successParent | Out-Null
+    Protect-HostOwnedReadOnlyTree -TargetPath $successParent -ReaderSid $runtimeSid
+    Assert-HostOwnedReadOnlyTree -TargetPath $successParent -ReaderSid $runtimeSid
+    $successRoot = Join-Path $successParent 'Issue961'
     $successAuthority = Join-Path $successRoot 'receipt-authority.json'
     $successReceipt = Join-Path $successRoot 'bootstrap-receipt.json'
     $receiptContent = ConvertTo-HerdrCanonicalJson -Value ([ordered]@{ receipt_id = '#961-private-native-positive' })
@@ -202,8 +211,11 @@ try {
         (Get-HerdrAuthoritySha256 -Path $existingReceipt) -ceq $receiptBefore) `
         'Held-authority refusal changed the last valid generation.'
 
-    $failedTarget = Join-Path $root 'failed\Issue961'
-    New-Item -ItemType Directory -Path (Split-Path -Parent $failedTarget) -Force | Out-Null
+    $failedParent = Join-Path $root 'failed'
+    New-Item -ItemType Directory -Path $failedParent | Out-Null
+    Protect-HostOwnedReadOnlyTree -TargetPath $failedParent -ReaderSid $runtimeSid
+    Assert-HostOwnedReadOnlyTree -TargetPath $failedParent -ReaderSid $runtimeSid
+    $failedTarget = Join-Path $failedParent 'Issue961'
     $failedReceipt = Join-Path $failedTarget 'bootstrap-receipt.json'
     $savedWindowsReceiptPath = $script:WindowsReceiptPath
     try {

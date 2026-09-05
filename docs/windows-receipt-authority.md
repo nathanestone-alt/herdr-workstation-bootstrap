@@ -79,8 +79,9 @@ proof. The source fixture test is not a substitute for that native acceptance.
 Pass it the freshly re-observed limited `rdp-natha` process ID, round-trip UTC creation time,
 session ID, and SID. Without those live-process inputs it prints `nativeNOTRUN` and cannot be
 reported as a full #1074 native PASS. The fixture uses the production token, ACL, uv resolver,
-and publisher helpers against private temporary paths; it copies the independently hashed
-installed uv bytes and never changes the live WinGet link, package, or production authority.
+and publisher helpers beneath an existence-checked, GUID-named private boundary in fixed local
+ProgramData; it copies the independently hashed installed uv bytes and never changes the live
+WinGet link, package, or production authority.
 
 ## Producer/consumer contract
 

@@ -85,7 +85,11 @@ function Protect-HostOwnedReadOnlyTree {
         else {
             "*$($ReaderSid.Value):(RX)"
         }
-        & $icacls $item.FullName '/inheritance:r' '/grant:r' @grantRules '/setowner' '*S-1-5-32-544' | Out-Null
+        & $icacls $item.FullName '/setowner' '*S-1-5-32-544' | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to set built-in Administrators owner on read-only host path '$($item.FullName)' (icacls exit $LASTEXITCODE)."
+        }
+        & $icacls $item.FullName '/inheritance:r' '/grant:r' @grantRules | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to protect read-only host path '$($item.FullName)' (icacls exit $LASTEXITCODE)."
         }

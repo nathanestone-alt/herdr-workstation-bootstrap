@@ -95,4 +95,27 @@ foreach ($required in @(
     Assert-True $implementation.Contains($required) "WinGet uv enforcement lacks required proof: $required"
 }
 
+$aclPolicyPath = Join-Path $PSScriptRoot '..\scripts\windows\HerdrHostOwnedAclPolicy.ps1'
+$parseErrors = $null
+$aclPolicyAst = [Management.Automation.Language.Parser]::ParseFile($aclPolicyPath, [ref]$null, [ref]$parseErrors)
+Assert-True ($parseErrors.Count -eq 0) 'Host-owned ACL policy did not parse for command-shape regression checks.'
+$readOnlyFunction = @($aclPolicyAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Protect-HostOwnedReadOnlyTree'
+}, $true))
+Assert-True ($readOnlyFunction.Count -eq 1) 'Read-only ACL policy function cardinality changed.'
+$icaclsCommands = @($readOnlyFunction[0].FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and $node.Extent.Text.Contains('$icacls')
+}, $true) | ForEach-Object { $_.Extent.Text })
+$ownerCommands = @($icaclsCommands | Where-Object { $_.Contains("'/setowner'") })
+$daclCommands = @($icaclsCommands | Where-Object { $_.Contains("'/grant:r'") })
+Assert-True ($ownerCommands.Count -eq 1) 'Read-only ACL policy must issue exactly one owner command per item.'
+Assert-True ($daclCommands.Count -eq 1) 'Read-only ACL policy must issue exactly one replacement-DACL command per item.'
+Assert-True (-not $ownerCommands[0].Contains("'/grant:r'")) `
+    'Read-only ACL policy recombined incompatible icacls owner and DACL operations.'
+Assert-True (-not $daclCommands[0].Contains("'/setowner'")) `
+    'Read-only ACL policy recombined incompatible icacls DACL and owner operations.'
+
 Write-Host 'Windows receipt-authority source fixture tests passed.'
