@@ -52,3 +52,25 @@ Unblock conditions:
 2. establish durable privileged access for the trusted-launcher deployment and required live `--entrypoint verify` check (exit 0, zero FAIL lines).
 
 This evidence-only verdict record does not create a new substantive review candidate.
+
+## Authorized neutral-runner resolution
+
+Nathan subsequently authorized the exact-SHA neutral gate with Codex sandbox bypass. Ledger node `20-rtk-049-neutral-r5` ran in a new detached worktree at the unchanged substantive candidate `dd8cc9fa9c4d846e265e9b29ff0c41fabdf76cb9`, through the same policy-selected OpenAI `gpt-5.6-sol`, medium reasoning, priority route. The sandbox bypass remained bounded to the fixed read-only test matrix and disposable `/tmp` outputs.
+
+Neutral r5 returned `PASS FOR NEUTRAL RUNNER` with 7/7 predicates:
+
+- exact candidate and clean initial/final worktree: PASS;
+- base-to-candidate `git diff --check`: PASS;
+- RTK release fixtures: PASS;
+- bootstrap tools fixtures: PASS, with the documented non-root trusted-launcher handoff skip;
+- one native repository-validator invocation: PASS (`Repository validation passed`);
+- exact version, official URL, and SHA-256 lock assertions: PASS;
+- changes and open items: none.
+
+The prior neutral BLOCK is resolved without a substantive-surface change. Cross-review remains terminal under the evidence-only rule.
+
+## Final gate verdict
+
+**PASS FOR MERGE/PUSH AUTHORIZATION. DEPLOYMENT PENDING PRIVILEGED ACCESS.**
+
+The installed trust anchor still refuses unprivileged execution, and `sudo -n` still requires a password. Merge and push remain separately user-authorized operations; live deployment additionally requires durable privileged access followed by `--entrypoint verify` exit 0 with zero FAIL lines.
