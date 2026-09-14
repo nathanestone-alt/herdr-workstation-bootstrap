@@ -12,7 +12,7 @@ trap 'rm -rf -- "$test_root"' EXIT
 # shellcheck source=/dev/null
 source "$repo_root/scripts/ubuntu/rtk-release.sh"
 
-version='0.45.0'
+version='0.49.0'
 
 write_rtk_binary() {
   local path="$1"

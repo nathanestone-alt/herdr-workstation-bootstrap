@@ -56,5 +56,3 @@ The substantive candidate is `90f40c6ca17823f8ab9e2c23216d0b0bdf1a478f`. Adding 
 ## Verdict
 
 PASS FOR MERGE/INSTALL AUTHORIZATION
-
-

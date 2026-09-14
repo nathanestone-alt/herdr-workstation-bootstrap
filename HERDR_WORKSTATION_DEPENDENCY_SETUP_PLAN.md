@@ -42,7 +42,7 @@ Collected 2026-08-16. Surface versions are reference evidence; Ubuntu recovery p
 | Windows | Windows 11 Home ARM64 | Windows 11 Pro x86-64 |
 | PowerShell | 7.6.4 | Current x64 Windows build plus native Ubuntu build |
 | WSL | 2.7.8 | Not primary; use Ubuntu Hyper-V |
-| RTK | 0.42.4 ARM64 Windows | Install the pinned official v0.45.0 x86-64 Linux musl release; customize through configuration and hooks |
+| RTK | 0.42.4 ARM64 Windows | Install the pinned official v0.49.0 x86-64 Linux musl release; customize through configuration and hooks |
 | Codex CLI | 0.147.0 Windows | Fresh native Ubuntu install |
 | Claude Code | 2.1.233 Windows | Fresh native Ubuntu install |
 | Herdr | 0.8.0 preview Windows | Fresh stable Linux install and exact-version validation |
@@ -99,7 +99,7 @@ Tooling layer:
   pinned in `config/ubuntu-toolchain.lock`, converged under user-owned managed
   paths and exposed as `python3.13` plus the fail-closed `py -3.13` command.
 - Rust stable x86-64 via `rustup` (retained for workstation tooling).
-- RTK from the official `rtk-ai/rtk` v0.45.0 x86-64 Linux musl release pinned by URL and SHA-256 in `config/ubuntu-toolchain.lock`; customization remains in configuration and hooks.
+- RTK from the official `rtk-ai/rtk` v0.49.0 x86-64 Linux musl release pinned by URL and SHA-256 in `config/ubuntu-toolchain.lock`; customization remains in configuration and hooks.
 - Codex CLI, Claude Code and stable Linux Herdr from their official installers.
 - Bun; Node 24 through `fnm` when required.
 - Tailscale node `herdr-ubuntu`.

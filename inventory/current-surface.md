@@ -23,9 +23,9 @@ Captured 2026-08-16. These versions document the working ARM64 environment; AMD6
 The Ubuntu bootstrap installs the official upstream Linux release and keeps
 customization in configuration and hooks:
 
-- Version: `0.45.0`
+- Version: `0.49.0`
 - Asset: `rtk-x86_64-unknown-linux-musl.tar.gz`
-- SHA-256: `c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4`
+- SHA-256: `7278231dfd7e6a730a4ab7f847b195bcf02289c2d57622b0dab75a6411100c8f`
 
 Forking or source-building is deferred until a concrete upstream gap is
 proven.
