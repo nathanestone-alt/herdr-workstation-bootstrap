@@ -1,7 +1,7 @@
 # Issue #20 — RTK v0.49.0 cross-review and neutral-runner verdict
 
-Candidate: `dd8cc9fa9c4d846e265e9b29ff0c41fabdf76cb9`  
-Base: `cbc43993769cb32a2aa2aef79f8a6ab7dece9c08` (`origin/main`)  
+Candidate: `dd8cc9fa9c4d846e265e9b29ff0c41fabdf76cb9`
+Base: `cbc43993769cb32a2aa2aef79f8a6ab7dece9c08` (`origin/main`)
 Scope: governed RTK release pin, release fixture/current-surface documentation, and one pre-existing EOF-only validation correction.
 
 ## Builder evidence
