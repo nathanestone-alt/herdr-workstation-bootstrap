@@ -74,3 +74,27 @@ The prior neutral BLOCK is resolved without a substantive-surface change. Cross-
 **PASS FOR MERGE/PUSH AUTHORIZATION. DEPLOYMENT PENDING PRIVILEGED ACCESS.**
 
 The installed trust anchor still refuses unprivileged execution, and `sudo -n` still requires a password. Merge and push remain separately user-authorized operations; live deployment additionally requires durable privileged access followed by `--entrypoint verify` exit 0 with zero FAIL lines.
+
+## Authorized deployment and live verification
+
+Nathan authorized the exact four-commit range through evidence commit `f9741790cb99dc7cad58a786dd47821b35af9552`, authorized the privileged deployment, and entered the sudo credential directly in his Ubuntu terminal. The authorized range was fast-forwarded and pushed to `origin/main` before deployment.
+
+The independently fetched installer was a regular executable owned by `nathan`, passed `bash -n`, and matched the previously reviewed SHA-256 `08052064dd5734b9c7e46729572c6c8a41ee4aff51f33bf879f9acc5b078282b`. The deployment then completed in the governed order:
+
+1. re-pin the trusted launcher to canonical HTTPS origin commit `f9741790cb99dc7cad58a786dd47821b35af9552`;
+2. run the installed launcher with `--entrypoint bootstrap --phase tools`; and
+3. run the installed launcher with `--entrypoint verify`.
+
+Post-deployment evidence:
+
+- launcher: `root:root 0755`, regular file;
+- policy: `root:root 0600`, regular file, and the deployment wrapper confirmed the exact authorized origin and commit;
+- installed RTK: `rtk 0.49.0` at `/home/nathan/.cargo/bin/rtk`;
+- live trusted verify: exit 0, 104 PASS, 0 FAIL, ending `Ubuntu bootstrap verification passed.`;
+- verification log: `/tmp/issue-20-rtk-049-live-verify.log`, SHA-256 `68f5403af8da23ed6a6e6ce76e3a68a4a441e14c7a83a3dca3f6f2406a316823`.
+
+## Terminal verdict
+
+**PASS — MERGED, PUSHED, DEPLOYED, AND LIVE-VERIFIED.**
+
+This deployment append is mechanical evidence for the already reviewed candidate and does not reopen cross-review.

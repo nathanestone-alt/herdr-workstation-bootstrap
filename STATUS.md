@@ -1,29 +1,26 @@
-# Issue #8 operational checkpoint — COMPLETE
+# Issue #20 operational checkpoint — COMPLETE
 
-`nathanestone-alt/herdr-workstation-bootstrap#8` (installed receipt authority with attested RTK role) is **implemented, independently verified, deployed live, and verified green.**
+`nathanestone-alt/herdr-workstation-bootstrap#20` (governed RTK v0.49.0 update) is **implemented, independently verified, merged, pushed, deployed live, and verified green.**
 
 ## Deployed commit
 
-- **`115515e459f877e629be48fd8317054d5a1e8278`** on `codex/issue-8-receipt-authority`, merged to `main`.
-- Launcher policy pinned to this commit; launcher `root:root 0755`.
-- Live `verify`: **PASS** (99 PASS, 0 FAIL — `/tmp/issue-8-deploy-verify-final.log`).
-- Receipt authority `/etc/stmodel/issue-961/receipt-authority.json` published with the attested `rtk_release` (v0.45.0); authority and toolchain manifest consistent (both `459d97d3…`); authority `source_commit_sha` = deployed commit.
+- **`f9741790cb99dc7cad58a786dd47821b35af9552`** on `main` and `origin/main`.
+- Substantive candidate: `dd8cc9fa9c4d846e265e9b29ff0c41fabdf76cb9`.
+- Independent cross-review: PASS with P1=0, P2=0, P3=0.
+- Deterministic neutral runner: PASS, 7/7 predicates.
 
-## What was fixed (all independently reviewed + fuzzed + live-verified)
+## Live deployment
 
-The `pyvenv.cfg` receipt-evidence reader in `scripts/ubuntu/verify.sh` disagreed with the actual consumer, CPython `site.py`, in four ways — three security divergences and one resolver gap. All fixed:
+- Trusted launcher re-pinned to the canonical HTTPS origin at deployed commit `f9741790cb99dc7cad58a786dd47821b35af9552`.
+- Launcher is `root:root 0755`; policy is `root:root 0600` and matched the authorized origin and commit during deployment.
+- Governed tools phase installed `/home/nathan/.cargo/bin/rtk` version `0.49.0`.
+- Live trusted `verify`: **PASS** (104 PASS, 0 FAIL; exit 0).
+- Verification log: `/tmp/issue-20-rtk-049-live-verify.log`, SHA-256 `68f5403af8da23ed6a6e6ce76e3a68a4a441e14c7a83a3dca3f6f2406a316823`.
 
-1. **Case-fold / non-ASCII key smuggling** (was ticket #9's P2 + wider): match keys `tolower()`, reject non-ASCII/non-tab bytes, reject duplicate normalized keys.
-2. **Print-on-reject trusted stdout**: the caller reads stdout through `|| true`; a rejecting path now prints nothing (deferred `bad` flag).
-3. **Embedded carriage return**: `RS="\r\n|\r|\n"` splits records exactly as CPython's universal-newline `for line in f`, so a CR-smuggled directive becomes a duplicate and is rejected.
-4. **uv resolution**: `verify_resolve_command` now allows uv's managed runtime dir `~/.local/lib/herdr-workstation/uv/<UV_VERSION>/<UV_PLATFORM>` (uv is a symlink there, like the Node tools). The verify fixture was corrected to model that symlink layout (it had used a plain file, masking the gap).
+## Durable evidence
 
-Verification across the arc: fixture suite + parity batteries + an 8k and an 18k differential fuzz against a real `site.py` oracle (zero attested-but-divergent inputs; negative controls bit); four independent multi-agent review rounds (final verdicts CLEAR); 6/6 neutral suites in fresh clones; mutation checks discriminating each regression. Tickets #9 and #10 resolved in code.
-
-## Deploy record
-
-Re-pin → `--phase tools` (reconciled the authority/manifest digest desync from a prior standalone authority install; provisioning code was byte-identical to the known-good run) → live `verify` PASS, done at commit `115515e`. The overnight NOPASSWD sudoers drop-in (`/etc/sudoers.d/issue8-overnight`) was removed at the end.
+See `audit/findings/2026-09-14_issue-20_rtk-049_cross-review-neutral.md` for builder checks, independent review, neutral-runner resolution, authorization, deployment, and terminal verdict.
 
 ## Follow-ups
 
-None outstanding for #8. #9/#10 closed. Herdr coordination items (#25/#26/#28) tracked separately as before.
+None outstanding for issue #20. The four unrelated top-level Markdown files under `/home/nathan/code` were moved to the desktop Trash and can be recovered if needed.
