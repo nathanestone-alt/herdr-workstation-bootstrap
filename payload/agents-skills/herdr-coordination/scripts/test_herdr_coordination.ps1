@@ -1179,7 +1179,7 @@ throw "unexpected explicit fake RTK invocation: $($arguments -join ' ')"
         Remove-Item Env:HERDR_TEST_CALLER_AGENT_PID -ErrorAction SilentlyContinue
         $unboundNameLineCount = @(Get-Content -LiteralPath $coordLogPath).Count
         $unboundNameRequest = & $pwshExecutable -NoProfile -File $helperPath `
-            -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
+            -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode E `
             -WorkKind issue -IssueNumber 828 -WorkTitle "must not relay" -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Process-unbound name-request was accepted."
         $unboundNameText = $unboundNameRequest -join [Environment]::NewLine
@@ -1191,7 +1191,7 @@ throw "unexpected explicit fake RTK invocation: $($arguments -join ' ')"
             -From "w1:p2" `
             -RepoCode AGT `
             -LaneCode T `
-            -RoleCode R `
+            -RoleCode E `
             -WorkKind issue `
             -IssueNumber 828 `
             -WorkTitle "UserForm diagnostic coordinate mapping" `
@@ -1216,7 +1216,7 @@ throw "unexpected explicit fake RTK invocation: $($arguments -join ' ')"
         Assert-True -Condition ($nameRequestLog -match 'PANE NAMING REQUEST: repo=AGT; lifecycle=assignment; requester_pane=w1:p2; requester_tab=w1:t2') -Message "Name-request body/provenance was missing or pane-label enrichment corrupted its machine fields."
 
         $invalidNameRequest = & $pwshExecutable -NoProfile -File $helperPath `
-            -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode R `
+            -Action name-request -From "w1:p2" -RepoCode AGT -LaneCode T -RoleCode E `
             -WorkKind issue -IssueNumber 828 -WorkTitle "bad`nvalue" -LogPath $coordLogPath 2>&1
         Assert-True -Condition ($LASTEXITCODE -ne 0) -Message "Newline-bearing name-request was accepted."
 
@@ -1225,7 +1225,7 @@ throw "unexpected explicit fake RTK invocation: $($arguments -join ' ')"
         Set-Content -LiteralPath $coordLogPath -Value "" -Encoding utf8
         $retirementRequestOutput = & $pwshExecutable -NoProfile -File $helperPath `
             -Action name-request -NamingLifecycle retirement -From "w1:p2" `
-            -RepoCode AGT -LaneCode T -RoleCode R -WorkKind issue -IssueNumber 828 `
+            -RepoCode AGT -LaneCode T -RoleCode E -WorkKind issue -IssueNumber 828 `
             -WorkTitle "retired" -PreviousName "AGT-T-R1" -PreviousWork "#828 · completed" `
             -WatchTimeoutMs 20000 `
             -LogPath $coordLogPath 2>&1

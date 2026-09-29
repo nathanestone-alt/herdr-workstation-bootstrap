@@ -509,15 +509,19 @@ Keep one pane in the tab for phone/SSH readability unless the user requests a sp
 Coordination owns names. Ordinary panes report facts and request a name; they
 must not rename themselves or another pane. Use these canonical forms:
 
-- assigned work: `<REPO>-<LANE>-<ROLE><SLOT>`, for example `STM-WB-O1`;
-- unassigned exploration: `<REPO>-E<SLOT>`, only while no concrete task exists;
+- every repository pane: `<REPO>-<LANE>-<ROLE><SLOT>`, for example `STM-WB-O1`
+  or `STM-WB-E3`;
 - reserved Hdr panes: `Coordination` and `Fix`.
 
 Repository codes are `STM` for STModel and `AGT` for STModelAgent. Lane codes
-are `T`, `M`, `LSP`, `WB`, `MCP`, `OPS`, and `RES`. Role codes are `O`
-(orchestrator/owner), `B` (builder), `R` (independent reviewer), and `C`
-(cross-reviewer). Provider remains separate semantic metadata; never encode
-Claude or Codex in the canonical name.
+are `T` (tooling), `WB` (workbook), `PP` (Parallel Preview, which works
+alongside `WB` to speed up workbook work), and `S` (skills). Role codes are `O`
+(owner) and `E` (explore: planning, grills, and specs inside a lane). The
+retired lanes `M`, `LSP`, `MCP`, `OPS`, and `RES`, the retired roles `B`, `R`,
+and `C`, and the lane-less `<REPO>-E<SLOT>` exploration form are rejected;
+exploration now names its lane, for example `STM-WB-E3`. Provider remains
+separate semantic metadata; never encode Claude or Codex in the canonical name.
+A retirement request may still name a legacy previous identity.
 
 The pane subtitle is current work, not identity:
 
@@ -565,7 +569,7 @@ created atomically:
 
 ```powershell
 rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
-  -Action name-request -RepoCode AGT -LaneCode T -RoleCode R `
+  -Action name-request -RepoCode AGT -LaneCode T -RoleCode E `
   -WorkKind issue -IssueNumber 828 `
   -WorkTitle "UserForm diagnostic coordinate mapping" `
   -PreviousName AGT-T-R1 -PreviousWork "#829"
@@ -585,7 +589,7 @@ For retirement, make the lifecycle explicit and retain the previous identity:
 ```powershell
 rtk pwsh -NoProfile -File "$coordSkill/scripts/herdr_coordination.ps1" `
   -Action name-request -NamingLifecycle retirement `
-  -RepoCode AGT -LaneCode T -RoleCode R -WorkKind issue -IssueNumber 828 `
+  -RepoCode AGT -LaneCode T -RoleCode E -WorkKind issue -IssueNumber 828 `
   -WorkTitle "retired" -PreviousName AGT-T-R1 -PreviousWork "#828 · completed"
 ```
 

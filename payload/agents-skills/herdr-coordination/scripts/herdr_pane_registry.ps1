@@ -593,8 +593,8 @@ switch ($Action) {
             agent = $target.agent
             agent_session = $target.agent_session
             repo = $Repo.ToUpperInvariant()
-            lane = if ($Explore -or $Coordination -or $Fix) { $null } else { $Lane.ToUpperInvariant() }
-            role = if ($Explore -or $Coordination -or $Fix) { $null } else { $Role.ToUpperInvariant() }
+            lane = if ($Coordination -or $Fix) { $null } else { $Lane.ToUpperInvariant() }
+            role = if ($Coordination -or $Fix) { $null } elseif ($Explore) { "E" } else { $Role.ToUpperInvariant() }
             slot = $Slot
             work_kind = $WorkKind
             github_repo = $GitHubRepo
