@@ -9,8 +9,8 @@ $script:CanonicalWorkspaces = [ordered]@{
     HDR = "Hdr"
     BUZ = "Buzz"
 }
-$script:CanonicalLanes = @("T", "M", "LSP", "WB", "MCP", "OPS", "RES")
-$script:CanonicalRoles = @("O", "B", "R", "C")
+$script:CanonicalLanes = @("T", "WB", "PP", "S")
+$script:CanonicalRoles = @("O", "E")
 
 function Get-HerdrRegistrySha256 {
     param([Parameter(Mandatory)][string]$Text)
@@ -442,7 +442,16 @@ function Get-HerdrCanonicalPaneName {
         return $(if ($Coordination) { "Coordination" } else { "Fix" })
     }
     if ($Explore) {
-        return "$code-E$Slot"
+        if (-not [string]::IsNullOrWhiteSpace($Role) -and $Role.Trim().ToUpperInvariant() -ne "E") {
+            throw "Explore names use role E; observed role '$Role'."
+        }
+        $Role = "E"
+    }
+    if ([string]::IsNullOrWhiteSpace($Lane)) {
+        throw "A lane is required; the lane-less '<REPO>-E<n>' form is retired."
+    }
+    if ([string]::IsNullOrWhiteSpace($Role)) {
+        throw "A role is required."
     }
     $canonicalLane = $Lane.Trim().ToUpperInvariant()
     $canonicalRole = $Role.Trim().ToUpperInvariant()

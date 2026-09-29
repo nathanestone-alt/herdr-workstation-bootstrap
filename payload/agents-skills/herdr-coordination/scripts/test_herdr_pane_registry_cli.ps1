@@ -215,9 +215,9 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Assert-True $authority.acquired "Coordinator authority was not acquired"
     Assert-Equal $authority.authority_epoch 1 "Initial authority epoch was wrong"
 
-    $challenge = Invoke-Registry @("-Action", "challenge", "-PaneId", "w2:p1", "-Repo", "STM", "-Explore", "-Slot", "1", "-WorkKind", "explore", "-Topic", "unassigned")
+    $challenge = Invoke-Registry @("-Action", "challenge", "-PaneId", "w2:p1", "-Repo", "STM", "-Lane", "WB", "-Explore", "-Slot", "1", "-WorkKind", "explore", "-Topic", "unassigned")
     Assert-True $challenge.reserved "Explore reservation was not created"
-    Assert-Equal $challenge.canonical_name "STM-E1" "Explore canonical name was wrong"
+    Assert-Equal $challenge.canonical_name "STM-WB-E1" "Explore canonical name was wrong"
     Assert-Equal $challenge.generation 1 "Initial generation was wrong"
 
     Set-Caller target
@@ -227,16 +227,16 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Set-Caller coordinator
     $assignment = Invoke-Registry @("-Action", "assign", "-ReservationId", $challenge.reservation_id)
     Assert-True $assignment.prepared "Coordinator did not prepare assignment"
-    Assert-Equal $assignment.canonical_name "STM-E1" "Prepared assignment changed canonical name"
+    Assert-Equal $assignment.canonical_name "STM-WB-E1" "Prepared assignment changed canonical name"
     $updatedState = Get-Content -Raw $statePath | ConvertFrom-Json -Depth 16
-    Assert-Equal $updatedState.target_tab_label "STM-E1" "Canonical tab rename was not applied"
-    Assert-Equal $updatedState.target_pane_label "STM-E1" "Canonical visible pane label was not applied"
+    Assert-Equal $updatedState.target_tab_label "STM-WB-E1" "Canonical tab rename was not applied"
+    Assert-Equal $updatedState.target_pane_label "STM-WB-E1" "Canonical visible pane label was not applied"
     Assert-Equal $updatedState.target_title "EXPLORE · unassigned" "Work subname was not applied"
     Assert-Equal $updatedState.target_display_agent "EXPLORE · unassigned" "Sidebar work subtitle was not applied"
-    Assert-Equal $updatedState.target_tokens.canonical_name "STM-E1" "Registry metadata token was not applied"
+    Assert-Equal $updatedState.target_tokens.canonical_name "STM-WB-E1" "Registry metadata token was not applied"
 
     Assert-Throws {
-        Invoke-Registry @("-Action", "resolve", "-Name", "@pane[STM-E1]")
+        Invoke-Registry @("-Action", "resolve", "-Name", "@pane[STM-WB-E1]")
     } "does not resolve" "Unacknowledged reservation became routeable"
 
     Set-Caller target
@@ -248,17 +248,17 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Assert-True $activation.activated "Coordinator did not activate acknowledged assignment"
     Assert-Equal $activation.generation 1 "Activated generation was wrong"
 
-    $resolved = Invoke-Registry @("-Action", "resolve", "-Name", "@pane[STM-E1]")
+    $resolved = Invoke-Registry @("-Action", "resolve", "-Name", "@pane[STM-WB-E1]")
     Assert-True $resolved.resolved "Active human pane reference did not resolve"
     Assert-Equal $resolved.binding.pane_id "w2:p1" "Human pane reference resolved to wrong pane"
     Assert-Equal $resolved.binding.agent "claude" "Provider was not preserved separately"
     $reverse = Invoke-Registry @("-Action", "resolve-pane", "-PaneId", "w2:p1")
-    Assert-Equal $reverse.binding.canonical_name "STM-E1" "Reverse pane lookup lost canonical identity"
+    Assert-Equal $reverse.binding.canonical_name "STM-WB-E1" "Reverse pane lookup lost canonical identity"
 
     Set-Caller target
     $coordinationLog = Join-Path $testRoot "coordination.md"
     $sendOutput = & pwsh -NoProfile -File $coordinationScript `
-        -Action send -To "@pane[STM-E1]" -Message "Registry-routed self-test" `
+        -Action send -To "@pane[STM-WB-E1]" -Message "Registry-routed self-test" `
         -PaneRegistryPath $registryPath -LogPath $coordinationLog 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Registry-addressed coordination send failed: $($sendOutput -join [Environment]::NewLine)"
@@ -277,7 +277,7 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Assert-True ((Get-Content -Raw $coordinationLog) -match '\[PAYLOAD-SHA256 [0-9a-f]{64}\]') "Registry envelope omitted durable payload hashing"
 
     $revalidated = Invoke-Registry @(
-        "-Action", "revalidate", "-Name", "STM-E1",
+        "-Action", "revalidate", "-Name", "STM-WB-E1",
         "-ExpectedRegistryId", $resolved.binding.registry_id,
         "-ExpectedBindingId", $resolved.binding.binding_id,
         "-ExpectedGeneration", [string]$resolved.binding.generation
@@ -285,7 +285,7 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
     Assert-True $revalidated.valid "Resolved generation did not revalidate"
     Assert-Throws {
         Invoke-Registry @(
-            "-Action", "revalidate", "-Name", "STM-E1",
+            "-Action", "revalidate", "-Name", "STM-WB-E1",
             "-ExpectedRegistryId", $resolved.binding.registry_id,
             "-ExpectedBindingId", $resolved.binding.binding_id,
             "-ExpectedGeneration", "2"
@@ -304,7 +304,7 @@ throw "unsupported mock herdr command: $($arguments -join ' ')"
 
     Set-Caller coordinator
     Assert-Throws {
-        Invoke-Registry @("-Action", "challenge", "-PaneId", "w2:p1", "-Repo", "AGT", "-Explore", "-Slot", "1")
+        Invoke-Registry @("-Action", "challenge", "-PaneId", "w2:p1", "-Repo", "AGT", "-Lane", "WB", "-Explore", "-Slot", "1")
     } "must use workspace 'AGT'" "Cross-repository workspace claim was accepted"
 
     $status = Invoke-Registry @("-Action", "status")

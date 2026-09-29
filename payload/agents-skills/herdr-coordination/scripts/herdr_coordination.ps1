@@ -3141,7 +3141,7 @@ function Invoke-CoordinatorApplyName {
     )
 
     $effectiveSubtitle = Normalize-PaneMetadataValue -Value $Subtitle
-    if ($CanonicalName -notmatch '^(?:Coordination|Fix|(?:STM|AGT|Hdr|Buzz)-(?:E\d+|[A-Z][A-Z0-9]*-[A-Z]\d+))$') {
+    if ($CanonicalName -notmatch '^(?:Coordination|Fix|(?:STM|AGT|Hdr|Buzz)-(?:T|WB|PP|S)-(?:O|E)[1-9]\d{0,2})$') {
         throw "apply-name rejected non-canonical pane name '$CanonicalName'."
     }
     foreach ($value in @($CanonicalName, $effectiveSubtitle, $ExpectedCurrentLabel)) {
@@ -3804,8 +3804,11 @@ switch ($Action) {
             [string]::IsNullOrWhiteSpace($WorkKind)) {
             throw "name-request requires -RepoCode, -LaneCode, -RoleCode, and -WorkKind."
         }
-        if ($RoleCode -notmatch '^[A-Z]$') {
-            throw "-RoleCode must be one uppercase role letter (for example O or R)."
+        if ($LaneCode -cnotmatch '^(?:T|WB|PP|S)$') {
+            throw "-LaneCode must be a canonical lane: T, WB, PP, or S."
+        }
+        if ($RoleCode -cnotmatch '^(?:O|E)$') {
+            throw "-RoleCode must be a canonical role: O or E."
         }
         if ($WorkKind -eq "issue" -or $WorkKind -eq "pr") {
             if ([string]::IsNullOrWhiteSpace($IssueNumber) -or

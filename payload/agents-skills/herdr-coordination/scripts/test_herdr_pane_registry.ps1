@@ -116,32 +116,43 @@ function Add-ActiveBinding {
 }
 
 try {
-    Assert-Equal (Get-HerdrCanonicalPaneName -Repo STM -Explore -Slot 1) "STM-E1" "Explore naming failed"
-    Assert-Equal (Get-HerdrCanonicalPaneName -Repo AGT -Lane LSP -Role R -Slot 2) "AGT-LSP-R2" "Assigned naming failed"
+    Assert-Equal (Get-HerdrCanonicalPaneName -Repo STM -Lane WB -Explore -Slot 3) "STM-WB-E3" "Explore naming failed"
+    Assert-Equal (Get-HerdrCanonicalPaneName -Repo STM -Lane WB -Role E -Slot 3) "STM-WB-E3" "Explore role naming failed"
+    Assert-Equal (Get-HerdrCanonicalPaneName -Repo STM -Lane PP -Role O -Slot 1) "STM-PP-O1" "Parallel Preview naming failed"
+    Assert-Equal (Get-HerdrCanonicalPaneName -Repo STM -Lane S -Role O -Slot 1) "STM-S-O1" "Skills naming failed"
+    Assert-Equal (Get-HerdrCanonicalPaneName -Repo AGT -Lane T -Role O -Slot 2) "AGT-T-O2" "Assigned naming failed"
+    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Explore -Slot 1 } "lane is required" "Lane-less explore name was accepted"
+    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane WB -Role O -Explore } "Explore names use role E" "Explore with a non-E role was accepted"
+    foreach ($retiredLane in @("M", "LSP", "MCP", "OPS", "RES")) {
+        Assert-Throws { Get-HerdrCanonicalPaneName -Repo AGT -Lane $retiredLane -Role O } "Unsupported lane" "Retired lane '$retiredLane' was accepted"
+    }
+    foreach ($retiredRole in @("B", "R", "C")) {
+        Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane T -Role $retiredRole } "Unsupported role" "Retired role '$retiredRole' was accepted"
+    }
     Assert-Equal (Get-HerdrCanonicalPaneName -Repo HDR -Coordination) "Coordination" "Reserved Coordination naming failed"
     Assert-Equal (Get-HerdrCanonicalPaneName -Repo HDR -Fix) "Fix" "Reserved Fix naming failed"
-    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STModel -Explore } "Unsupported repository" "Alternate repository spelling was accepted"
-    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane Tooling -Role R } "Unsupported lane" "Malformed lane was accepted"
-    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane T -Role Reviewer } "Unsupported role" "Malformed role was accepted"
+    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STModel -Lane WB -Explore } "Unsupported repository" "Alternate repository spelling was accepted"
+    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane Tooling -Role O } "Unsupported lane" "Malformed lane was accepted"
+    Assert-Throws { Get-HerdrCanonicalPaneName -Repo STM -Lane T -Role Owner } "Unsupported role" "Malformed role was accepted"
     Assert-Throws { Assert-HerdrCanonicalWorkspaceBinding -Repo STM -WorkspaceLabel master } "must use workspace 'STM'" "Cross-workspace binding was accepted"
 
     $basic = New-Fixture "basic"
     $authority = Add-Authority $basic
-    Add-ActiveBinding $basic "bind-1" "STM-E1" 1 "w2:p1" "session-one" | Out-Null
+    Add-ActiveBinding $basic "bind-1" "STM-WB-E1" 1 "w2:p1" "session-one" | Out-Null
     $state = Get-HerdrPaneRegistryState -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts
     Assert-Equal $state.event_count 2 "Event count was not reconstructed"
     Assert-Equal $state.head_hash $state.receipts[-1].head_hash "Head receipt was not reconstructed"
-    Assert-Equal $state.generation_high_water["STM-E1"] 1 "Generation high-water was not reconstructed"
-    $resolved = Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "@pane[STM-E1]" -ForDispatch
+    Assert-Equal $state.generation_high_water["STM-WB-E1"] 1 "Generation high-water was not reconstructed"
+    $resolved = Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "@pane[STM-WB-E1]" -ForDispatch
     Assert-Equal $resolved.pane_id "w2:p1" "Human pane reference resolved to the wrong pane"
     Assert-True $resolved.dispatchable "Current-authority binding was not dispatchable"
     Assert-Equal $resolved.registry_id $authority.registry_id "Resolution lost registry identity"
 
     Assert-Throws {
-        Add-ActiveBinding $basic "bind-2" "STM-E1" 2 "w2:p2" "session-two"
+        Add-ActiveBinding $basic "bind-2" "STM-WB-E1" 2 "w2:p2" "session-two"
     } "already has an active binding" "Duplicate active canonical name was accepted"
     Assert-Throws {
-        Add-ActiveBinding $basic "bind-2" "STM-E2" 1 "w2:p2" "session-one"
+        Add-ActiveBinding $basic "bind-2" "STM-WB-E2" 1 "w2:p2" "session-one"
     } "already bound" "Duplicate native session was accepted"
     Assert-Throws {
         Add-HerdrPaneRegistryEvent -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Fields ([ordered]@{
@@ -152,27 +163,27 @@ try {
     Add-HerdrPaneRegistryEvent -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Fields ([ordered]@{
         action = "retired"
         binding_id = "bind-1"
-        canonical_name = "STM-E1"
+        canonical_name = "STM-WB-E1"
         generation = 1
         authority_epoch = 1
         authority_lease_id = "lease-test"
         transaction_phase = "retired"
     }) | Out-Null
     Assert-Throws {
-        Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "STM-E1"
+        Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "STM-WB-E1"
     } "does not resolve" "Retired binding remained routeable"
-    Add-ActiveBinding $basic "bind-2" "STM-E1" 2 "w2:p2" "session-two" | Out-Null
-    $reused = Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "STM-E1" -ForDispatch
+    Add-ActiveBinding $basic "bind-2" "STM-WB-E1" 2 "w2:p2" "session-two" | Out-Null
+    $reused = Resolve-HerdrPaneRegistryName -RegistryPath $basic.Registry -ReceiptPath $basic.Receipts -Name "STM-WB-E1" -ForDispatch
     Assert-Equal $reused.generation 2 "Reused name did not advance generation"
     Assert-Equal $reused.pane_id "w2:p2" "Reused name routed to the retired pane"
 
     $expired = New-Fixture "expired"
     Add-Authority $expired ([DateTimeOffset]::UtcNow.AddMinutes(-1)) | Out-Null
-    Add-ActiveBinding $expired "bind-expired" "AGT-E1" 1 "w3:p1" "session-expired" "AGT" "AGT" | Out-Null
-    $displayOnly = Resolve-HerdrPaneRegistryName -RegistryPath $expired.Registry -ReceiptPath $expired.Receipts -Name "AGT-E1"
+    Add-ActiveBinding $expired "bind-expired" "AGT-T-E1" 1 "w3:p1" "session-expired" "AGT" "AGT" | Out-Null
+    $displayOnly = Resolve-HerdrPaneRegistryName -RegistryPath $expired.Registry -ReceiptPath $expired.Receipts -Name "AGT-T-E1"
     Assert-True (-not $displayOnly.dispatchable) "Expired authority was reported as dispatchable"
     Assert-Throws {
-        Resolve-HerdrPaneRegistryName -RegistryPath $expired.Registry -ReceiptPath $expired.Receipts -Name "AGT-E1" -ForDispatch
+        Resolve-HerdrPaneRegistryName -RegistryPath $expired.Registry -ReceiptPath $expired.Receipts -Name "AGT-T-E1" -ForDispatch
     } "NON-DISPATCHABLE" "Dispatch was allowed through expired authority"
 
     $torn = New-Fixture "torn"
