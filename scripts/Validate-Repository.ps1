@@ -59,7 +59,8 @@ if ($bashCandidates) {
         'tests\test-receipt-authority.sh',
         'tests\test-tailscale-downgrade.sh',
         'tests\test-trusted-launcher.sh',
-        'tests\test-install-payload.sh'
+        'tests\test-install-payload.sh',
+        'tests\test-herdr-backup-install.sh'
     )) {
         if (-not $IsLinux) {
             Write-Host "SKIP: $relativeTest requires a Linux Ubuntu execution environment."
@@ -209,6 +210,12 @@ $requiredFiles = @(
     'tests\test-tailscale-downgrade.sh',
     'tests\test-trusted-launcher.sh',
     'tests\test-install-payload.sh',
+    'tests\test-herdr-backup-install.sh',
+    'scripts\ubuntu\backup\herdr-backup',
+    'scripts\ubuntu\backup\restic.env',
+    'scripts\ubuntu\backup\restic-excludes',
+    'scripts\ubuntu\backup\install-herdr-backup.sh',
+    'scripts\ubuntu\backup\README.md',
     'docs\windows-receipt-authority.md',
     'legacy\WSL2-FALLBACK.md'
 )
