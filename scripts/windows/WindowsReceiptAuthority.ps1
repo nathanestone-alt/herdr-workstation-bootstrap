@@ -479,7 +479,10 @@ function Assert-HerdrWindowsAuthority {
         [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid,
         [Parameter(Mandatory)][object]$RuntimeToken,
         [Parameter(Mandatory)][string]$RuntimeProfilePath,
-        [switch]$SkipExpiryAge
+        [switch]$SkipExpiryAge,
+        # Replacement only: an approved binary change is what a replacement re-attests, so the
+        # existing pair's recorded executable and uv identities may differ from the installed ones.
+        [switch]$SkipInstalledIdentityDrift
     )
 
     if ((Get-HerdrCanonicalPath -Path $AuthorityPath) -cne $script:WindowsReceiptAuthorityPath) {
@@ -529,21 +532,25 @@ function Assert-HerdrWindowsAuthority {
         }
         $roleHash = Get-HerdrStringSha256 -Value (ConvertTo-HerdrCanonicalJson -Value $receipt.role_identities)
         if ($roleHash -cne $authority.role_manifest_sha256) { throw 'Installed receipt role manifest hash is invalid.' }
-        foreach ($identity in @($receipt.python313, $receipt.python313.launcher, $receipt.uv) + @($receipt.role_identities.Values)) {
-            $identityPath = Assert-HerdrAuthoritySafePath -Path ([string]$identity.executable)
-            if ((Get-HerdrAuthoritySha256 -Path $identityPath) -cne [string]$identity.sha256) {
-                throw "Installed executable identity hash changed: '$identityPath'."
+        if (-not $SkipInstalledIdentityDrift) {
+            foreach ($identity in @($receipt.python313, $receipt.python313.launcher, $receipt.uv) + @($receipt.role_identities.Values)) {
+                $identityPath = Assert-HerdrAuthoritySafePath -Path ([string]$identity.executable)
+                if ((Get-HerdrAuthoritySha256 -Path $identityPath) -cne [string]$identity.sha256) {
+                    throw "Installed executable identity hash changed: '$identityPath'."
+                }
             }
         }
         if ([bool]$receipt.uv.command_path_is_reparse -ne $true) {
             throw 'Installed uv command receipt does not require a reparse link.'
         }
-        $actualUv = Get-HerdrUvIdentity -RuntimeProfilePath $RuntimeProfilePath -ExpectedTargetSha256 ([string]$receipt.uv.sha256)
-        if ([string]$actualUv.command_path -cne [string]$receipt.uv.command_path -or
-            [string]$actualUv.executable -cne [string]$receipt.uv.executable -or
-            [string]$actualUv.version -cne [string]$receipt.uv.version -or
-            [string]$actualUv.version_output_sha256 -cne [string]$receipt.uv.version_output_sha256) {
-            throw 'Installed uv command no longer resolves to the receipted target.'
+        if (-not $SkipInstalledIdentityDrift) {
+            $actualUv = Get-HerdrUvIdentity -RuntimeProfilePath $RuntimeProfilePath -ExpectedTargetSha256 ([string]$receipt.uv.sha256)
+            if ([string]$actualUv.command_path -cne [string]$receipt.uv.command_path -or
+                [string]$actualUv.executable -cne [string]$receipt.uv.executable -or
+                [string]$actualUv.version -cne [string]$receipt.uv.version -or
+                [string]$actualUv.version_output_sha256 -cne [string]$receipt.uv.version_output_sha256) {
+                throw 'Installed uv command no longer resolves to the receipted target.'
+            }
         }
     }
     finally {
@@ -645,7 +652,7 @@ function Publish-HerdrAuthorityReplacement {
         throw 'Authority replacement paths do not form the fixed #961 pair.'
     }
     Assert-HerdrWindowsAuthority -AuthorityPath $AuthorityPath -RuntimeSid $RuntimeSid `
-        -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge
+        -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge -SkipInstalledIdentityDrift
     $target = Split-Path -Parent $AuthorityPath
     $suffix = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ', [Globalization.CultureInfo]::InvariantCulture) + '-' + [Guid]::NewGuid().ToString('N')
     $stage = Join-Path (Split-Path -Parent $target) ('.issue-961-replace-' + $suffix + '.tmp')
@@ -687,7 +694,7 @@ function Publish-HerdrAuthorityReplacement {
         $backupCreated = $true
         Protect-HostOwnedReadOnlyTree -TargetPath $backup -ReaderSid $RuntimeSid
         Assert-HerdrWindowsAuthority -AuthorityPath $AuthorityPath -RuntimeSid $RuntimeSid `
-            -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge
+            -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge -SkipInstalledIdentityDrift
         Move-HerdrAuthorityPairTransaction -AuthorityPath $AuthorityPath -ReceiptPath $ReceiptPath -Stage $stage -Backup $backup
         $published = $true
     }

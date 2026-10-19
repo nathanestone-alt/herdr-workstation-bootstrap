@@ -299,7 +299,8 @@ Assert-Throws {
         Assert-Throws { Publish-HerdrAuthorityReplacement @publish } 'receipt hash differs' 'invalid existing pair digest'
         [IO.File]::WriteAllText($script:WindowsReceiptPath, $oldReceipt + "`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::AppendAllText($executable, 'tamper')
-        Assert-Throws { Publish-HerdrAuthorityReplacement @publish } 'identity hash changed' 'existing executable drift'
+        Assert-Throws { Assert-HerdrWindowsAuthority @check -SkipExpiryAge } 'identity hash changed' 'ordinary Check on existing executable drift'
+        Assert-HerdrWindowsAuthority @check -SkipExpiryAge -SkipInstalledIdentityDrift
         [IO.File]::WriteAllText($executable, 'fixture executable')
         $badPublish = $publish.Clone()
         $badPublish.AuthorityContent = $newAuthority.Replace((Get-HerdrStringSha256 ($newReceipt + "`n")), ('0' * 64))
