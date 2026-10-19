@@ -83,9 +83,14 @@ After the change lands at `<landed-commit>`, use an independently reviewed clean
 checkout of that commit and an elevated PowerShell 7 session. Pass `-Mode Install
 -Replace` with every commissioning input from the example above. `-Replace` is
 refused in Check mode and without elevation. It validates the existing pair with
-Check's ACL, ownership, runtime-token and executable-identity checks before measuring
-the replacement, and again before publication. Only the legacy age comparison is
-skipped; invalid timestamps and unknown expiry policies are still refused.
+Check's ACL, ownership, runtime-token, schema and authority-to-receipt binding checks
+before measuring the replacement, and again before publication. Two comparisons are
+skipped for the existing pair only: the legacy age comparison, and the comparison of
+its recorded executable and uv identities against the installed binaries, because an
+approved binary change (for example a PowerShell or Python upgrade) is what a
+replacement re-attests. The replacement itself is measured fresh, and ordinary Check
+still refuses identity drift. Invalid timestamps and unknown expiry policies are still
+refused.
 
 Capture a still-running non-elevated `HERDR-WIN\rdp-natha` process in that account's
 limited PowerShell session. Keep the process alive through commissioning:

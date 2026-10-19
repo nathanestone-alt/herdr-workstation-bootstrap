@@ -68,7 +68,7 @@ try {
 
     if ($Replace) {
         Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid `
-            -RuntimeToken $runtimeToken -RuntimeProfilePath $runtimeProfile -SkipExpiryAge
+            -RuntimeToken $runtimeToken -RuntimeProfilePath $runtimeProfile -SkipExpiryAge -SkipInstalledIdentityDrift
     }
 
     $git = Get-HerdrAuthorityCommand -Name @('git.exe', 'git') -Label 'Git'
