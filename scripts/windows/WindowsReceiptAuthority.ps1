@@ -62,13 +62,24 @@ function Assert-HerdrWindowsReceiptExpiry {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ReceiptJson,
-        [datetime]$Now = [DateTime]::UtcNow
+        [datetime]$Now = [DateTime]::UtcNow,
+        [switch]$SkipAgeCheck
     )
 
     $document = [Text.Json.JsonDocument]::Parse($ReceiptJson)
     try {
         try { $element = $document.RootElement.GetProperty('expires_at_utc') }
         catch { throw 'Installed Windows receipt expires_at_utc is missing.' }
+        $policy = [Text.Json.JsonElement]::new()
+        if ($document.RootElement.TryGetProperty('expiry_policy', [ref]$policy)) {
+            if ($policy.ValueKind -ne [Text.Json.JsonValueKind]::String -or $policy.GetString() -cne 'none') {
+                throw 'Installed Windows receipt expiry_policy must be the JSON string "none".'
+            }
+            if ($element.ValueKind -ne [Text.Json.JsonValueKind]::Null) {
+                throw 'Installed Windows receipt expires_at_utc must be JSON null under expiry_policy "none".'
+            }
+            return
+        }
         if ($element.ValueKind -ne [Text.Json.JsonValueKind]::String) {
             throw 'Installed Windows receipt expires_at_utc must be a JSON string.'
         }
@@ -87,7 +98,7 @@ function Assert-HerdrWindowsReceiptExpiry {
         catch [FormatException] {
             throw 'Installed Windows receipt expires_at_utc is not canonical UTC.'
         }
-        if ($expires -le $Now.ToUniversalTime()) { throw 'Installed Windows receipt is expired.' }
+        if (-not $SkipAgeCheck -and $expires -le $Now.ToUniversalTime()) { throw 'Installed Windows receipt is expired.' }
         return $expires
     }
     finally { $document.Dispose() }
@@ -335,7 +346,8 @@ function New-HerdrWindowsReceiptValues {
         platform = 'Windows'
         architecture = 'x86_64'
         issued_at_utc = $issued.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
-        expires_at_utc = $issued.AddDays(30).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+        expiry_policy = 'none'
+        expires_at_utc = $null
         python313 = $Python313
         uv = $Uv
         role_identities = $RoleIdentities
@@ -466,7 +478,8 @@ function Assert-HerdrWindowsAuthority {
         [Parameter(Mandatory)][string]$AuthorityPath,
         [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid,
         [Parameter(Mandatory)][object]$RuntimeToken,
-        [Parameter(Mandatory)][string]$RuntimeProfilePath
+        [Parameter(Mandatory)][string]$RuntimeProfilePath,
+        [switch]$SkipExpiryAge
     )
 
     if ((Get-HerdrCanonicalPath -Path $AuthorityPath) -cne $script:WindowsReceiptAuthorityPath) {
@@ -479,7 +492,8 @@ function Assert-HerdrWindowsAuthority {
     $receiptHandle = $null
     $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
     try {
-        $authority = [IO.File]::ReadAllText($AuthorityPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -AsHashtable
+        $authorityJson = [IO.File]::ReadAllText($AuthorityPath, [Text.UTF8Encoding]::new($false))
+        $authority = $authorityJson | ConvertFrom-Json -AsHashtable
         if ($authority.schema_version -ne 1 -or $authority.authority_id -cne $script:WindowsReceiptAuthorityId -or
             $authority.platform -cne 'Windows' -or $authority.architecture -cne 'x86_64' -or
             $authority.runtime_identity.account -cne $script:WindowsRuntimeAccount -or
@@ -509,7 +523,10 @@ function Assert-HerdrWindowsAuthority {
             $receipt.uv.version_output_sha256 -cne $authority.uv.version_output_sha256) {
             throw 'Installed authority does not exactly bind the receipt identities.'
         }
-        Assert-HerdrWindowsReceiptExpiry -ReceiptJson $receiptJson | Out-Null
+        Assert-HerdrWindowsReceiptExpiry -ReceiptJson $receiptJson -SkipAgeCheck:$SkipExpiryAge | Out-Null
+        if ($authority.ContainsKey('expiry_policy') -or $authority.ContainsKey('expires_at_utc')) {
+            Assert-HerdrWindowsReceiptExpiry -ReceiptJson $authorityJson -SkipAgeCheck:$SkipExpiryAge | Out-Null
+        }
         $roleHash = Get-HerdrStringSha256 -Value (ConvertTo-HerdrCanonicalJson -Value $receipt.role_identities)
         if ($roleHash -cne $authority.role_manifest_sha256) { throw 'Installed receipt role manifest hash is invalid.' }
         foreach ($identity in @($receipt.python313, $receipt.python313.launcher, $receipt.uv) + @($receipt.role_identities.Values)) {
@@ -534,4 +551,150 @@ function Assert-HerdrWindowsAuthority {
         if ($receiptHandle) { $receiptHandle.Dispose() }
         $authorityHandle.Dispose()
     }
+}
+
+function Assert-HerdrAuthorityAdministrator {
+    [CmdletBinding()]
+    param()
+
+    if (-not $IsWindows -or -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Windows authority replacement requires an elevated administrator session.'
+    }
+}
+
+function Move-HerdrAuthorityPairTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AuthorityPath,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)][string]$Backup
+    )
+
+    if (-not $IsWindows) { throw 'Atomic authority replacement requires Windows transactional NTFS.' }
+    if (-not ('Herdr.Authority.PairTransaction' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace Herdr.Authority {
+    public static class PairTransaction {
+        [DllImport("KtmW32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateTransaction(IntPtr attributes, IntPtr uow, uint options,
+            uint isolation, uint isolationFlags, uint timeout, string description);
+        [DllImport("KtmW32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] static extern bool CommitTransaction(IntPtr transaction);
+        [DllImport("KtmW32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] static extern bool RollbackTransaction(IntPtr transaction);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] static extern bool MoveFileTransactedW(
+            string source, string target, IntPtr progress, IntPtr data, uint flags, IntPtr transaction);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] static extern bool RemoveDirectoryTransactedW(string path, IntPtr transaction);
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)] static extern bool CloseHandle(IntPtr handle);
+
+        public static void Move(string[] sources, string[] targets, string stage) {
+            IntPtr transaction = CreateTransaction(IntPtr.Zero, IntPtr.Zero, 0, 0, 0, 30000,
+                "STModel #961 authority pair replacement");
+            if (transaction == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            bool committed = false;
+            try {
+                for (int i = 0; i < sources.Length; i++) {
+                    if (!MoveFileTransactedW(sources[i], targets[i], IntPtr.Zero, IntPtr.Zero, 0, transaction))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Atomic authority pair move failed");
+                }
+                if (!RemoveDirectoryTransactedW(stage, transaction))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Atomic authority stage removal failed");
+                if (!CommitTransaction(transaction))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Atomic authority pair commit failed");
+                committed = true;
+            }
+            finally {
+                if (!committed) RollbackTransaction(transaction);
+                CloseHandle(transaction);
+            }
+        }
+    }
+}
+'@
+    }
+    $authorityName = [IO.Path]::GetFileName($AuthorityPath)
+    $receiptName = [IO.Path]::GetFileName($ReceiptPath)
+    [Herdr.Authority.PairTransaction]::Move(
+        @($ReceiptPath, $AuthorityPath, (Join-Path $Stage $receiptName), (Join-Path $Stage $authorityName)),
+        @((Join-Path $Backup $receiptName), (Join-Path $Backup $authorityName), $ReceiptPath, $AuthorityPath), $Stage)
+}
+
+function Publish-HerdrAuthorityReplacement {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AuthorityPath,
+        [Parameter(Mandatory)][string]$AuthorityContent,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [Parameter(Mandatory)][string]$ReceiptContent,
+        [Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$RuntimeSid,
+        [Parameter(Mandatory)][object]$RuntimeToken,
+        [Parameter(Mandatory)][string]$RuntimeProfilePath
+    )
+
+    Assert-HerdrAuthorityAdministrator
+    if ((Get-HerdrCanonicalPath -Path $AuthorityPath) -cne $script:WindowsReceiptAuthorityPath -or
+        (Get-HerdrCanonicalPath -Path $ReceiptPath) -cne $script:WindowsReceiptPath) {
+        throw 'Authority replacement paths do not form the fixed #961 pair.'
+    }
+    Assert-HerdrWindowsAuthority -AuthorityPath $AuthorityPath -RuntimeSid $RuntimeSid `
+        -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge
+    $target = Split-Path -Parent $AuthorityPath
+    $suffix = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ', [Globalization.CultureInfo]::InvariantCulture) + '-' + [Guid]::NewGuid().ToString('N')
+    $stage = Join-Path (Split-Path -Parent $target) ('.issue-961-replace-' + $suffix + '.tmp')
+    $backup = Join-Path $target ('backup-' + $suffix)
+    $stageCreated = $false
+    $backupCreated = $false
+    $heldAncestors = [Collections.Generic.List[object]]::new()
+    $published = $false
+    try {
+        foreach ($component in @(Get-HerdrPathComponents -Path $target)) {
+            $raw = [Herdr.Security.NativeMethods]::OpenDirectoryForRelative($component)
+            $null = $heldAncestors.Add([Microsoft.Win32.SafeHandles.SafeFileHandle]::new($raw, $true))
+        }
+        Ensure-HerdrManagedDirectory -Path $stage -Description '#961 staged replacement' -RequireLeafCreation | Out-Null
+        $stageCreated = $true
+        Write-HerdrAuthorityStagedFile -Path (Join-Path $stage 'bootstrap-receipt.json') -Content $ReceiptContent
+        Write-HerdrAuthorityStagedFile -Path (Join-Path $stage 'receipt-authority.json') -Content $AuthorityContent
+        Protect-HostOwnedReadOnlyTree -TargetPath $stage -ReaderSid $RuntimeSid
+        $stageReceipt = Join-Path $stage 'bootstrap-receipt.json'
+        $stageAuthority = Join-Path $stage 'receipt-authority.json'
+        if ((Get-HerdrAuthoritySha256 -Path $stageReceipt) -cne (Get-HerdrStringSha256 -Value ($ReceiptContent + "`n")) -or
+            (Get-HerdrAuthoritySha256 -Path $stageAuthority) -cne (Get-HerdrStringSha256 -Value ($AuthorityContent + "`n"))) {
+            throw 'The staged #961 replacement bytes differ from the commissioned generation.'
+        }
+        $stagedReceipt = $ReceiptContent | ConvertFrom-Json -AsHashtable
+        $stagedAuthority = $AuthorityContent | ConvertFrom-Json -AsHashtable
+        if ($stagedAuthority.receipt_path -cne $ReceiptPath -or
+            $stagedAuthority.receipt_sha256 -cne (Get-HerdrAuthoritySha256 -Path (Join-Path $stage 'bootstrap-receipt.json')) -or
+            $stagedAuthority.receipt_id -cne $stagedReceipt.receipt_id -or
+            $stagedAuthority.authority_id -cne $script:WindowsReceiptAuthorityId) {
+            throw 'The staged #961 replacement generation is not internally coherent.'
+        }
+        Assert-HerdrWindowsReceiptExpiry -ReceiptJson $ReceiptContent | Out-Null
+        if ($stagedAuthority.ContainsKey('expiry_policy') -or $stagedAuthority.ContainsKey('expires_at_utc')) {
+            Assert-HerdrWindowsReceiptExpiry -ReceiptJson $AuthorityContent | Out-Null
+        }
+        Assert-HerdrAuthorityNamespaceRuntimeAccess -AuthorityRoot $stage -RuntimeToken $RuntimeToken
+        Ensure-HerdrManagedDirectory -Path $backup -Description '#961 previous authority pair' -RequireLeafCreation | Out-Null
+        $backupCreated = $true
+        Protect-HostOwnedReadOnlyTree -TargetPath $backup -ReaderSid $RuntimeSid
+        Assert-HerdrWindowsAuthority -AuthorityPath $AuthorityPath -RuntimeSid $RuntimeSid `
+            -RuntimeToken $RuntimeToken -RuntimeProfilePath $RuntimeProfilePath -SkipExpiryAge
+        Move-HerdrAuthorityPairTransaction -AuthorityPath $AuthorityPath -ReceiptPath $ReceiptPath -Stage $stage -Backup $backup
+        $published = $true
+    }
+    finally {
+        foreach ($handle in $heldAncestors) { $handle.Dispose() }
+        if (-not $published -and $stageCreated -and [IO.Directory]::Exists($stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        if (-not $published -and $backupCreated -and [IO.Directory]::Exists($backup)) { Remove-Item -LiteralPath $backup -Recurse -Force }
+    }
+    return $backup
 }

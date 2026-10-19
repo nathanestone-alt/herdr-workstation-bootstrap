@@ -83,6 +83,37 @@ selected runtime user with `--no-new-privs` for `verify`, while Python probes
 in receipt authority use the same explicit root-to-user boundary. No
 signing-key or signing-service infrastructure is required.
 
+## Receipt lifetime and one-time migration
+
+New #961 receipts use schema version 1 with `expiry_policy: "none"` and an explicit
+`expires_at_utc: null`. They no longer expire. Re-attestation happens on a deliberate,
+approved interpreter change, rather than a periodic renewal. Executable digests,
+sealed Python/stdlib and role identities, source/payload bindings, and root-owned
+publication paths retain their existing checks. Agents without root cannot mint.
+Legacy receipts without `expiry_policy` still need a valid future UTC expiry.
+Unknown policy values/types and `"none"` with a missing or non-null expiry are refused.
+An authority envelope that carries its own expiry follows the same rule.
+
+After this change lands at `<landed-commit>`, obtain that full reviewed commit and
+its installer SHA-256 independently. Repeat the installer download, SHA-256 check,
+syntax check and existing-anchor ownership/mode check above, then run:
+
+```bash
+reviewed_commit='<landed-commit>'
+# Use the independently verified installer for this commit, as above.
+sudo -- "$installer" --re-pin --origin "$origin" --commit "$reviewed_commit" --run-as-user nathan
+# Confirm the published policy literal and independently reviewed launcher hash.
+sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint receipt-authority --install
+sudo /usr/local/libexec/herdr-workstation-bootstrap --entrypoint receipt-authority --check
+```
+
+The installer prints `launcher=/usr/local/libexec/herdr-workstation-bootstrap`,
+`policy=/etc/herdr-workstation/bootstrap-policy.conf`, and `commit=<landed-commit>`.
+The mint prints `receipt authority install: authority=/etc/stmodel/issue-961/receipt-authority.json
+receipt=/etc/stmodel/issue-961/receipt.json source=<landed-commit> ...`; Check prints
+`receipt authority check: ...`. Capture the new receipt SHA-256 for the coordinated
+STModel pin migration. Do not re-run mint as a scheduled renewal.
+
 ## Invocation
 
 Use the installed launcher, not a repository script:

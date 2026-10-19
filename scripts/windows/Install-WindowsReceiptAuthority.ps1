@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Install', 'Check')][string]$Mode = 'Check',
+    [switch]$Replace,
     [string]$SourceRoot = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
     [ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceCommit,
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPayloadManifestSha256,
@@ -34,6 +35,7 @@ if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.In
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'The #961 Windows authority producer requires an elevated administrator session.'
 }
+if ($Replace -and $Mode -ne 'Install') { throw '-Replace requires -Mode Install.' }
 $source = Assert-HerdrAuthoritySafePath -Path $SourceRoot
 $authority = Get-HerdrCanonicalPath -Path $AuthorityPath
 $receipt = Get-HerdrCanonicalPath -Path $ReceiptPath
@@ -64,6 +66,11 @@ try {
     Assert-HerdrAuthorityHex -Value $ExpectedProducerScriptSha256 -Length 64 -Label 'ExpectedProducerScriptSha256'
     Assert-HerdrAuthorityHex -Value $ExpectedUvTargetSha256 -Length 64 -Label 'ExpectedUvTargetSha256'
 
+    if ($Replace) {
+        Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid `
+            -RuntimeToken $runtimeToken -RuntimeProfilePath $runtimeProfile -SkipExpiryAge
+    }
+
     $git = Get-HerdrAuthorityCommand -Name @('git.exe', 'git') -Label 'Git'
     $actualCommit = Invoke-HerdrAuthorityCommand -Path $git.Path -ArgumentList @('-C', $source, 'rev-parse', 'HEAD') -Label 'Git source commit probe'
     if ($actualCommit -cne $ExpectedSourceCommit) { throw "Source commit differs from commissioned commit: $actualCommit." }
@@ -93,8 +100,16 @@ try {
     $receiptSha256 = Get-HerdrStringSha256 -Value ($receiptJson + "`n")
     $authorityValue = New-HerdrWindowsAuthorityValue -Receipt $receiptValue -ReceiptPath $receipt -ReceiptSha256 $receiptSha256
     $authorityJson = ConvertTo-HerdrCanonicalJson -Value $authorityValue
-    Publish-HerdrAuthorityFirstInstall -AuthorityPath $authority -AuthorityContent $authorityJson `
-        -ReceiptPath $receipt -ReceiptContent $receiptJson -RuntimeSid $runtimeSid -RuntimeToken $runtimeToken
+    if ($Replace) {
+        $backup = Publish-HerdrAuthorityReplacement -AuthorityPath $authority -AuthorityContent $authorityJson `
+            -ReceiptPath $receipt -ReceiptContent $receiptJson -RuntimeSid $runtimeSid -RuntimeToken $runtimeToken `
+            -RuntimeProfilePath $runtimeProfile
+        Write-Host "Windows #961 previous authority pair backed up: $backup"
+    }
+    else {
+        Publish-HerdrAuthorityFirstInstall -AuthorityPath $authority -AuthorityContent $authorityJson `
+            -ReceiptPath $receipt -ReceiptContent $receiptJson -RuntimeSid $runtimeSid -RuntimeToken $runtimeToken
+    }
     Write-Host ("Windows #961 receipt authority installed: authority={0} receipt={1} source={2} runtime_pid={3} " +
         "runtime_creation_utc={4} runtime_session={5} runtime_sid={6} elevation_type={7} administrators_enabled={8} administrators_deny_only={9}" -f
         $authority, $receipt, $actualCommit, $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc,
