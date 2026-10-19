@@ -53,8 +53,8 @@ try {
     if ($Mode -eq 'Check') {
         Assert-HerdrWindowsAuthority -AuthorityPath $authority -RuntimeSid $runtimeSid `
             -RuntimeToken $runtimeToken -RuntimeProfilePath $runtimeProfile
-        Write-Host ("Windows #961 receipt authority check passed: {0} runtime_pid={1} runtime_creation_utc={2} runtime_session={3} " +
-            "runtime_sid={4} elevation_type={5} administrators_enabled={6} administrators_deny_only={7}" -f
+        Write-Host (("Windows #961 receipt authority check passed: {0} runtime_pid={1} runtime_creation_utc={2} runtime_session={3} " +
+            "runtime_sid={4} elevation_type={5} administrators_enabled={6} administrators_deny_only={7}") -f
             $authority, $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc, $ExpectedRuntimeSessionId,
             $runtimeSid.Value, $runtimeToken.ElevationType, $runtimeToken.AdministratorsGroupEnabled, $runtimeToken.AdministratorsGroupDenyOnly)
         return
@@ -110,8 +110,8 @@ try {
         Publish-HerdrAuthorityFirstInstall -AuthorityPath $authority -AuthorityContent $authorityJson `
             -ReceiptPath $receipt -ReceiptContent $receiptJson -RuntimeSid $runtimeSid -RuntimeToken $runtimeToken
     }
-    Write-Host ("Windows #961 receipt authority installed: authority={0} receipt={1} source={2} runtime_pid={3} " +
-        "runtime_creation_utc={4} runtime_session={5} runtime_sid={6} elevation_type={7} administrators_enabled={8} administrators_deny_only={9}" -f
+    Write-Host (("Windows #961 receipt authority installed: authority={0} receipt={1} source={2} runtime_pid={3} " +
+        "runtime_creation_utc={4} runtime_session={5} runtime_sid={6} elevation_type={7} administrators_enabled={8} administrators_deny_only={9}") -f
         $authority, $receipt, $actualCommit, $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc,
         $ExpectedRuntimeSessionId, $runtimeSid.Value, $runtimeToken.ElevationType,
         $runtimeToken.AdministratorsGroupEnabled, $runtimeToken.AdministratorsGroupDenyOnly)
