@@ -232,9 +232,9 @@ try {
     Assert-True (@(Get-ChildItem -LiteralPath (Split-Path -Parent $failedTarget) -Filter '.issue-961-authority-*.tmp').Count -eq 0) `
         'A failed first installation retained a staged generation.'
 
-    Write-Host ("Windows #1074 native positive acceptance PASS: runtime_pid={0} runtime_creation_utc={1} " +
+    Write-Host (("Windows #1074 native positive acceptance PASS: runtime_pid={0} runtime_creation_utc={1} " +
         "runtime_session={2} runtime_sid={3} runtime_group_attributes=0x{4:x8} runtime_granted=0x{5:x8} " +
-        "runner_group_attributes=0x{6:x8} runner_granted=0x{7:x8} uv_sha256={8} uv_version='{9}'." -f
+        "runner_group_attributes=0x{6:x8} runner_granted=0x{7:x8} uv_sha256={8} uv_version='{9}'.") -f
         $RuntimeProcessId, $ExpectedRuntimeProcessCreationTimeUtc, $ExpectedRuntimeSessionId, $ExpectedRuntimeUserSid,
         $runtimeToken.AdministratorsGroupAttributes, $runtimeGranted, $runnerToken.AdministratorsGroupAttributes,
         $runnerGranted, $uv.sha256, $uv.version)

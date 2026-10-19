@@ -622,8 +622,8 @@ try {
     Assert-True ($raceOperationAttempts -eq 80) `
         "Ancestor/junction race did not execute the bounded operation set (attempts=$raceOperationAttempts)."
     Assert-True ($raceMutationEvidence.Count -gt 0) `
-        ("Ancestor/junction race did not observe a bounded ancestor mutation; attempts={0}; successes={1}; " +
-         "race_evidence={2}; contention={3}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '),
+        (("Ancestor/junction race did not observe a bounded ancestor mutation; attempts={0}; successes={1}; " +
+         "race_evidence={2}; contention={3}.") -f $raceOperationAttempts, $raceOperationSuccesses, ($raceEvidenceKeys -join ', '),
          ($raceContentionDiagnostics -join ' | '))
     $raceControlSuccess = $false
     try {
@@ -635,8 +635,8 @@ try {
         [void]$raceOperationFailures.Add("Control: $($_.Exception.Message)")
     }
     Assert-True $raceControlSuccess `
-        ("Ancestor/junction race control operation failed after parent restoration; attempts={0}; successes={1}; failures={2}; " +
-         "race_evidence={3}; contention={4}." -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
+        (("Ancestor/junction race control operation failed after parent restoration; attempts={0}; successes={1}; failures={2}; " +
+         "race_evidence={3}; contention={4}.") -f $raceOperationAttempts, $raceOperationSuccesses, ($raceOperationFailures -join ' | '),
          ($raceEvidenceKeys -join ', '), ($raceContentionDiagnostics -join ' | '))
     Assert-True (@(Get-ChildItem -LiteralPath $raceOutside -Force -File -ErrorAction SilentlyContinue).Count -eq 0) `
         'Handle-relative create/copy race wrote outside the trusted root.'
