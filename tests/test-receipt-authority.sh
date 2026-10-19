@@ -409,6 +409,43 @@ run_authority --check
 (( $(jq -r '.python313.bundle.file_count' "$receipt_path") > 1 )) || exit 1
 [[ "$(jq -r '.python313.execution_path' "$receipt_path")" == sealed://python313/.local/bin/python3.13 ]] || exit 1
 
+# Rebind the authority digest so each expiry refusal reaches the freshness
+# reader rather than stopping at the receipt hash check.
+jq -e '.schema_version == 1 and .expiry_policy == "none" and has("expires_at_utc") and .expires_at_utc == null' "$receipt_path" >/dev/null
+cp -- "$receipt_path" "$test_root/receipt.expiry-good"
+cp -- "$authority_path" "$test_root/authority.expiry-good"
+check_expiry_case() {
+  local label="$1" expression="$2" expected="$3" digest
+  jq "$expression" "$test_root/receipt.expiry-good" > "$receipt_path"
+  digest="$(sha256sum "$receipt_path" | /usr/bin/gawk '{print $1}')"
+  jq --arg digest "$digest" '.receipt_sha256 = $digest' "$test_root/authority.expiry-good" > "$authority_path"
+  if [[ "$expected" == accept ]]; then
+    run_authority --check
+  else
+    expect_failure "$label" run_authority --check
+  fi
+}
+check_expiry_case legacy-future 'del(.expiry_policy) | .expires_at_utc = "2999-01-01T00:00:00Z"' accept
+check_expiry_case legacy-expired 'del(.expiry_policy) | .expires_at_utc = "2000-01-01T00:00:00Z"' refuse
+check_expiry_case unknown-policy '.expiry_policy = "rolling"' refuse
+check_expiry_case null-policy '.expiry_policy = null' refuse
+check_expiry_case numeric-policy '.expiry_policy = 1' refuse
+check_expiry_case none-with-date '.expires_at_utc = "2999-01-01T00:00:00Z"' refuse
+check_expiry_case none-without-expiry 'del(.expires_at_utc)' refuse
+check_expiry_case legacy-invalid-date 'del(.expiry_policy) | .expires_at_utc = "2999-02-30T00:00:00Z"' refuse
+check_expiry_case legacy-non-utc 'del(.expiry_policy) | .expires_at_utc = "2999-01-01T00:00:00+00:00"' refuse
+cp -- "$test_root/receipt.expiry-good" "$receipt_path"
+for authority_expiry in '"expiry_policy":"none","expires_at_utc":null' '"expires_at_utc":"2999-01-01T00:00:00Z"'; do
+  jq ". + {$authority_expiry}" "$test_root/authority.expiry-good" > "$authority_path"
+  run_authority --check
+done
+jq '. + {expiry_policy:"none", expires_at_utc:"2999-01-01T00:00:00Z"}' "$test_root/authority.expiry-good" > "$authority_path"
+expect_failure 'authority none-with-date' run_authority --check
+jq '. + {expires_at_utc:"2000-01-01T00:00:00Z"}' "$test_root/authority.expiry-good" > "$authority_path"
+expect_failure 'authority legacy-expired' run_authority --check
+cp -- "$test_root/authority.expiry-good" "$authority_path"
+echo 'receipt expiry contract: 14 cases passed.'
+
 # The bundle parent is deliberately outside /tmp: it is a child of the
 # launcher-controlled staging root.  An existing writable parent must be
 # rejected without being repaired, while the approved private parent succeeds.

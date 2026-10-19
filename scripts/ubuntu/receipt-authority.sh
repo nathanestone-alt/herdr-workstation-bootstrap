@@ -1855,7 +1855,6 @@ rtk_release_json="$("$jq_bin" -cSn \
   '{version:$version, url:$url, sha256:$sha256, archive:($url | split("/") | last)}')"
 
 issued_at_utc="$(/usr/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
-expires_at_utc="$(/usr/bin/date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"
 receipt_id="issue-961-bootstrap-${repo_commit:0:12}-$(/usr/bin/date -u '+%Y%m%dT%H%M%SZ')"
 
 build_receipt() {
@@ -1871,14 +1870,13 @@ build_receipt() {
     --arg platform 'Ubuntu' \
     --arg architecture 'x86_64' \
     --arg issued_at_utc "$issued_at_utc" \
-    --arg expires_at_utc "$expires_at_utc" \
     --argjson python313 "$python_json" \
     --argjson role_identities "$role_manifest_json" \
     --argjson rtk_release "$rtk_release_json" \
     --arg role_manifest_sha256 "$role_manifest_sha256" \
     --arg source_root "$source_root" \
     --arg script_sha256 "$script_sha256" \
-    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expires_at_utc:$expires_at_utc, python313:$python313, role_identities:$role_identities, rtk_release:$rtk_release, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
+    '{schema_version:$schema_version, receipt_id:$receipt_id, verification_status:$verification_status, source_commit_sha:$source_commit_sha, clean:$clean, python313_lock_verified:$python313_lock_verified, payload_manifest_sha256:$payload_manifest_sha256, bridge_allowlist_sha256:$bridge_allowlist_sha256, platform:$platform, architecture:$architecture, issued_at_utc:$issued_at_utc, expiry_policy:"none", expires_at_utc:null, python313:$python313, role_identities:$role_identities, rtk_release:$rtk_release, role_manifest_sha256:$role_manifest_sha256, provenance:{authority_id:"#961-installation-authority-v1", producer:"herdr-workstation-bootstrap", source_root:$source_root, source_commit_sha:$source_commit_sha, receipt_authority_script_sha256:$script_sha256, authority_mode:"authoritative", secrets_excluded:true}}'
 }
 
 validate_parent_chain() {
@@ -1944,6 +1942,17 @@ validate_output_file_security() {
   fi
 }
 
+validate_expiry() {
+  local path="$1" expires expires_epoch
+  if "$jq_bin" -e 'has("expiry_policy")' "$path" >/dev/null; then
+    validate_json_field "$path" '.expiry_policy == "none" and has("expires_at_utc") and .expires_at_utc == null'
+    return
+  fi
+  expires="$("$jq_bin" -er '.expires_at_utc | select(type == "string") | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' "$path")" || fail 'receipt is expired or has an invalid expiry'
+  expires_epoch="$(/usr/bin/date -u -d "$expires" '+%s' 2>/dev/null || true)"
+  [[ "$expires_epoch" =~ ^[0-9]+$ && "$expires_epoch" -gt "$(/usr/bin/date -u '+%s')" ]] || fail 'receipt is expired or has an invalid expiry'
+}
+
 validate_installed_authority() {
   [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || fail "receipt body is missing or symlinked: $receipt_path"
   [[ -f "$authority_path" && ! -L "$authority_path" ]] || fail "authority envelope is missing or symlinked: $authority_path"
@@ -1982,9 +1991,10 @@ validate_installed_authority() {
   [[ "$("$jq_bin" -cS '.rtk_release' "$authority_path")" == "$rtk_release_json" ]] || fail 'authority RTK release provenance differs from the lock'
   [[ "$("$jq_bin" -cS '.python313' "$authority_path")" == "$python_json" ]] || fail 'authority Python identity differs from receipt'
   [[ "$("$jq_bin" -r '.provenance.receipt_authority_script_sha256 // empty' "$authority_path")" == "$script_sha256" ]] || fail 'authority script provenance differs from source'
-  local expires_epoch
-  expires_epoch="$(/usr/bin/date -u -d "$("$jq_bin" -r '.expires_at_utc' "$receipt_path")" '+%s' 2>/dev/null || true)"
-  [[ "$expires_epoch" =~ ^[0-9]+$ && "$expires_epoch" -gt "$(/usr/bin/date -u '+%s')" ]] || fail 'receipt is expired or has an invalid expiry'
+  validate_expiry "$receipt_path"
+  if "$jq_bin" -e 'has("expiry_policy") or has("expires_at_utc")' "$authority_path" >/dev/null; then
+    validate_expiry "$authority_path"
+  fi
 }
 
 if [[ "$mode" == install ]]; then
