@@ -9,6 +9,7 @@ if (-not $IsWindows) {
 $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $root = Join-Path ([IO.Path]::GetTempPath()) "herdr-acl-policy-$([Guid]::NewGuid().ToString('N'))"
 $child = Join-Path $root 'pre-existing-child'
+$readOnlyRoot = Join-Path ([IO.Path]::GetTempPath()) "herdr-readonly-acl-policy-$([Guid]::NewGuid().ToString('N'))"
 try {
     New-Item -ItemType Directory -Path $child -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $child 'existing.txt'), 'fixture')
@@ -47,10 +48,29 @@ try {
     $operatorProbe = Join-Path $root 'operator-write.tmp'
     [IO.File]::WriteAllText($operatorProbe, 'allowed')
     Remove-Item -LiteralPath $operatorProbe -Force
+
+    New-Item -ItemType Directory -Path $readOnlyRoot -Force | Out-Null
+    $readOnlyFile = Join-Path $readOnlyRoot 'authority.json'
+    [IO.File]::WriteAllText($readOnlyFile, '{}')
+    Protect-HostOwnedReadOnlyTree -TargetPath $readOnlyRoot -ReaderSid $operatorSid
+    Assert-HostOwnedReadOnlyTree -TargetPath $readOnlyRoot -ReaderSid $operatorSid
+    $readerRules = @(Get-Acl -LiteralPath $readOnlyFile | Select-Object -ExpandProperty Access | Where-Object {
+        $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $operatorSid.Value
+    })
+    if ($readerRules.Count -eq 0) { throw 'Read-only host policy omitted the designated reader SID.' }
+    $writeMask = [Security.AccessControl.FileSystemRights]0x000D0156
+    foreach ($readerRule in $readerRules) {
+        if (($readerRule.FileSystemRights -band $writeMask) -ne 0) {
+            throw "Read-only host policy granted write rights to the designated reader: $($readerRule.FileSystemRights)."
+        }
+    }
     Write-Host 'Host-owned ACL policy regression test passed.'
 }
 finally {
     if (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $readOnlyRoot) {
+        Remove-Item -LiteralPath $readOnlyRoot -Recurse -Force
     }
 }
