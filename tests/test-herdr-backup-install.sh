@@ -13,7 +13,8 @@ cat > "$test_root/bin/crontab" <<EOF
 #!/usr/bin/env bash
 table="$test_root/crontab.txt"
 case "\${1:-}" in
-  -l) [[ -f "\$table" ]] && cat "\$table" || { echo "no crontab for test" >&2; exit 1; } ;;
+  -l) [[ -f "$test_root/crontab.fail" ]] && { echo "crontabs/test/: fopen: Permission denied" >&2; exit 1; }
+      [[ -f "\$table" ]] && cat "\$table" || { echo "no crontab for test" >&2; exit 1; } ;;
   -) cat > "\$table" ;;
   *) echo "unexpected crontab args: \$*" >&2; exit 2 ;;
 esac
@@ -51,6 +52,19 @@ echo '# drift' >> "$HOME/.config/restic/excludes"
 if "$installer" --check >/dev/null; then fail "--check missed drift"; fi
 "$installer" >/dev/null
 "$installer" --check >/dev/null || fail "reinstall did not repair drift"
+
+# An unreadable crontab (not "no crontab") aborts both modes and never rewrites the table.
+table_before="$(cat "$test_root/crontab.txt")"
+touch "$test_root/crontab.fail"
+if "$installer" >/dev/null 2>&1; then fail "install succeeded on an unreadable crontab"; fi
+if "$installer" --check >/dev/null 2>&1; then fail "--check passed on an unreadable crontab"; fi
+rm -f "$test_root/crontab.fail"
+[[ "$(cat "$test_root/crontab.txt")" == "$table_before" ]] || fail "unreadable crontab was rewritten"
+
+# No crontab at all is an empty table: install creates it with the one line.
+rm -f "$test_root/crontab.txt"
+"$installer" >/dev/null
+[[ "$(cat "$test_root/crontab.txt")" == "$cron_line" ]] || fail "fresh crontab not created"
 
 # The repo env never carries an inline password.
 if grep -qE '^(export )?RESTIC_PASSWORD=' "$repo_root/scripts/ubuntu/backup/restic.env"; then

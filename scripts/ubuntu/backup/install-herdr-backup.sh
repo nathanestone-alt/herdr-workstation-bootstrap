@@ -19,8 +19,23 @@ pairs=(
   "restic-excludes:$cfg_dir/excludes"
 )
 
+# Print the user crontab. "no crontab for <user>" is an empty table; any other
+# listing failure aborts, so a failed read can never be written back as empty.
+read_crontab() {
+  local out err
+  err="$(mktemp)"
+  if out="$(crontab -l 2>"$err")"; then
+    rm -f -- "$err"; [[ -n "$out" ]] && printf '%s\n' "$out"; return 0
+  fi
+  if grep -q '^no crontab for' "$err"; then rm -f -- "$err"; return 0; fi
+  echo "ERROR crontab -l failed: $(head -c 300 "$err")" >&2
+  rm -f -- "$err"; return 1
+}
+
 cron_count() {
-  { crontab -l 2>/dev/null || true; } | grep -cxF -- "$cron_line" || true
+  local table
+  table="$(read_crontab)" || return 1
+  grep -cxF -- "$cron_line" <<<"$table" || true
 }
 
 if [[ "${1:-}" == --check ]]; then
@@ -31,7 +46,11 @@ if [[ "${1:-}" == --check ]]; then
       echo "FAIL differs from repo: $live"; fail=1
     fi
   done
-  [[ "$(cron_count)" == 1 ]] || { echo "FAIL crontab needs exactly one line: $cron_line"; fail=1; }
+  if ! count="$(cron_count)"; then
+    echo "FAIL could not read the crontab"; fail=1
+  elif [[ "$count" != 1 ]]; then
+    echo "FAIL crontab needs exactly one line: $cron_line"; fail=1
+  fi
   [[ -f "$cfg_dir/password" ]] || { echo "FAIL missing $cfg_dir/password"; fail=1; }
   [[ $fail == 0 ]] && echo "OK herdr-backup live copies match the repo"
   exit "$fail"
@@ -39,14 +58,15 @@ elif [[ $# -gt 0 ]]; then
   echo "usage: $0 [--check]" >&2; exit 64
 fi
 
+# Read the crontab before touching anything; an unreadable table stops the install.
+current="$(read_crontab)" || exit 1
+
 mkdir -p "$bin_dir" "$cfg_dir" "$state_dir"
 install -m 0755 "$src/herdr-backup" "$bin_dir/herdr-backup"
 install -m 0644 "$src/restic.env" "$cfg_dir/env"
 install -m 0644 "$src/restic-excludes" "$cfg_dir/excludes"
 
-if [[ "$(cron_count)" == 0 ]]; then
-  # Read the table fully before writing it back; a pipe would race the rewrite.
-  current="$(crontab -l 2>/dev/null || true)"
+if ! grep -qxF -- "$cron_line" <<<"$current"; then
   { [[ -n "$current" ]] && printf '%s\n' "$current"; printf '%s\n' "$cron_line"; } | crontab -
 fi
 
