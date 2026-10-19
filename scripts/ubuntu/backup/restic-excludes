@@ -1,0 +1,11 @@
+/home/nathan/.cache
+/home/nathan/.local/share/Trash
+/home/nathan/.npm
+/home/nathan/.cargo/registry
+/home/nathan/.rustup
+node_modules
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache

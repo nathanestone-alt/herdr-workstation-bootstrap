@@ -1,0 +1,17 @@
+#!/bin/bash
+# Nightly restic backup of /home/nathan to the Windows drive (C:\HerdrBackup\restic on herdr-win), throttled.
+set -uo pipefail
+. "$HOME/.config/restic/env"
+R="$HOME/.local/bin/restic"
+LOG="$HOME/.local/state/herdr-backup/backup.log"
+exec 9>"$HOME/.local/state/herdr-backup/lock"; flock -n 9 || { echo "$(date -Is) already running" >> "$LOG"; exit 0; }
+{
+  echo "== $(date -Is) start"
+  "$R" cat config >/dev/null 2>&1 || "$R" init
+  nice -n 10 ionice -c3 "$R" backup "$HOME" --exclude-file "$HOME/.config/restic/excludes" --exclude-caches --one-file-system --limit-upload 40960 --tag nightly --quiet
+  rc=$?
+  "$R" forget --tag nightly --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --quiet
+  [ "$(date +%u)" = 7 ] && "$R" prune --quiet --max-unused 10%
+  echo "rc=$rc repo: $("$R" stats --mode raw-data 2>/dev/null | grep -E "Total Size" | sed "s/ *Total Size: *//")"
+  echo "== $(date -Is) end"
+} >> "$LOG" 2>&1
