@@ -108,38 +108,36 @@ Record working names, usernames and test dates only in the uncommitted commissio
 
 ## As built: who reaches what (2026-10-21)
 
-Tailnet nodes: `surface7` (laptop), `herdr-win`, `herdr-ubuntu`, `openclaw-vps` (the Hostinger VPS; [VPS-ACCESS.md](VPS-ACCESS.md) plans the name `hostinger-vps`), `glkvm` (the Comet KVM) and the phone. The work computer is not on the tailnet: installing Tailscale needs admin rights it does not have, and its network blocks outbound SSH (TCP 22).
+Tailnet nodes: `surface7` (laptop), `herdr-win`, `herdr-ubuntu`, `openclaw-vps` (the Hostinger VPS; [VPS-ACCESS.md](VPS-ACCESS.md) plans the name `hostinger-vps`), `glkvm` (the Comet KVM) and the phone. The work computer is not on the tailnet: installing Tailscale needs admin rights it does not have. Its own security software blocks outbound SSH on 22 and on other high ports, but it lets raw TCP out on 443.
 
 | From | VPS | herdr-ubuntu | herdr-win | Surface | KVM |
 |---|---|---|---|---|---|
 | Surface | `ssh vps` | `ssh herdr-ubuntu` | RDP shortcut, or `ssh herdr-win` | — | `https://glkvm` |
-| Phone | SSH app | SSH or Mosh app | Windows App (RDP) | SSH app | browser, `https://glkvm` |
-| Work computer | Tailscale browser SSH | `ssh herdr-ubuntu` from the VPS | `ssh herdr-win` from the VPS (shell only) | `ssh surface` from the VPS (shell only) | not set up |
+| Phone | Termius | Termius | Windows App (RDP) | Termius | browser, `https://glkvm` |
+| Work computer | Termius, port 443 | `ssh herdr-ubuntu` from the VPS | Remote Desktop or the KVM; `ssh herdr-win` from the VPS for a shell | `ssh surface` from the VPS (shell only) | KVM remote access |
 
 ### From the work computer
 
-1. Sign in at `login.tailscale.com`, open Machines, and choose **SSH** from the `openclaw-vps` menu. It runs over HTTPS, so the work network allows it.
-2. Log in as the VPS's named admin user, not `root`. The hop aliases and the VPS key live in that user's `~/.ssh`.
-3. From that shell, run `ssh herdr-ubuntu`, `ssh herdr-win` or `ssh surface`.
-
-Each browser session adds an ephemeral tailnet node. Tailscale removes it on its own after the tab closes.
+1. In Termius, connect to the VPS's public address on **port 443** as the VPS's named admin user, with the Termius key. That key is in the admin user's `authorized_keys` on the VPS.
+2. From that shell, run `ssh herdr-ubuntu`, `ssh herdr-win` or `ssh surface`. The hop aliases and the VPS key live in the admin user's `~/.ssh`.
 
 ### Why it is shaped this way
 
-- Tailscale SSH, and so the browser console, serves only Linux and macOS nodes. The Windows nodes (`herdr-win`, `surface7`) are reached by hopping through a Linux node.
+- **443 is shared.** `sslh` listens on the VPS's public 443 (IPv4 and IPv6). It sends SSH to `sshd` on `127.0.0.1:22` and TLS to Caddy, which now serves HTTPS on an internal port (`https_port 8443` in the Caddyfile, with an explicit `http://` redirect site because automatic redirects would point at the internal port). Port 80 is unchanged. Caddy's logs now show every HTTPS client as `127.0.0.1`.
+- **Rollback:** stop and disable `sslh`, restore the Caddyfile backup taken on 2026-10-21, and reload Caddy.
+- **Tailscale SSH is off on every node.** It worked, but the browser console was clumsy next to Termius. With it off, port 22 on each tailnet address is plain `sshd` with keys, the same for people and agents. The tailnet SSH rule is `accept`, but it has no effect while no node runs Tailscale SSH.
+- **Test from the far end.** `portquiz.net` reported ports as open from the work computer that the VPS never saw. Confirm a path with a packet capture on the VPS instead. Filtering the capture by address can mislead too: the work computer and the home machines can share one public IP.
 - The Surface runs Windows 11 Home, which cannot host RDP. From off the tailnet it is shell-only.
-- Tailscale SSH is on for `openclaw-vps` only. The tailnet SSH rule uses `check`, which asks for browser re-authentication from time to time. Turning Tailscale SSH on for `herdr-ubuntu` under `check` would stall unattended agent sessions, so switch the rule to `accept` first.
-- `tailscale set --ssh` aborts when run over a Tailscale connection, because it reroutes port 22. Run it over the VPS's public-IP path.
 - The VPS key is authorized on `herdr-ubuntu`, on `herdr-win` (admin accounts read `C:\ProgramData\ssh\administrators_authorized_keys`) and on the Surface. Each host key was checked from a second trusted machine before it was pinned on the VPS.
-- That makes the VPS a jump host into the home machines, so its public SSH is key-only: `/etc/ssh/sshd_config.d/00-keys-only.conf` turns off password and keyboard-interactive login.
+- That makes the VPS a jump host into the home machines, so its public SSH is key-only: `/etc/ssh/sshd_config.d/00-keys-only.conf` turns off password and keyboard-interactive login, on 22 and through `sslh` on 443 alike.
 
 ### Shortcuts
 
 - Surface `~/.ssh/config`: `vps` (Tailscale), `vps-public` (public-IP fallback), `herdr-ubuntu`, `herdr-win`, and `rdp-tunnel` (`ssh -N rdp-tunnel`, then RDP to `localhost:13389`). An RDP file for `herdr-win` is on the Surface desktop.
 - VPS admin user `~/.ssh/config`: `herdr-ubuntu`, `herdr-win`, `surface`.
+- Termius on the work computer: one host, the VPS on port 443.
 
 ### Not yet done
 
-- herdr-win's screen from the work computer, which needs GL.iNet remote access for the KVM.
 - Restricting the tailnet policy as described under "Tailscale policy intent".
-- Saving phone app profiles for these hosts.
+- Saving phone Termius profiles for these hosts.
