@@ -12,6 +12,8 @@ Preferred connection order:
 
 Do not route VPS administration through the Windows host or expose credentials to an agent repository.
 
+As built, the VPS's tailnet name is `openclaw-vps`, Tailscale SSH is on for it, and it is the jump host the work computer uses. See "As built" in [REMOTE-ACCESS.md](REMOTE-ACCESS.md).
+
 ## Information to collect without committing
 
 Copy 'inventory/hostinger-vps.example.md' to 'LOCAL-VPS-INVENTORY.md'. The latter is ignored by Git.
