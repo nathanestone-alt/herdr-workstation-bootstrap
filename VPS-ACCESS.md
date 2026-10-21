@@ -12,7 +12,7 @@ Preferred connection order:
 
 Do not route VPS administration through the Windows host or expose credentials to an agent repository.
 
-As built, the VPS's tailnet name is `openclaw-vps`, Tailscale SSH is on for it, and it is the jump host the work computer uses. See "As built" in [REMOTE-ACCESS.md](REMOTE-ACCESS.md).
+As built, the VPS's tailnet name is `openclaw-vps`. It is the jump host the work computer reaches with Termius on port 443, where `sslh` shares the port with Caddy; Tailscale SSH is off. See "As built" in [REMOTE-ACCESS.md](REMOTE-ACCESS.md).
 
 ## Information to collect without committing
 
