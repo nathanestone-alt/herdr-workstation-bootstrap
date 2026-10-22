@@ -126,6 +126,7 @@ Tailnet nodes: `surface7` (laptop), `herdr-win`, `herdr-ubuntu`, `openclaw-vps` 
 - **443 is shared.** `sslh` listens on the VPS's public 443 (IPv4 and IPv6). It sends SSH to `sshd` on `127.0.0.1:22` and TLS to Caddy, which now serves HTTPS on an internal port (`https_port 8443` in the Caddyfile, with an explicit `http://` redirect site because automatic redirects would point at the internal port). Port 80 is unchanged. Caddy's logs now show every HTTPS client as `127.0.0.1`.
 - **Rollback:** stop and disable `sslh`, restore the Caddyfile backup taken on 2026-10-21, and reload Caddy.
 - **Tailscale SSH is off on every node.** It worked, but the browser console was clumsy next to Termius. With it off, port 22 on each tailnet address is plain `sshd` with keys, the same for people and agents. The tailnet SSH rule is `accept`, but it has no effect while no node runs Tailscale SSH.
+- **Keep-alive on the VPS.** The work network silently drops a quiet connection after a few minutes, which killed the Termius session and every hop inside it. Since 2026-10-22 `sshd` on the VPS probes each client every 30 seconds (`/etc/ssh/sshd_config.d/10-keepalive.conf`: `ClientAliveInterval 30`, `ClientAliveCountMax 6`), and the admin user's `~/.ssh/config` sends the same probe on onward hops (`Host *`, `ServerAliveInterval 30`). A Termius-side keep-alive is optional. If sessions still drop, `sslh`'s journal shows whether the far end timed out.
 - **Test from the far end.** `portquiz.net` reported ports as open from the work computer that the VPS never saw. Confirm a path with a packet capture on the VPS instead. Filtering the capture by address can mislead too: the work computer and the home machines can share one public IP.
 - The Surface runs Windows 11 Home, which cannot host RDP. From off the tailnet it is shell-only.
 - The VPS key is authorized on `herdr-ubuntu`, on `herdr-win` (admin accounts read `C:\ProgramData\ssh\administrators_authorized_keys`) and on the Surface. Each host key was checked from a second trusted machine before it was pinned on the VPS.
@@ -134,7 +135,7 @@ Tailnet nodes: `surface7` (laptop), `herdr-win`, `herdr-ubuntu`, `openclaw-vps` 
 ### Shortcuts
 
 - Surface `~/.ssh/config`: `vps` (Tailscale), `vps-public` (public-IP fallback), `herdr-ubuntu`, `herdr-win`, and `rdp-tunnel` (`ssh -N rdp-tunnel`, then RDP to `localhost:13389`). An RDP file for `herdr-win` is on the Surface desktop.
-- VPS admin user `~/.ssh/config`: `herdr-ubuntu`, `herdr-win`, `surface`.
+- VPS admin user `~/.ssh/config`: `herdr-win`, `surface`, and the keep-alive for every host. `ssh herdr-ubuntu` needs no entry: the tailnet name resolves directly and the user name matches.
 - Termius on the work computer: one host, the VPS on port 443.
 
 ### Not yet done
