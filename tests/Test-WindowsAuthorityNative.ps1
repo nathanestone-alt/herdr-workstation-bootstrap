@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
+    [ValidateSet('herdr-win', 'surface7')][string]$AuthorityHost = 'herdr-win',
     [ValidateRange(0, [int]::MaxValue)][int]$RuntimeProcessId = 0,
     [string]$ExpectedRuntimeProcessCreationTimeUtc = '',
     [ValidateRange(0, [int]::MaxValue)][int]$ExpectedRuntimeSessionId = 0,
@@ -17,13 +18,22 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot '..\scripts\windows\HerdrReviewStaging.ps1')
 . (Join-Path $PSScriptRoot '..\scripts\windows\HerdrWindowsRuntimeTokenAccess.ps1')
 . (Join-Path $PSScriptRoot '..\scripts\windows\HerdrHostOwnedAclPolicy.ps1')
-. (Join-Path $PSScriptRoot '..\scripts\windows\WindowsReceiptAuthority.ps1')
+$helperName = if ($AuthorityHost -ceq 'surface7') { 'WindowsReceiptAuthorityArm64.ps1' } else { 'WindowsReceiptAuthority.ps1' }
+. (Join-Path $PSScriptRoot ('..\scripts\windows\' + $helperName))
 
 if (-not $IsWindows) {
     Write-Host 'nativeNOTRUN: Windows authority native token/link/publication checks require Windows.'
     return
 }
 
+if ($AuthorityHost -ceq 'surface7') {
+    foreach ($required in @('ExpectedRuntimeUserSid', 'KnownUvExecutablePath', 'ExpectedUvTargetSha256', 'ExpectedUvVersionOutput')) {
+        if (-not $PSBoundParameters.ContainsKey($required)) { throw "Surface native test requires explicit $required." }
+    }
+    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) {
+        throw 'Surface native test requires Windows ARM64.'
+    }
+}
 $missingInputs = @()
 if ($RuntimeProcessId -eq 0) { $missingInputs += 'RuntimeProcessId' }
 if ([string]::IsNullOrWhiteSpace($ExpectedRuntimeProcessCreationTimeUtc)) { $missingInputs += 'ExpectedRuntimeProcessCreationTimeUtc' }

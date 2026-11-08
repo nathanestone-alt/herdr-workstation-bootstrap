@@ -179,6 +179,107 @@ Assert-True (-not $ownerCommands[0].Contains("'/grant:r'")) `
 Assert-True (-not $daclCommands[0].Contains("'/setowner'")) `
     'Read-only ACL policy recombined incompatible icacls DACL and owner operations.'
 
+# #1774: portable source execution. Windows token/ACL checks remain native-only.
+$surfaceHelperPath = Join-Path $PSScriptRoot '..\scripts\windows\WindowsReceiptAuthorityArm64.ps1'
+$surfaceInstallerPath = Join-Path $PSScriptRoot '..\scripts\windows\Install-WindowsReceiptAuthorityArm64.ps1'
+$savedAccount = $script:WindowsRuntimeAccount
+try {
+    . $surfaceHelperPath
+    Assert-True ($script:WindowsRuntimeAccount -ceq 'Surface7\natha') 'Surface account is not canonical.'
+    $parseErrors = $null
+    $helperAst = [Management.Automation.Language.Parser]::ParseFile($surfaceHelperPath, [ref]$null, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'ARM64 helper parse failed.'
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile($surfaceInstallerPath, [ref]$null, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'ARM64 installer parse failed.'
+    $guard = @($helperAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.Text.Contains("throw 'Installed Windows authority identity is invalid.'")
+    }, $true))
+    Assert-True ($guard.Count -eq 1) 'Identity guard cardinality changed.'
+    # Execute the production identity guard itself; no Windows SID construction on Linux.
+    $guardCode = [scriptblock]::Create($guard[0].Extent.Text)
+    $RuntimeSid = @{ Value = 'S-1-5-21-fixture-surface' }
+    $authority = @{
+        schema_version = 1; authority_id = '#961-installation-authority-v1'
+        platform = 'Windows'; architecture = 'aarch64'; receipt_path = $script:WindowsReceiptPath
+        runtime_identity = @{ account = 'Surface7\natha'; sid = $RuntimeSid.Value }
+    }
+    . $guardCode
+    $authority.architecture = 'x86_64'
+    Assert-Throws { . $guardCode } 'identity is invalid' 'ARM Check rejects x64 authority'
+    $authority.architecture = 'aarch64'
+    foreach ($badAccount in @('HERDR-WIN\rdp-natha', 'surface7\natha', 'Surface7\other')) {
+        $authority.runtime_identity.account = $badAccount
+        Assert-Throws { . $guardCode } 'identity is invalid' 'ARM Check rejects wrong account/case'
+    }
+    $authority.runtime_identity.account = 'Surface7\natha'
+    $authority.runtime_identity.sid = 'S-1-5-21-foreign'
+    Assert-Throws { . $guardCode } 'identity is invalid' 'ARM Check rejects wrong SID'
+    $authority.runtime_identity.sid = $RuntimeSid.Value
+    $authority.platform = 'Linux'
+    Assert-Throws { . $guardCode } 'identity is invalid' 'ARM Check rejects wrong OS'
+    $authority.platform = 'Windows'
+    $receipt = @{
+        receipt_id = 'surface-fixture'; verification_status = 'verified'; source_commit_sha = ('a' * 40)
+        payload_manifest_sha256 = ('b' * 64); bridge_allowlist_sha256 = ('c' * 64)
+        platform = 'Windows'; architecture = 'aarch64'; python313 = @{sha256=('d'*64)}
+        uv = @{sha256=('e'*64)}; role_manifest_sha256 = ('f'*64)
+        runtime_identity = $authority.runtime_identity; provenance = @{ receipt_authority_script_sha256 = ('1'*64) }
+    }
+    $envelope = New-HerdrWindowsAuthorityValue -Receipt $receipt -ReceiptPath $script:WindowsReceiptPath -ReceiptSha256 ('2'*64)
+    Assert-True ($envelope.architecture -ceq 'aarch64') 'Envelope dropped ARM64 architecture.'
+    Assert-True ($envelope.runtime_identity.account -ceq 'Surface7\natha') 'Envelope dropped Surface account.'
+    Assert-True ($envelope.provenance.receipt_authority_script_sha256 -ceq ('1'*64)) 'Envelope dropped installer provenance.'
+    $producerGuard = @($installerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.Text.Contains("throw 'Producer script differs from the independently commissioned SHA-256.'")
+    }, $true))
+    Assert-True ($producerGuard.Count -eq 1) 'Producer hash guard cardinality changed.'
+    $ExpectedProducerScriptSha256 = Get-HerdrAuthoritySha256 -Path $surfaceInstallerPath
+    $producerScriptSha256 = $ExpectedProducerScriptSha256
+    . ([scriptblock]::Create($producerGuard[0].Extent.Text))
+    $mutation = Join-Path ([IO.Path]::GetTempPath()) ('1774-mutation-' + [guid]::NewGuid() + '.ps1')
+    try {
+        [IO.File]::WriteAllBytes($mutation, [IO.File]::ReadAllBytes($surfaceInstallerPath) + [byte[]]@(32))
+        $producerScriptSha256 = Get-HerdrAuthoritySha256 -Path $mutation
+        Assert-Throws { . ([scriptblock]::Create($producerGuard[0].Extent.Text)) } 'independently commissioned SHA-256' 'one-byte installer mutation'
+    }
+    finally { Remove-Item -LiteralPath $mutation -Force -ErrorAction SilentlyContinue }
+    & {
+        function Get-HerdrAuthorityCommand { param($Name,$Label) return @{ Path = 'fixture-py' } }
+        function Invoke-HerdrAuthorityCommand {
+            param($Path,$ArgumentList,$Label)
+            return '{"version_info":[3,13,12,"final",0],"implementation":"CPython","version":"3.13.12","executable":"fixture-python","build_platform":"win-amd64"}'
+        }
+        Assert-Throws { Get-HerdrPython313Identity } 'native ARM64 CPython' 'emulated x64 Python rejected by ARM issuer'
+    }
+    $legacyHelperPath = Join-Path $PSScriptRoot '..\scripts\windows\WindowsReceiptAuthority.ps1'
+    $legacyAst = [Management.Automation.Language.Parser]::ParseFile($legacyHelperPath, [ref]$null, [ref]$parseErrors)
+    $legacyGuard = @($legacyAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Extent.Text.Contains("throw 'Installed Windows authority identity is invalid.'")
+    }, $true))
+    Assert-True ($legacyGuard.Count -eq 1) 'Legacy identity guard cardinality changed.'
+    $legacyCode = [scriptblock]::Create($legacyGuard[0].Extent.Text)
+    $script:WindowsRuntimeAccount = 'HERDR-WIN\rdp-natha'
+    $authority.runtime_identity.account = $script:WindowsRuntimeAccount
+    $authority.architecture = 'x86_64'
+    . $legacyCode
+    $authority.architecture = 'aarch64'
+    Assert-Throws { . $legacyCode } 'identity is invalid' 'Legacy Check rejects ARM64 authority'
+    $authority.architecture = 'x86_64'
+    $authority.runtime_identity.account = 'Surface7\natha'
+    Assert-Throws { . $legacyCode } 'identity is invalid' 'Legacy Check rejects Surface account'
+    Write-Host '#1774 portable identity, envelope, native-Python and one-byte installer hash controls PASS.'
+}
+finally {
+    . (Join-Path $PSScriptRoot '..\scripts\windows\WindowsReceiptAuthority.ps1')
+    $script:WindowsRuntimeAccount = $savedAccount
+}
+
 Write-Host "Windows receipt-authority source fixture tests passed: $script:assertionCount assertions."
 
 if (-not $IsWindows) {

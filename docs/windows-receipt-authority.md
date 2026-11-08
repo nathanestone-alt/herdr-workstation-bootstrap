@@ -162,3 +162,21 @@ ignored, but these bindings must not be weakened or sourced from caller-controll
 The consumer must independently apply the same handle-bound `AccessCheck` rule to its own live
 runtime token before trusting the authority; the producer's commissioning-time process proof is
 evidence about that captured process, not a transferable boolean or a waiver for later processes.
+
+## Surface7 ARM64 issuer (#1774)
+
+The separate Install-WindowsReceiptAuthorityArm64.ps1 and WindowsReceiptAuthorityArm64.ps1
+pair commissions only Surface7\natha on Windows aarch64 with native ARM64 CPython
+3.13.12. It preserves the schema, fixed ProgramData paths, live limited-token proof,
+host-owned ACL/publication checks, uv 0.12.6 WinGet link topology, and expiry policy.
+The ExpectedProducerScriptSha256 value binds the ARM64 installer, not the helper.
+Commission the clean source commit and all digests independently after review.
+Use the original commissioning command with the ARM64 installer filename and
+-RuntimeAccount 'Surface7\natha'. Resolve the current live limited process tuple
+for this account; never copy herdr-win's SID, paths, receipt, or hashes.
+
+The original x64 pair must remain byte-identical. No action or re-mint on herdr-win
+is part of adding this issuer. Runtime consumers use their own host's fixed authority.
+Run Test-WindowsAuthorityNative.ps1 -AuthorityHost surface7 with explicit live-process
+inputs, ExpectedRuntimeUserSid, KnownUvExecutablePath, ExpectedUvTargetSha256 and
+ExpectedUvVersionOutput. Linux nativeNOTRUN is not native acceptance.
